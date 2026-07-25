@@ -1,8 +1,9 @@
 {
   "binfmt_marker": "/proc/sys/fs/binfmt_misc/qemu-arm",
   "builder_container_digest": "REQUIRED_SHA256_CONTAINER_DIGEST",
-  "debian_snapshot": "REQUIRED_IMMUTABLE_DEBIAN_SNAPSHOT_URL",
-  "raspberrypi_snapshot": "REQUIRED_IMMUTABLE_RASPBERRY_PI_SNAPSHOT_URL",
+  "raspbian_snapshot": "REQUIRED_IMMUTABLE_RASPBIAN_SNAPSHOT_URL",
+  "raspberrypi_inrelease_sha256": "REQUIRED_SHA256_RASPBERRY_PI_INRELEASE",
+  "raspberrypi_repository": "https://archive.raspberrypi.com/debian/",
   "schema_version": 2,
   "tools": [
     {

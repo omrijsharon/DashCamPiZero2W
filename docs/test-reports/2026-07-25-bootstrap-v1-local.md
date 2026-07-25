@@ -99,14 +99,34 @@ snapshots, destructive-command non-repetition, foreign/torn state latching,
 format-intent reconciliation, and completion-write power cuts. These are model
 and fake-runtime results, not physical power-loss evidence.
 
+### Linux builder probe
+
+Ubuntu-22.04 WSL was prepared with `libguestfs-tools`, `qemu-user-static`,
+`binfmt-support`, and a virtual appliance kernel. A 16 MiB regular-file
+guestfish launch/read probe passed, and qemu-arm binfmt was registered with the
+expected ARM ELF magic and interpreter.
+
+The pinned source was then copied to a builder-private WSL directory. Its
+extracted size and SHA-256 matched the source contract. The first real
+guestfish `e2fsck-f` refused the June 2026 source filesystem because Ubuntu
+22.04's appliance e2fsprogs does not support ext4 `FEATURE_C12`; no successful
+resize occurred. The exact temporary WSL probe directory and its raw/archive
+copies were then removed. This establishes that the release builder must use a
+newer Trixie-class filesystem toolchain.
+
+Package-source review also corrected the contract: Raspberry Pi OS 32-bit base
+packages come from Raspbian, not generic Debian armhf. The unresolved builder
+now requires an immutable Raspbian snapshot plus the exact checked
+`InRelease` hash for the Raspberry Pi package repository.
+
 ## Release-image blockers
 
 The following remain deliberately unchecked:
 
 1. Replace the placeholder builder container/tool identities and repository
    locations in `deploy/bootstrap/image/build-requirements.json` with a
-   reviewed, executable Linux contract. No validated immutable Raspberry Pi
-   package snapshot has yet been selected.
+   reviewed, executable Trixie-class Linux contract. The Ubuntu-22.04 probe is
+   explicitly unsupported for the source ext4 feature set.
 2. Produce the application wheel and dependency bundle from one clean recorded
    commit and bind their complete installed identities to that commit and
    `uv.lock`.

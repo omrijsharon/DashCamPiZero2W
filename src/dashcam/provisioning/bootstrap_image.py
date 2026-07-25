@@ -1045,8 +1045,9 @@ class BuilderRequirements:
 
     schema_version: int
     builder_container_digest: str
-    debian_snapshot: str
-    raspberrypi_snapshot: str
+    raspbian_snapshot: str
+    raspberrypi_repository: str
+    raspberrypi_inrelease_sha256: str
     binfmt_marker: str
     tools: tuple[ToolPin, ...]
 
@@ -1124,8 +1125,9 @@ def load_builder_requirements(payload: bytes) -> BuilderRequirements:
         {
             "schema_version",
             "builder_container_digest",
-            "debian_snapshot",
-            "raspberrypi_snapshot",
+            "raspbian_snapshot",
+            "raspberrypi_repository",
+            "raspberrypi_inrelease_sha256",
             "binfmt_marker",
             "tools",
         },
@@ -1173,9 +1175,14 @@ def load_builder_requirements(payload: bytes) -> BuilderRequirements:
         builder_container_digest=_required_string(
             root["builder_container_digest"], "builder_container_digest"
         ),
-        debian_snapshot=_required_string(root["debian_snapshot"], "debian_snapshot"),
-        raspberrypi_snapshot=_required_string(
-            root["raspberrypi_snapshot"], "raspberrypi_snapshot"
+        raspbian_snapshot=_required_string(root["raspbian_snapshot"], "raspbian_snapshot"),
+        raspberrypi_repository=_required_string(
+            root["raspberrypi_repository"], "raspberrypi_repository"
+        ),
+        raspberrypi_inrelease_sha256=_required_sha256(
+            root["raspberrypi_inrelease_sha256"],
+            "raspberrypi_inrelease_sha256",
+            BootstrapImageRefusalCode.TOOLCHAIN_UNRESOLVED,
         ),
         binfmt_marker=_required_string(root["binfmt_marker"], "binfmt_marker"),
         tools=tuple(tools),
@@ -1191,25 +1198,21 @@ def load_builder_requirements(payload: bytes) -> BuilderRequirements:
             BootstrapImageRefusalCode.TOOLCHAIN_UNRESOLVED,
             "builder container digest must be an exact sha256 identity",
         )
-    if not requirements.debian_snapshot.startswith("https://snapshot.debian.org/"):
+    if not requirements.raspbian_snapshot.startswith("https://snapshot.raspbian.org/"):
         _refuse(
             BootstrapImageRefusalCode.TOOLCHAIN_UNRESOLVED,
-            "Debian packages must use an immutable snapshot.debian.org URL",
+            "32-bit base packages must use an immutable snapshot.raspbian.org URL",
         )
-    if not requirements.raspberrypi_snapshot.startswith("https://"):
+    if requirements.raspberrypi_repository != "https://archive.raspberrypi.com/debian/":
         _refuse(
             BootstrapImageRefusalCode.TOOLCHAIN_UNRESOLVED,
-            "Raspberry Pi packages must use a pinned HTTPS snapshot",
+            "Raspberry Pi packages must use the exact reviewed HTTPS repository",
         )
-    for label, url in (
-        ("Debian", requirements.debian_snapshot),
-        ("Raspberry Pi", requirements.raspberrypi_snapshot),
-    ):
-        if re.search(r"/20\d{6}T\d{6}Z(?:/|$)", url) is None:
-            _refuse(
-                BootstrapImageRefusalCode.TOOLCHAIN_UNRESOLVED,
-                f"{label} snapshot URL lacks an immutable UTC timestamp",
-            )
+    if re.search(r"/20\d{10}/raspbian/?$", requirements.raspbian_snapshot) is None:
+        _refuse(
+            BootstrapImageRefusalCode.TOOLCHAIN_UNRESOLVED,
+            "Raspbian snapshot URL lacks an immutable YYYYMMDDhhmm identity",
+        )
     required_tools = {
         "guestfish",
         "guestmount",
@@ -2180,8 +2183,11 @@ def customize_regular_image(
             {
                 "ROOTFS_DIR": str(root_mount),
                 "BOOTFS_DIR": str(boot_mount),
-                "DASHCAM_DEBIAN_SNAPSHOT": requirements.debian_snapshot,
-                "DASHCAM_RASPBERRYPI_SNAPSHOT": requirements.raspberrypi_snapshot,
+                "DASHCAM_RASPBIAN_SNAPSHOT": requirements.raspbian_snapshot,
+                "DASHCAM_RASPBERRYPI_REPOSITORY": requirements.raspberrypi_repository,
+                "DASHCAM_RASPBERRYPI_INRELEASE_SHA256": (
+                    requirements.raspberrypi_inrelease_sha256
+                ),
             }
         )
         stage_result = runner(
@@ -2371,14 +2377,14 @@ def _configure_apt_snapshots(rootfs: Path, requirements: BuilderRequirements) ->
         _refuse(BootstrapImageRefusalCode.OUTPUT_EXISTS, "snapshot apt source already exists")
     payload = (
         "Types: deb\n"
-        f"URIs: {requirements.debian_snapshot}\n"
+        f"URIs: {requirements.raspbian_snapshot}\n"
         "Suites: trixie\n"
-        "Components: main contrib non-free non-free-firmware\n"
+        "Components: main contrib non-free rpi\n"
         "Architectures: armhf\n"
-        "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
+        "Signed-By: /usr/share/keyrings/raspbian-archive-keyring.gpg\n"
         "Check-Valid-Until: no\n\n"
         "Types: deb\n"
-        f"URIs: {requirements.raspberrypi_snapshot}\n"
+        f"URIs: {requirements.raspberrypi_repository}\n"
         "Suites: trixie\n"
         "Components: main\n"
         "Architectures: armhf\n"

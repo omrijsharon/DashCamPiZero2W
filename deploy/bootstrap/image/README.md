@@ -70,11 +70,12 @@ host block-device target or kernel partition-table reread is involved. This
 equivalent is necessary because rebuilding a nominally similar Lite image from
 moving apt repositories would no longer use the exact pinned `.img.xz` source.
 The saved build report must pin the builder container digest, libguestfs/qemu
-versions, and Debian repository snapshot used for package installation.
+versions, the Raspbian snapshot used by the 32-bit base, and the exact
+Raspberry Pi repository `InRelease` hash used for package installation.
 `build-requirements.json` intentionally contains unresolved identities today,
 so the executable builder refuses a large build. Replace them only with
-reviewed exact container/tool-version-output hashes and immutable Debian and
-Raspberry Pi snapshot URLs.
+reviewed exact container/tool-version-output hashes, an immutable Raspbian
+snapshot URL, and the checked Raspberry Pi repository metadata hash.
 
 The stage:
 

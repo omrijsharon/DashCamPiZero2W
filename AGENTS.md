@@ -23,6 +23,11 @@
   retaining the 6 GiB Stage A target. The image must author and read back an
   all-zero 4 MiB prefix at the future p3 start; Stage B also requires no known
   filesystem signatures before its one authorized format.
+- The 32-bit base uses Raspbian packages, not generic Debian armhf. A release
+  builder must use an immutable Raspbian snapshot and bind the Raspberry Pi
+  repository to its reviewed `InRelease` hash. Ubuntu-22.04 libguestfs is
+  rejected: its e2fsprogs cannot read the pinned image's ext4 `FEATURE_C12`;
+  use a reviewed Trixie-class builder.
 - Stage A is an exact-identity-gated, one-write `sfdisk --no-reread`
   transaction followed by raw-MBR readback, durable commit, sync, and exactly
   one controlled reboot. Stage B runs on a different boot ID, revalidates the

@@ -4,8 +4,9 @@ set -euo pipefail
 # Official pi-gen provides ROOTFS_DIR and BOOTFS_DIR to custom stages.
 : "${ROOTFS_DIR:?pi-gen ROOTFS_DIR is required}"
 : "${BOOTFS_DIR:?pi-gen BOOTFS_DIR is required}"
-: "${DASHCAM_DEBIAN_SNAPSHOT:?immutable Debian snapshot URL is required}"
-: "${DASHCAM_RASPBERRYPI_SNAPSHOT:?immutable Raspberry Pi snapshot URL is required}"
+: "${DASHCAM_RASPBIAN_SNAPSHOT:?immutable Raspbian snapshot URL is required}"
+: "${DASHCAM_RASPBERRYPI_REPOSITORY:?Raspberry Pi repository URL is required}"
+: "${DASHCAM_RASPBERRYPI_INRELEASE_SHA256:?Raspberry Pi InRelease hash is required}"
 
 case "${ROOTFS_DIR}" in /*) ;; *) echo "ROOTFS_DIR must be absolute" >&2; exit 2 ;; esac
 case "${BOOTFS_DIR}" in /*) ;; *) echo "BOOTFS_DIR must be absolute" >&2; exit 2 ;; esac
@@ -99,8 +100,8 @@ cp -a --no-dereference "${assets}/wheelhouse/." "${ROOTFS_DIR}/opt/dashcam/wheel
 
 snapshot_sources="${ROOTFS_DIR}/etc/apt/sources.list.d/dashcam-bootstrap.sources"
 test -f "${snapshot_sources}"
-grep -Fqx "URIs: ${DASHCAM_DEBIAN_SNAPSHOT}" "${snapshot_sources}"
-grep -Fqx "URIs: ${DASHCAM_RASPBERRYPI_SNAPSHOT}" "${snapshot_sources}"
+grep -Fqx "URIs: ${DASHCAM_RASPBIAN_SNAPSHOT}" "${snapshot_sources}"
+grep -Fqx "URIs: ${DASHCAM_RASPBERRYPI_REPOSITORY}" "${snapshot_sources}"
 if find "${ROOTFS_DIR}/etc/apt" -maxdepth 2 \
   \( -name '*.list' -o -name '*.sources' \) \
   ! -path "${snapshot_sources}" -print -quit | grep -q .; then
@@ -113,6 +114,19 @@ mapfile -t required_packages < <(
 )
 [ "${#required_packages[@]}" -gt 0 ]
 chroot "${ROOTFS_DIR}" apt-get update
+mapfile -t raspberrypi_inrelease < <(
+  find "${ROOTFS_DIR}/var/lib/apt/lists" -maxdepth 1 -type f \
+    -name '*archive.raspberrypi.com*trixie*InRelease' -print
+)
+[ "${#raspberrypi_inrelease[@]}" -eq 1 ]
+actual_raspberrypi_inrelease_sha256="$(
+  sha256sum "${raspberrypi_inrelease[0]}" | cut -d ' ' -f 1
+)"
+[ "${actual_raspberrypi_inrelease_sha256}" = \
+  "${DASHCAM_RASPBERRYPI_INRELEASE_SHA256}" ] || {
+  echo "Raspberry Pi repository metadata identity changed" >&2
+  exit 1
+}
 chroot "${ROOTFS_DIR}" apt-get install \
   --yes \
   --no-install-recommends \

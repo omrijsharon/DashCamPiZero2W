@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-24",
+  "status": "v1_retired_v2_regular_file_verified_reflash_pending",
+  "authorization": {
+    "cid": "fe34325344000000200000031a0192d1",
+    "device_size_bytes": 31457280000,
+    "device_sectors": 61440000,
+    "statement": "CID fe34325344000000200000031a0192d1 is expendable and may be completely erased, reflashed, repartitioned, and formatted.",
+    "record_path": "deploy/image/exact-card-authorization-fe34325344000000200000031a0192d1-v1.json",
+    "record_sha256": "21165e74ae83f6ad9480bec8519b4acce907159f8f924cdb2a354623a6561310"
+  },
+  "source": {
+    "path": "artifacts/images/2026-06-18-raspios-trixie-armhf-lite.img.xz",
+    "size_bytes": 549086704,
+    "sha256": "ea4e84c501d6dd4f4b1d04eb84df133a03f90a05ee2e8ab849185c17c2b0707b"
+  },
+  "output": {
+    "path": "artifacts/images/dashcam-release-authorized-fe34325344000000200000031a0192d1-v1.img",
+    "size_bytes": 2675965952,
+    "sha256": "7225b9285e48cecab9fd9a7765cb35e6cb4d4769a59b0606b1784abc3b870904",
+    "runtime_gate_created": true,
+    "mbr_disk_id": "0x4f2c9ea0",
+    "boot_start_sector": 16384,
+    "boot_size_sectors": 1048576,
+    "root_start_sector": 1064960,
+    "root_source_size_sectors": 4161536,
+    "boot_uuid": "89F4-4546",
+    "root_uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8"
+  },
+  "fat_readback": {
+    "cmdline": "console=serial0,115200 console=tty1 root=PARTUUID=4f2c9ea0-02 rootfstype=ext4 fsck.repair=yes rootwait dashcam.bounded_provision=v1",
+    "stock_resize_token_count": 0,
+    "bounded_trigger_count": 1,
+    "initramfs_size_bytes": 13452750,
+    "initramfs_sha256": "ee7f95c2d70071ce5223ef78fc9df599c2152afd241840ea769bccf369848153"
+  },
+  "initramfs_readback": {
+    "main_offset": 3901440,
+    "main_entry_count": 476,
+    "hook_sha256": "2e24e9a515c84094820e5fd704fe769858bc0f02b06bdce07c84974e4c256143",
+    "gate_mode": "0100400",
+    "gate_sha256": "63011e33524f0c45d1def101947267fd6b44ab610be673758f8a82d75c67b3b9",
+    "target_table_sha256": "ef8d7b4101b7e308f9f79e4d59e8d79bfc24138d2cc1dd5225152c6de382d00e"
+  },
+  "root_readback": {
+    "runtime_gate_sha256": "63011e33524f0c45d1def101947267fd6b44ab610be673758f8a82d75c67b3b9",
+    "authorization_marker_sha256": "2ca5870f11fad30a59a15083360dafdf6e406b08ebf61ad808e2d92cac9766e4",
+    "layout_sha256": "4c082acbde590383c28e7a4c6ad26e2e117e61744788796ed7f73c24e65eb1fa",
+    "post_root_runtime_sha256": "ed0c442afa088ef8dc2df04dc795a79c71afff0d79f48441b2c9c5bbef6c32b9",
+    "post_root_service_sha256": "6e555e30722ee4f2f201d7ca5407fc0b1eaeda8df2d7fda319915cef00fd41ba",
+    "service_link": "/etc/systemd/system/local-fs.target.wants/dashcam-firstboot-storage.service",
+    "service_link_target": "../dashcam-firstboot-storage.service",
+    "regular_file_types_and_modes_verified": true,
+    "root_uuid_verified": true
+  },
+  "tooling": {
+    "executor_sha256": "7a86f1d54c9dc1ff20466e1527920be1b69d5143b7c90e5aae27bd493d0e029b",
+    "initramfs_customizer_sha256": "4f246aa14018debd5dc87b8bf232561b6bdb5a1cf87265850fd385c29014c8f2",
+    "uv_version": "0.11.31",
+    "python_version": "3.13.14",
+    "execution_boundary": "new regular image only; no block device, loop, mount, sudo, or Pi access"
+  },
+  "validation": {
+    "pytest": "775 passed, 1 skipped (Windows host lacks a native POSIX shell; WSL sh -n passed separately)",
+    "ruff_format": "154 files already formatted",
+    "ruff_check": "passed",
+    "mypy": "passed for 110 source files",
+    "independent_fat_ext4_initramfs_readback": "passed"
+  },
+  "pre_physical_write_gate": {
+    "live_recheck_cid": "fe34325344000000200000031a0192d1",
+    "live_recheck_device_sectors": 61440000,
+    "live_recheck_root": "/dev/mmcblk0p2",
+    "live_recheck_pi_serial": "00000000db28ffe4",
+    "shutdown_requested": true,
+    "ssh_offline_confirmed": true,
+    "card_moved_to_reader": true,
+    "windows_disk_number": 1,
+    "windows_bus_type": "USB",
+    "windows_media_type": "Removable Media",
+    "windows_reported_size_bytes": 31457280000,
+    "windows_logical_sector_size": 512,
+    "windows_is_system": false,
+    "windows_is_boot": false,
+    "windows_mbr_disk_id": "0x624667df",
+    "windows_partition_1": {
+      "type": "0x0c",
+      "start_sector": 16384,
+      "sector_count": 1048576
+    },
+    "windows_partition_2": {
+      "type": "0x83",
+      "start_sector": 1064960,
+      "sector_count": 60375040
+    },
+    "identity_match": true
+  },
+  "rejected_intermediates": [
+    {
+      "sha256": "6bff4dbd02ab07211bb534bee75613ddebec037650c1425744847976c66fedbc",
+      "reason": "service was enabled under multi-user.target after the post-root unit moved to local-fs.target",
+      "removed": true
+    },
+    {
+      "reason": "local-fs.target.wants did not yet exist in the stock root filesystem",
+      "executor_result": "output_verification_failed",
+      "partial_output_removed_by_executor": true
+    }
+  ],
+  "imager_pre_write": {
+    "imager_version": "2.0.10",
+    "summary_inspected": true,
+    "selected_device": "Raspberry Pi Zero 2 W",
+    "selected_storage": "Generic MassStorageClass USB Device",
+    "selected_image_was_authorized_output": true,
+    "write_started": false,
+    "use_custom_missing_initialization_metadata": true,
+    "local_manifest_path": "deploy/image/dashcam-authorized-local.rpi-imager-manifest",
+    "local_manifest_init_format": "cloudinit-rpi",
+    "local_manifest_image_size_and_sha256_verified": true,
+    "manifest_backed_window_title_verified": true,
+    "final_summary_inspected": true,
+    "final_summary_customisations": [
+      "hostname configured",
+      "localisation configured",
+      "user account configured",
+      "Wi-Fi configured",
+      "SSH enabled"
+    ],
+    "customisation_review_pending": false
+  },
+  "first_boot_trial": {
+    "ssh_address": "192.168.68.110",
+    "ssh_user": "dashcamadmin",
+    "ssh_public_key_authentication": true,
+    "ssh_ed25519_fingerprint": "SHA256:eBoFZu2nyAsDlAJD8L684xdaQdWLB75/dFRrDZXEQxk",
+    "pi_serial": "00000000db28ffe4",
+    "wifi_mac": "2c:cf:67:98:4c:49",
+    "card_cid": "fe34325344000000200000031a0192d1",
+    "card_sectors": 61440000,
+    "identity_match": true,
+    "system_state": "degraded",
+    "failed_unit": "dashcam-firstboot-storage.service",
+    "failed_unit_exit_status": 125,
+    "refusal": "required regular file is absent or unsafe: /boot/firmware/dashcam-provision/initramfs-v1.state",
+    "cmdline_trigger_retained": true,
+    "root_partition_size_sectors": 4161536,
+    "partition_3_exists": false,
+    "partition_or_filesystem_mutation_observed": false,
+    "customized_generic_initramfs_sha256": "ee7f95c2d70071ce5223ef78fc9df599c2152afd241840ea769bccf369848153",
+    "loaded_stock_initramfs7_sha256": "3f5288ed963028accc5103f13f5a03a9d6d26ef3f58ad38a31736d3802d452b1",
+    "root_cause": "auto_initramfs paired the armv7 kernel7.img with initramfs7; v1 customized the generic initramfs file instead",
+    "safe_refusal_verified": true
+  },
+  "corrected_v2": {
+    "evidence_path": "docs/test-reports/2026-07-24-authorized-exact-card-image-v2.json",
+    "path": "artifacts/images/dashcam-release-authorized-fe34325344000000200000031a0192d1-v2.img",
+    "size_bytes": 2675965952,
+    "sha256": "ff053cc595c8b7323a9779b28c338ed9c57de13ca5d384ecff69d797159cc802",
+    "target_profile": "pi-zero-2-w-armv7l",
+    "custom_initramfs7_sha256": "c1e3cba130781f22fa45e0d01b33f22fc37088ec1f767288bb77dddbcb95da5e",
+    "generic_initramfs_unchanged": true,
+    "full_local_validation": "808 passed, 1 skipped; Ruff and mypy passed",
+    "independent_readback": "passed"
+  },
+  "remaining_gate": "Cleanly shut down the live Pi, re-resolve the exact card in Windows, flash the verified v2 image through the updated manifest, and repeat first/second-boot evidence collection."
+}

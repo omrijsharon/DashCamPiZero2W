@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "status": "gated_candidate_pending_exact_image_validation",
+  "placeholder_exit_code": 125,
+  "cmdline_transform": {
+    "remove_exact_token": "resize",
+    "add_exact_token": "dashcam.bounded_provision=v1",
+    "require_exactly_one_stock_token": true,
+    "reject_existing_bounded_trigger": true,
+    "preserve_all_other_tokens_in_order": true,
+    "imager_firstrun_tokens_are_not_special_cased_or_removed": true
+  },
+  "initramfs": {
+    "hook_template": "templates/dashcam-bounded-provision-hook.sh.inert",
+    "runtime_template": "templates/dashcam-bounded-provision-runtime.sh.inert",
+    "required_rebuild_argv": [
+      "update-initramfs",
+      "-u",
+      "-k",
+      "all"
+    ],
+    "auto_initramfs_required": true
+  },
+  "fail_closed_preconditions": [
+    "resolve the boot disk from the live root=PARTUUID reference; never from a hard-coded device node",
+    "capture and reconcile the observed MBR disk ID, cmdline root PARTUUID, fstab PARTUUID, filesystem UUIDs, partition types, starts, sizes, and boot flags",
+    "require a 512-byte logical sector and a DOS/MBR table with exactly the verified p1 and p2 starts and identities",
+    "require current p2 size to be no larger than the exact 6 GiB target; shrinking is forbidden",
+    "require entries p3 and p4 to be absent and the proposed p3 range to have no filesystem, RAID, LVM, partition-table, or other data signature",
+    "require device capacity, 1 MiB alignment, 1 MiB trailing reserve, and at least 8 GiB of aligned p3 data space",
+    "require all required initramfs binaries, libraries, kernel interfaces, and durable storage for the pre-mutation backup to have been verified on the exact image",
+    "require marker, partition table, filesystem UUID, and volume sentinel state to be mutually consistent before treating a later boot as complete"
+  ],
+  "required_mutation_sequence": [
+    "mount only the identity-verified FAT boot partition at a private initramfs path",
+    "create an exclusive partition-table and first-sector backup before any table write",
+    "fsync the backup and directory, read it back, and verify its digest and captured identity",
+    "recheck the complete device identity and every precondition immediately before mutation",
+    "write only the bounded p2 end and verified-new p3 entry while preserving the observed MBR ID, p1, starts, types, flags, and references",
+    "reread and verify the table; never proceed after a partial or ambiguous result",
+    "run bounded ext4 check and grow operations; never shrink",
+    "format only the just-created, signature-free p3 as exFAT DASHCAM and capture its UUID",
+    "create and durably verify the volume sentinel and ext4 completion marker through a reviewed two-stage protocol",
+    "remove only the bounded trigger after complete marker reconciliation, preserve Imager firstrun tokens, and perform one controlled reboot"
+  ],
+  "failure_contract": [
+    "never invoke stock resize_early",
+    "never format an existing or ambiguously identified partition",
+    "never continue to recording or silently fall back to rootfs",
+    "retain the bounded trigger and a durable failure record unless complete idempotency state is verified",
+    "use one bounded attempt per boot and a separately validated recovery or reboot path; no reboot loop",
+    "do not install or execute these inert templates as a production hook"
+  ]
+}

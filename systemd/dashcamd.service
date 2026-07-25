@@ -1,0 +1,51 @@
+[Unit]
+Description=Dashcam recorder (single camera owner)
+Documentation=file:/opt/dashcam/docs/installation.md
+After=local-fs.target dashcam-storage-check.service
+Wants=dashcam-storage-check.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=dashcam
+Group=dashcam
+SupplementaryGroups=video render dialout audio dashcam-storage
+WorkingDirectory=/var/lib/dashcam
+ExecStart=/opt/dashcam/venv/bin/python -m dashcam.daemon
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=45s
+TimeoutStopSec=30s
+WatchdogSec=20s
+RuntimeDirectory=dashcam
+RuntimeDirectoryMode=0750
+StateDirectory=dashcam
+StateDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/dashcam /srv/dashcam
+
+# Storage preflight is deliberately a soft process-start dependency: dashcamd
+# must start in STORAGE_FAULT so status remains observable, but it must not open
+# the camera or create media until its own fresh mount verification succeeds.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-24",
+  "status": "corrected_regular_file_image_verified_hardware_reflash_pending",
+  "reason": "The v1 trial safely proved that 32-bit Pi Zero 2 W firmware loads initramfs7 with kernel7.img; v2 corrects and closes that exact target.",
+  "authorization": {
+    "cid": "fe34325344000000200000031a0192d1",
+    "device_size_bytes": 31457280000,
+    "device_sectors": 61440000,
+    "record_path": "deploy/image/exact-card-authorization-fe34325344000000200000031a0192d1-v1.json",
+    "record_sha256": "21165e74ae83f6ad9480bec8519b4acce907159f8f924cdb2a354623a6561310"
+  },
+  "source": {
+    "path": "artifacts/images/2026-06-18-raspios-trixie-armhf-lite.img.xz",
+    "size_bytes": 549086704,
+    "sha256": "ea4e84c501d6dd4f4b1d04eb84df133a03f90a05ee2e8ab849185c17c2b0707b"
+  },
+  "plan_binding": {
+    "schema_version": 2,
+    "target_profile": "pi-zero-2-w-armv7l",
+    "kernel_filename": "kernel7.img",
+    "initramfs_filename": "initramfs7",
+    "closure_path": "deploy/image/initramfs-closure-v1.json",
+    "closure_size_bytes": 7791,
+    "closure_sha256": "8a4a109aed561d559e4f2a0703370778e105449be144f724ca49c65447c9bcfe",
+    "closure_rebound_before_output_creation": true
+  },
+  "output": {
+    "path": "artifacts/images/dashcam-release-authorized-fe34325344000000200000031a0192d1-v2.img",
+    "size_bytes": 2675965952,
+    "sha256": "ff053cc595c8b7323a9779b28c338ed9c57de13ca5d384ecff69d797159cc802",
+    "mbr_disk_id": "0x4f2c9ea0",
+    "boot_start_sector": 16384,
+    "boot_size_sectors": 1048576,
+    "root_start_sector": 1064960,
+    "root_source_size_sectors": 4161536,
+    "boot_uuid": "89F4-4546",
+    "root_uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8",
+    "runtime_gate_created": true
+  },
+  "fat_independent_readback": {
+    "config_size_bytes": 1238,
+    "config_sha256": "1a312a2c82554d6d9bb49b09c66f1e137284c0676e84ec6501e9a013c27aa928",
+    "active_auto_initramfs_assignments": 1,
+    "explicit_kernel_or_initramfs_override": false,
+    "cmdline": "console=serial0,115200 console=tty1 root=PARTUUID=4f2c9ea0-02 rootfstype=ext4 fsck.repair=yes rootwait dashcam.bounded_provision=v1",
+    "cmdline_size_bytes": 132,
+    "cmdline_sha256": "2884dbc86ec358aacc2e2bda6a3bde33ec5e9a7d05846a81543c9885c210f9db",
+    "stock_resize_token_count": 0,
+    "bounded_trigger_count": 1,
+    "stock_initramfs7_size_bytes": 14257002,
+    "stock_initramfs7_sha256": "3f5288ed963028accc5103f13f5a03a9d6d26ef3f58ad38a31736d3802d452b1",
+    "custom_initramfs7_size_bytes": 13450240,
+    "custom_initramfs7_sha256": "c1e3cba130781f22fa45e0d01b33f22fc37088ec1f767288bb77dddbcb95da5e",
+    "generic_initramfs_unchanged": true,
+    "generic_initramfs_size_bytes": 14233252,
+    "generic_initramfs_sha256": "3505ce515a40f3c3ae39b28d1ff16cbd17db46710ee3732c8a1631f83673b70c"
+  },
+  "elf_closure": {
+    "root_artifacts": [
+      "resize2fs",
+      "dumpe2fs",
+      "sfdisk",
+      "libfdisk"
+    ],
+    "required_stock_entries": 19,
+    "unresolved_sonames": [],
+    "input_modes_and_hashes_verified": true,
+    "reopened_output_modes_and_hashes_verified": true,
+    "independent_graph_derivation_matched_manifest": true
+  },
+  "root_independent_readback": {
+    "filesystem_state": "clean",
+    "filesystem_uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8",
+    "block_count": 520192,
+    "block_size": 4096,
+    "runtime_gate": {
+      "mode": "0400",
+      "size_bytes": 33,
+      "sha256": "63011e33524f0c45d1def101947267fd6b44ab610be673758f8a82d75c67b3b9"
+    },
+    "authorization_marker": {
+      "mode": "0400",
+      "size_bytes": 71,
+      "sha256": "2ca5870f11fad30a59a15083360dafdf6e406b08ebf61ad808e2d92cac9766e4"
+    },
+    "layout_sha256": "4c082acbde590383c28e7a4c6ad26e2e117e61744788796ed7f73c24e65eb1fa",
+    "firstboot_contract_sha256": "c4d6b640fbfd20aefd6c4be85a50ad6b170a2340f59d9fcf25283ecf3a22d420",
+    "initramfs_contract_sha256": "f6295f64aadfcba9903a81721c4cc241be8444c79311da94ba1a9348f7f33b82",
+    "source_table_sha256": "96cd63919db38bbfab4921ab7d6458e7a3721c94d5cc211eceec90726ac6f41c",
+    "target_table_sha256": "ef8d7b4101b7e308f9f79e4d59e8d79bfc24138d2cc1dd5225152c6de382d00e",
+    "post_root_runtime_sha256": "ed0c442afa088ef8dc2df04dc795a79c71afff0d79f48441b2c9c5bbef6c32b9",
+    "post_root_service_sha256": "6e555e30722ee4f2f201d7ca5407fc0b1eaeda8df2d7fda319915cef00fd41ba",
+    "service_link": "/etc/systemd/system/local-fs.target.wants/dashcam-firstboot-storage.service",
+    "service_link_target": "../dashcam-firstboot-storage.service",
+    "regular_file_types_and_modes_verified": true
+  },
+  "validation": {
+    "pytest": "808 passed, 1 skipped (Windows host lacks a native POSIX shell)",
+    "ruff_format": "154 files formatted",
+    "ruff_check": "passed",
+    "mypy": "passed for src and scripts",
+    "real_customizer_determinism": "two exact initramfs7 runs produced identical 13,450,240-byte c1e3cba1... output",
+    "file_image_executor_exit": 0,
+    "independent_fat_ext4_readback": "passed"
+  },
+  "retired_v1": {
+    "path": "artifacts/images/dashcam-release-authorized-fe34325344000000200000031a0192d1-v1.img",
+    "sha256": "7225b9285e48cecab9fd9a7765cb35e6cb4d4769a59b0606b1784abc3b870904",
+    "must_not_flash": true
+  },
+  "pre_reflash_shutdown": {
+    "live_pi_serial": "00000000db28ffe4",
+    "live_card_cid": "fe34325344000000200000031a0192d1",
+    "live_card_sectors": 61440000,
+    "live_root": "/dev/mmcblk0p2",
+    "live_partitions": [
+      {
+        "number": 1,
+        "size_bytes": 536870912,
+        "filesystem": "vfat"
+      },
+      {
+        "number": 2,
+        "size_bytes": 2130706432,
+        "filesystem": "ext4"
+      }
+    ],
+    "partition_3_exists": false,
+    "clean_shutdown_requested": true,
+    "ssh_offline_confirmed": true
+  },
+  "windows_reflash_target": {
+    "observed_after_owner_reported_card_move": true,
+    "disk_number": 1,
+    "friendly_name": "Generic MassStorageClass",
+    "serial_number": "000000002960",
+    "bus_type": "USB",
+    "partition_style": "MBR",
+    "operational_status": "Online",
+    "health_status": "Healthy",
+    "size_bytes": 31457280000,
+    "logical_sector_size": 512,
+    "sector_count": 61440000,
+    "is_system": false,
+    "is_boot": false,
+    "is_read_only": false,
+    "mbr_disk_id": "0x4f2c9ea0",
+    "partitions": [
+      {
+        "number": 1,
+        "drive_letter": "D",
+        "type": "0x0c",
+        "start_sector": 16384,
+        "sector_count": 1048576
+      },
+      {
+        "number": 2,
+        "drive_letter": null,
+        "type": "0x83",
+        "start_sector": 1064960,
+        "sector_count": 4161536
+      }
+    ],
+    "matches_final_live_pi_capacity_and_v1_source_layout": true,
+    "target_resolved_for_imager_summary": true
+  },
+  "imager_pre_write": {
+    "imager_version": "2.0.10",
+    "manifest_backed_window_title_verified": true,
+    "summary_inspected": true,
+    "selected_device": "Raspberry Pi Zero 2 W",
+    "selected_operating_system": "DashCam Pi Zero 2 W - authorized exact-card v2",
+    "selected_storage": "Generic MassStorageClass USB Device",
+    "customisations_listed": [
+      "Hostname configured",
+      "Localisation configured",
+      "User account configured",
+      "Wi-Fi configured",
+      "SSH enabled"
+    ],
+    "write_started_at_summary_capture": false,
+    "action_time_confirmation_was_pending": true
+  },
+  "v2_flash_trial": {
+    "owner_reported_write_and_verify_finished": true,
+    "owner_reported_card_removed_from_reader": true,
+    "owner_reported_card_inserted_into_reference_pi": true,
+    "owner_reported_pi_powered_on": true,
+    "first_network_observation": "2026-07-25T00:06:00+03:00",
+    "last_network_observation": "2026-07-25T00:12:18+03:00",
+    "old_ip": "192.168.68.110",
+    "old_ip_ssh_reachable": false,
+    "mdns_name": "dashcam-pi.local",
+    "mdns_resolved": false,
+    "expected_wifi_mac": "2c:cf:67:98:4c:49",
+    "expected_wifi_mac_observed": false,
+    "other_pi_at_192_168_68_113_rejected_due_to_mac_mismatch": true,
+    "interpretation": "First boot is not yet network-reachable. This observation alone is not a provisioning failure: the initramfs transaction permits one automatic reboot and has no global SSH-availability SLA."
+  },
+  "second_v2_flash_trial": {
+    "reason": "The owner reported that the first v2 flash omitted the SSH public key and reflashed v2 with the public key configured.",
+    "owner_reported_reflash_complete": true,
+    "owner_reported_pi_powered_on": true,
+    "observation_started": "2026-07-25T00:19:46+03:00",
+    "observation_ended": "2026-07-25T00:36:09+03:00",
+    "old_ip": "192.168.68.110",
+    "old_ip_ssh_reachable": false,
+    "expected_wifi_mac": "2c:cf:67:98:4c:49",
+    "expected_wifi_mac_observed": false,
+    "subnet_ssh_scan_found_expected_mac": false,
+    "authentication_attempted": false,
+    "owner_observed_led": "fixed solid green",
+    "repeating_firmware_error_pattern_observed": false,
+    "usb_gadget_management_configured": false,
+    "interpretation": "The Pi did not reach observable Wi-Fi/SSH during a greater-than-sixteen-minute window. Omitting a public key explains authentication failure but not absence of the expected Wi-Fi MAC. The current image has no USB Ethernet/serial gadget management path, so durable on-card state must be inspected offline to determine the root cause."
+  },
+  "remaining_gate": "Reach and identity-check the reference Pi, capture first-boot provisioning evidence without retrying or repairing the transaction, then perform and verify the deliberate idempotence boot only if first-boot state is complete."
+}

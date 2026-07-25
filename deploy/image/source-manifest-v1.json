@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "archive": {
+    "filename": "2026-06-18-raspios-trixie-armhf-lite.img.xz",
+    "url": "https://downloads.raspberrypi.com/raspios_lite_armhf/images/raspios_lite_armhf-2026-06-19/2026-06-18-raspios-trixie-armhf-lite.img.xz",
+    "format": "xz",
+    "size_bytes": 549086704,
+    "sha256": "ea4e84c501d6dd4f4b1d04eb84df133a03f90a05ee2e8ab849185c17c2b0707b"
+  },
+  "image": {
+    "size_bytes": 2675965952,
+    "sector_size_bytes": 512,
+    "total_sectors": 5226496,
+    "table_type": "dos",
+    "mbr_disk_id": "0x4f2c9ea0",
+    "partitions": [
+      {
+        "number": 1,
+        "start_sector": 16384,
+        "size_sectors": 1048576,
+        "partition_type": "0x0c",
+        "bootable": false,
+        "filesystem": "vfat",
+        "filesystem_uuid": "89F4-4546"
+      },
+      {
+        "number": 2,
+        "start_sector": 1064960,
+        "size_sectors": 4161536,
+        "partition_type": "0x83",
+        "bootable": false,
+        "filesystem": "ext4",
+        "filesystem_uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8"
+      }
+    ],
+    "empty_partition_entries": [
+      3,
+      4
+    ]
+  },
+  "target": {
+    "root_size_bytes": 6442450944,
+    "alignment_bytes": 1048576,
+    "trailing_reserve_bytes": 1048576,
+    "minimum_device_bytes": 30064771072,
+    "minimum_data_bytes": 8589934592
+  },
+  "supported_capacity_examples_bytes": [
+    31457280000,
+    64000000000
+  ]
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=Reconcile the exact-card dashcam recording partition
+DefaultDependencies=no
+ConditionKernelCommandLine=dashcam.bounded_provision=v1
+ConditionPathExists=/etc/dashcam/firstboot-runtime-v1.enabled
+RequiresMountsFor=/boot/firmware
+After=systemd-remount-fs.service boot-firmware.mount
+Before=local-fs.target srv-dashcam.mount
+Before=dashcamd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/dashcam/dashcam-firstboot-storage
+RemainAfterExit=yes
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=local-fs.target

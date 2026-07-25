@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-24",
+  "scope": "read-only inspection of the pinned regular image and extracted regular partition files",
+  "hardware_accessed": false,
+  "block_devices_accessed": false,
+  "source": {
+    "archive": "2026-06-18-raspios-trixie-armhf-lite.img.xz",
+    "raw_image_size_bytes": 2675965952,
+    "boot_partition_offset_bytes": 8388608,
+    "root_partition_offset_bytes": 545259520,
+    "root_partition_size_bytes": 2130706432
+  },
+  "initramfs": {
+    "path_on_boot_partition": "initramfs",
+    "size_bytes": 14233252,
+    "sha256": "3505ce515a40f3c3ae39b28d1ff16cbd17db46710ee3732c8a1631f83673b70c",
+    "layout": "uncompressed newc early archive, zero padded to 512 bytes, followed by one zstd frame",
+    "early_entry_count": 327,
+    "early_trailer_end_offset": 3901076,
+    "main_offset": 3901440,
+    "main_compressed_size_bytes": 10331812,
+    "main_uncompressed_size_bytes": 34104320,
+    "main_entry_count": 467,
+    "main_frame_window_bytes": 4194304,
+    "main_frame_checksum": "XXH64",
+    "real_archive_round_trip_passed": true,
+    "early_bytes_preserved_byte_for_byte": true,
+    "stock_hook_counts": {
+      "scripts/local-premount/resize_early": 1,
+      "scripts/local-bottom/set_partuuid": 1
+    }
+  },
+  "stock_main_initramfs_tools": {
+    "present": [
+      "/usr/bin/busybox",
+      "/usr/bin/parted",
+      "/usr/sbin/blkid",
+      "/usr/sbin/blockdev",
+      "/usr/sbin/e2fsck",
+      "/usr/sbin/partprobe"
+    ],
+    "absent": [
+      "/usr/bin/python3",
+      "/usr/sbin/sfdisk",
+      "/usr/sbin/resize2fs",
+      "/usr/sbin/wipefs",
+      "/usr/sbin/mkfs.exfat"
+    ]
+  },
+  "root_filesystem": {
+    "uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8",
+    "block_size_bytes": 4096,
+    "block_count": 520192,
+    "free_blocks": 76343,
+    "free_bytes": 312700928,
+    "packages": {
+      "e2fsprogs": "1.47.2-3 armhf",
+      "util-linux": "2.41-5 armhf",
+      "exfatprogs": "1.2.9-1+deb13u1 armhf",
+      "python3": "3.13.5-1 armhf",
+      "parted": "3.6-5 armhf"
+    },
+    "tool_sha256": {
+      "/usr/sbin/resize2fs": "ae09115ff8fc5dc358034a764e67f42f3e60bbd66fb7f4a9b5ab2ad18031066d",
+      "/usr/sbin/dumpe2fs": "abbcbd8c85cfbc3b3a1bdb178acfa9b0f615fdcb8adc9f030a9e70ca35c138fe",
+      "/usr/sbin/sfdisk": "d3aaf9f941fb06a9e6e8c21214a30dbb5deb29cab31186db8c7e7c52f1920c49",
+      "/usr/sbin/wipefs": "17bbfdd2d0bac4fb3b8e3c052b779cf279e1e5bf686422d9171064c5bfe66285",
+      "/usr/sbin/mkfs.exfat": "0486941d617a05402dd53fd0fb65fe6c74df777ba8e32991de9ecb1ff4f85a76",
+      "/usr/sbin/blkid": "2e9f76e22f72ea5fe2204c2f75bc8f92903f902f2f9c49be0a87363129902c64",
+      "/usr/sbin/parted": "9311bce715064fe8865c204ecd9ba73f9128be69ec35d665a00e4bf82c18e038",
+      "/usr/bin/python3.13": "f8c3c734c8d4cba6ac745e047ad45f077b3a282c1c1596d00457b6c55382ff84"
+    }
+  },
+  "resize2fs_initramfs_closure": {
+    "binary_size_bytes": 67164,
+    "elf": "ELF 32-bit LSB ARM EABI5, dynamically linked, interpreter /lib/ld-linux-armhf.so.3",
+    "needed": [
+      "libe2p.so.2",
+      "libext2fs.so.2",
+      "libcom_err.so.2",
+      "libc.so.6",
+      "ld-linux-armhf.so.3"
+    ],
+    "all_needed_objects_present_in_stock_main_initramfs": true,
+    "object_sha256": {
+      "usr/lib/arm-linux-gnueabihf/ld-linux-armhf.so.3": "28f7d1bc1217e9aceb034ca61b6e1c1d9278e12a35fbe0965362935119092acd",
+      "usr/lib/arm-linux-gnueabihf/libc.so.6": "abe352709a75ac13f2a3e76b3232eb193b444f1322c62ce843bde62c05194d87",
+      "usr/lib/arm-linux-gnueabihf/libcom_err.so.2.1": "4dc1a3fbeccedab07752e01117cea3f50fd3120b52fff65fc2e0172adba82016",
+      "usr/lib/arm-linux-gnueabihf/libe2p.so.2.3": "214fbe83ba5971aeacdb43846c3ac822fe7e0a39e2fc0e3df7565b8b744606d8",
+      "usr/lib/arm-linux-gnueabihf/libext2fs.so.2.4": "24bdd0d1a7449885c13188e9380dd13b67808b6691b76c5f7ce1afedba1a1df9"
+    }
+  },
+  "sfdisk_initramfs_closure": {
+    "binary_size_bytes": 140944,
+    "binary_sha256": "d3aaf9f941fb06a9e6e8c21214a30dbb5deb29cab31186db8c7e7c52f1920c49",
+    "additional_object": {
+      "path": "usr/lib/arm-linux-gnueabihf/libfdisk.so.1",
+      "source_path": "/usr/lib/arm-linux-gnueabihf/libfdisk.so.1.1.0",
+      "size_bytes": 484892,
+      "sha256": "70e7e97e29c10b4f271a8b25a6e6a4296f1e3dec230008713eaf4ced680b8643"
+    },
+    "needed": [
+      "libfdisk.so.1",
+      "libsmartcols.so.1",
+      "libtinfo.so.6",
+      "libreadline.so.8",
+      "libc.so.6",
+      "ld-linux-armhf.so.3"
+    ],
+    "libfdisk_needed": [
+      "libuuid.so.1",
+      "libblkid.so.1",
+      "libc.so.6",
+      "ld-linux-armhf.so.3"
+    ],
+    "all_other_needed_objects_present_in_stock_main_initramfs": true
+  },
+  "real_customization_validation": {
+    "runtime_gate_injected": false,
+    "source": "exact pinned initramfs and exact ARMHF artifacts extracted read-only from its root filesystem",
+    "zstd_runs": 2,
+    "deterministic": true,
+    "output_size_bytes": 13452681,
+    "output_sha256": "b9d288874682de0d57ba48cd8abf6b6dd23ef8bb9d41394df81c508e6964cf77",
+    "early_archive_preserved_byte_for_byte": true,
+    "output_reopened_and_verified": true,
+    "physical_device_accessed": false
+  },
+  "conclusion": {
+    "python_in_initramfs": "refused",
+    "minimal_early_addition": "inject the exact ARMHF resize2fs, dumpe2fs, and sfdisk binaries plus libfdisk.so.1; every other dynamic object is already present",
+    "post_root_tools": "the pinned root already contains util-linux, exfatprogs, Python 3.13, and parted",
+    "physical_card_mutation_authorized": false
+  }
+}

@@ -1,0 +1,13 @@
+#!/bin/sh
+# INERT REVIEW TEMPLATE -- DO NOT INSTALL AS AN INITRAMFS RUNTIME.
+#
+# The required ordered guards, backup-before-write sequence, exact 6 GiB root
+# geometry, signature checks, marker reconciliation, and bounded failure/reboot
+# behavior are closed in ../firstboot-contract-v1.json.  No destructive command
+# is present here because those semantics have not passed loopback and
+# explicitly authorized expendable-card testing on the exact image.
+#
+# Refusal is intentional: an unresolved runtime must never become an executable
+# partitioning guess.
+echo "dashcam bounded-provision runtime is inert pending Pi validation" >&2
+exit 125

@@ -1,0 +1,19 @@
+This payload is a fail-closed executable candidate, not a hardware-ready hook.
+
+Do not create /etc/dashcam/firstboot-runtime-v1.enabled until all of these facts
+have been captured from the exact customized 32-bit Trixie image:
+
+- initramfs-tools hook ordering and the runtime stage location;
+- availability and shared-library closure at the exact /usr/bin and /usr/sbin
+  paths used by the closed runtime allowlist;
+- the durable writable boot-backup mount path and fsync/readback behavior;
+- live PARTUUID resolution before root is mounted read-write;
+- sfdisk write/verify and kernel reread behavior for this DOS/MBR image;
+- e2fsck, resize2fs, mkfs.exfat, blkid, fsck.exfat, and mount exit/output behavior;
+- the bounded evidence collector and atomic journal writer integration;
+- a successful loopback-image fault matrix and an explicitly authorized
+  expendable-card trial.
+
+The only accepted gate file content is:
+
+EXACT_IMAGE_RUNTIME_VALIDATED=v1

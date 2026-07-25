@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "hardware_facts_required": [
+    "initramfs hook ordering and runtime location",
+    "exact executable paths and shared-library closure",
+    "durable boot backup mount and fsync/readback behavior",
+    "pre-root PARTUUID resolution",
+    "DOS/MBR reread behavior",
+    "tool exit codes and structured output",
+    "bounded evidence collector integration",
+    "loopback and authorized expendable-card fault tests"
+  ],
+  "execution_gate_file": "/etc/dashcam/firstboot-runtime-v1.enabled",
+  "execution_gate_contents": "EXACT_IMAGE_RUNTIME_VALIDATED=v1"
+}

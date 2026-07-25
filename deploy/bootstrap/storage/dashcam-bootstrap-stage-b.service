@@ -1,0 +1,16 @@
+[Unit]
+Description=DashCam Bootstrap v1 storage Stage B
+DefaultDependencies=yes
+After=local-fs.target cloud-final.service dashcam-bootstrap-stage-a.service
+Before=dashcam-storage-check.service dashcamd.service
+Wants=local-fs.target cloud-final.service
+ConditionPathExists=/var/lib/dashcam/provisioning/bootstrap-v1.json
+
+[Service]
+Type=oneshot
+ExecStart=/opt/dashcam/venv/bin/python -m dashcam.provisioning.bootstrap --stage b
+TimeoutStartSec=300
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

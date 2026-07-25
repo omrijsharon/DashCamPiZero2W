@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-23T23:40:43.753Z",
+  "producer": {
+    "name": "codex-pre-pi-implementation",
+    "version": "0.1.0.dev0",
+    "build_id": "pre-pi-local-20260724"
+  },
+  "status": "passed",
+  "suite": {
+    "id": "pre-pi-local",
+    "name": "Pre-Pi hardware-independent implementation",
+    "run_id": "20260724-local-004",
+    "command": "See docs/test-reports/2026-07-24-pre-pi-implementation.md",
+    "tags": ["local", "pre-pi", "bounded-input", "integration"]
+  },
+  "summary": {
+    "duration_ms": 64370,
+    "total": 9,
+    "passed": 9,
+    "failed": 0,
+    "errored": 0,
+    "skipped": 0
+  },
+  "cases": [
+    {
+      "id": "lock",
+      "name": "uv lockfile synchronization",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "format",
+      "name": "Ruff formatting",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "lint",
+      "name": "Ruff lint",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "mypy",
+      "name": "Strict mypy",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "pytest-py311",
+      "name": "567 tests on Python 3.11.15",
+      "status": "passed",
+      "duration_ms": 17840
+    },
+    {
+      "id": "pytest-py312",
+      "name": "567 tests on Python 3.12.6",
+      "status": "passed",
+      "duration_ms": 11850
+    },
+    {
+      "id": "pytest-py313",
+      "name": "567 tests on Python 3.13.14",
+      "status": "passed",
+      "duration_ms": 18540
+    },
+    {
+      "id": "build-sdist",
+      "name": "Source distribution build",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "build-wheel",
+      "name": "Universal wheel build",
+      "status": "passed",
+      "duration_ms": 0
+    }
+  ],
+  "evidence_artifacts": [
+    {
+      "path": "docs/test-reports/2026-07-24-pre-pi-implementation.md",
+      "kind": "text",
+      "description": "Scope implementation corrections validation and limitations"
+    }
+  ],
+  "measurements": [
+    {
+      "name": "unit_tests_per_interpreter",
+      "value": 567,
+      "unit": "tests"
+    },
+    {
+      "name": "python_interpreters_tested",
+      "value": 3,
+      "unit": "interpreters"
+    },
+    {
+      "name": "pi_commands_executed",
+      "value": 0,
+      "unit": "commands"
+    }
+  ],
+  "warnings": [
+    {
+      "code": "LOCAL_FAKES_ONLY",
+      "message": "No Pi hardware media performance filesystem durability provisioning phone or Windows claim was evaluated."
+    },
+    {
+      "code": "TARGET_ADAPTERS_DEFERRED",
+      "message": "Camera media UART ALSA overlay preview deployment and privileged target adapters require the Milestone 4 capability gate."
+    }
+  ],
+  "environment": {
+    "kind": "local",
+    "os": "Microsoft Windows 11 Pro",
+    "os_version": "10.0.26200",
+    "architecture": "AMD64",
+    "python_version": "3.12.6",
+    "machine_class": "development-workstation"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "hevc",
+      "codec_type": "video",
+      "start_time": "0.000000",
+      "duration": "55.000000",
+      "bit_rate": "3000000"
+    },
+    {
+      "index": 1,
+      "codec_name": "opus",
+      "codec_type": "audio",
+      "start_time": "0.300000",
+      "duration": "54.000000"
+    }
+  ],
+  "format": {
+    "duration": "55.000000",
+    "bit_rate": "3100000"
+  },
+  "packets": [
+    {
+      "codec_type": "video",
+      "flags": "__",
+      "data": "00000000: 0000 0001 41aa bbcc"
+    }
+  ],
+  "frames": [
+    {
+      "media_type": "video",
+      "key_frame": 0,
+      "pict_type": "P"
+    }
+  ]
+}

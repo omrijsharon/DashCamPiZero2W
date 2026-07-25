@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-25",
+  "status": "v4_authorized_exact_card_image_independently_verified_offline_only",
+  "scope": "Regular-file image build and independent readback only. The V4 image has not been flashed to the authorized physical card, booted on a Pi, or used to mutate any hardware storage.",
+  "authorized_card_contract": {
+    "cid": "fe34325344000000200000031a0192d1",
+    "size_bytes": 31457280000,
+    "sector_count": 61440000,
+    "purpose": "The V4 runtime gate is bound only to this owner-authorized expendable card."
+  },
+  "image": {
+    "path": "artifacts/images/dashcam-release-authorized-fe34325344000000200000031a0192d1-v4.img",
+    "size_bytes": 2675965952,
+    "sha256": "6c243a01405210727aae5a63c1d28af9d386b746f26839ea917e15fe1308dd25"
+  },
+  "closure_manifest": {
+    "path": "deploy/image/initramfs-closure-v1.json",
+    "size_bytes": 7791,
+    "sha256": "ab74df854adabaa4611ea1683f06b73c42cbef51ce7a0c0ceda6044394d30799"
+  },
+  "independent_fat_and_cpio_readback": {
+    "selected_initramfs": "initramfs7",
+    "initramfs7_size_bytes": 13482464,
+    "initramfs7_sha256": "0740131c8be609b57ed4da0732f76483127a6941a9a7d27717c9173f1943eb30",
+    "embedded_hook_path": "scripts/local-premount/resize_early",
+    "embedded_hook_sha256": "0eb9d53e6c0c6b5e16f7214803f7a61d5cdc50f6f0cc3aa34562055c3b59eeee",
+    "embedded_hook_matches_reviewed_source_and_closure": true,
+    "cmdline": {
+      "root_partuuid": "4f2c9ea0-02",
+      "bounded_provision_trigger": "dashcam.bounded_provision=v1"
+    },
+    "config": {
+      "camera_auto_detect": true,
+      "auto_initramfs": true,
+      "dwc2_host_overlay": true
+    }
+  },
+  "v4_identity_race_repair": {
+    "identity_retry_max": 10,
+    "bounded_retry_scope": "Only the immediate post-partition-reread identity settle retries; partition writes, e2fsck, and resize remain one-shot.",
+    "verified_hook_features": [
+      "granular identity failure fields with explicit caller returns",
+      "captured rereadpt status",
+      "partprobe fallback with captured status",
+      "identity_settle diagnostic including field and bounded attempt",
+      "strict identity_before_ext4 check"
+    ]
+  },
+  "validation": {
+    "focused_identity_runtime": "13 passed, 1 skipped (Windows host sh syntax limitation)",
+    "wsl_posix_behavior": [
+      "transient identity failure succeeds on attempt 3",
+      "persistent identity failure stops on attempt 10 with field and attempt preserved"
+    ],
+    "focused_provisioning_and_image": "107 passed, 1 skipped",
+    "full_pytest": "812 passed, 1 skipped",
+    "mypy": "69 files passed",
+    "ruff": "passed"
+  },
+  "bounded_conclusion": {
+    "proven": "The V4 regular-file artifact and its selected ARMv7 initramfs7 hook were independently re-read and match the reviewed bounded identity-settle repair.",
+    "not_proven": "No physical-card flash, Pi boot, partition transaction, reboot, Wi-Fi association, SSH availability, or storage-growth result has been observed for V4.",
+    "next_authorized_action": "Re-resolve the exact authorized card offline, inspect the V4 Imager summary and customisation, obtain action-time confirmation, flash V4, then collect bounded first-boot evidence without blind retries.",
+    "milestone_5": "Milestone 5 remains unchecked."
+  }
+}

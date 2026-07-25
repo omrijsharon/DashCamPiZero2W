@@ -1,0 +1,477 @@
+{
+  "evaluated_capabilities": [
+    {
+      "basis_observation_ids": [
+        "media.rpicam.cameras",
+        "media.rpicam.version",
+        "media.libcamera.cameras",
+        "media.gstreamer.version",
+        "media.gstreamer.libcamera",
+        "media.gstreamer.h264",
+        "media.ffmpeg.version",
+        "media.ffmpeg.encoders",
+        "media.ffprobe.version",
+        "media.v4l2.nodes"
+      ],
+      "decision": "unknown",
+      "id": "camera.enumeration",
+      "rationale": "Camera modes require target inspection."
+    },
+    {
+      "basis_observation_ids": [
+        "media.rpicam.cameras",
+        "media.rpicam.version",
+        "media.libcamera.cameras",
+        "media.gstreamer.version",
+        "media.gstreamer.libcamera",
+        "media.gstreamer.h264",
+        "media.ffmpeg.version",
+        "media.ffmpeg.encoders",
+        "media.ffprobe.version",
+        "media.v4l2.nodes"
+      ],
+      "decision": "unknown",
+      "id": "encoder.hardware_h264",
+      "rationale": "Hardware H.264 requires a measured target test."
+    },
+    {
+      "basis_observation_ids": [
+        "audio.capture.devices",
+        "audio.capture.pcms"
+      ],
+      "decision": "unknown",
+      "id": "audio.capture",
+      "rationale": "Audio compatibility requires the selected USB device."
+    },
+    {
+      "basis_observation_ids": [
+        "uart.serial0.mapping",
+        "uart.kernel.cmdline",
+        "uart.boot.config",
+        "uart.legacy.boot.config"
+      ],
+      "decision": "unknown",
+      "id": "uart.gps",
+      "rationale": "UART mapping and stability require the target boot configuration."
+    },
+    {
+      "basis_observation_ids": [
+        "storage.block.layout",
+        "storage.recording.mount",
+        "storage.recording.space",
+        "storage.exfat.module",
+        "storage.exfat.fsck",
+        "storage.exfat.mkfs",
+        "storage.filesystems"
+      ],
+      "decision": "unknown",
+      "id": "storage.exfat",
+      "rationale": "exFAT safety requires the final card and mount identity."
+    },
+    {
+      "basis_observation_ids": [
+        "thermal.throttled",
+        "thermal.temperature",
+        "thermal.sysfs.temperature"
+      ],
+      "decision": "unknown",
+      "id": "thermal.power",
+      "rationale": "Thermal and power health require a target measurement."
+    }
+  ],
+  "evidence_artifacts": [],
+  "generated_at_utc": "2026-07-24T08:02:04.167034Z",
+  "producer": {
+    "build_id": "0.unknown",
+    "name": "dashcam-capability-probe",
+    "version": "0.unknown"
+  },
+  "raw_observations": {
+    "audio": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "audio.capture.devices",
+          "key": "raw_output",
+          "source": "arecord --list-devices",
+          "state": "observed",
+          "value": "**** List of CAPTURE Hardware Devices ****"
+        },
+        {
+          "id": "audio.capture.pcms",
+          "key": "raw_output",
+          "source": "arecord --list-pcms",
+          "state": "observed",
+          "value": "null\n    Discard all samples (playback) or generate zero samples (capture)\ndefault\n    Default Audio Device\nsysdefault\n    Default Audio Device"
+        }
+      ],
+      "state": "observed",
+      "warnings": []
+    },
+    "hardware": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "hardware.cpuinfo",
+          "key": "raw_output",
+          "source": "/proc/cpuinfo",
+          "state": "observed",
+          "value": "processor\t: 0\nmodel name\t: ARMv7 Processor rev 4 (v7l)\nBogoMIPS\t: 64.00\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae evtstrm crc32 \nCPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xd03\nCPU revision\t: 4\n\nprocessor\t: 1\nmodel name\t: ARMv7 Processor rev 4 (v7l)\nBogoMIPS\t: 64.00\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae evtstrm crc32 \nCPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xd03\nCPU revision\t: 4\n\nprocessor\t: 2\nmodel name\t: ARMv7 Processor rev 4 (v7l)\nBogoMIPS\t: 64.00\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae evtstrm crc32 \nCPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xd03\nCPU revision\t: 4\n\nprocessor\t: 3\nmodel name\t: ARMv7 Processor rev 4 (v7l)\nBogoMIPS\t: 64.00\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae evtstrm crc32 \nCPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xd03\nCPU revision\t: 4\n\nHardware\t: BCM2835\nRevision\t: 902120\nSerial\t\t: 00000000e36a511b\nModel\t\t: Raspberry Pi Zero 2 W Rev 1.0"
+        },
+        {
+          "id": "hardware.meminfo",
+          "key": "raw_output",
+          "source": "/proc/meminfo",
+          "state": "observed",
+          "value": "MemTotal:         435192 kB\nMemFree:          173992 kB\nMemAvailable:     301140 kB\nBuffers:            6772 kB\nCached:           181440 kB\nSwapCached:            0 kB\nActive:            44012 kB\nInactive:         167888 kB\nActive(anon):      27856 kB\nInactive(anon):    16692 kB\nActive(file):      16156 kB\nInactive(file):   151196 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:        434172 kB\nSwapFree:         434168 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 4 kB\nWriteback:             0 kB\nAnonPages:         23640 kB\nMapped:            38088 kB\nShmem:             20844 kB\nKReclaimable:       9960 kB\nSlab:              26680 kB\nSReclaimable:       9960 kB\nSUnreclaim:        16720 kB\nKernelStack:        1056 kB\nPageTables:         1428 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:      651768 kB\nCommitted_AS:     120060 kB\nVmallocTotal:    1622016 kB\nVmallocUsed:        8904 kB\nVmallocChunk:          0 kB\nPercpu:              448 kB\nCmaTotal:         262144 kB\nCmaFree:          136100 kB\nBalloon:               0 kB"
+        }
+      ],
+      "state": "observed",
+      "warnings": []
+    },
+    "media": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "media.rpicam.cameras",
+          "key": "raw_output",
+          "source": "rpicam-hello --list-cameras",
+          "state": "observed",
+          "value": "Available cameras\n-----------------\n0 : imx219 [3280x2464 10-bit RGGB] (/base/soc/i2c0mux/i2c@1/imx219@10)\n    Modes: 'SRGGB10_CSI2P' : 640x480 [200.16 fps - (1000, 752)/1280x960 crop]\n                             1640x1232 [81.07 fps - (0, 0)/3280x2464 crop]\n                             1920x1080 [47.57 fps - (680, 692)/1920x1080 crop]\n                             3280x2464 [21.19 fps - (0, 0)/3280x2464 crop]\n           'SRGGB8' : 640x480 [200.16 fps - (1000, 752)/1280x960 crop]\n                      1640x1232 [81.07 fps - (0, 0)/3280x2464 crop]\n                      1920x1080 [47.57 fps - (680, 692)/1920x1080 crop]\n                      3280x2464 [21.19 fps - (0, 0)/3280x2464 crop]"
+        },
+        {
+          "id": "media.rpicam.version",
+          "key": "raw_output",
+          "source": "rpicam-hello --version",
+          "state": "observed",
+          "value": "rpicam-apps build: v1.12.0 12-05-2026 (11:49:26)\nrpicam-apps capabilites: egl:0 qt:0 drm:1 libav:0\nlibcamera build: v0.7.1+rpt20260609"
+        },
+        {
+          "id": "media.libcamera.cameras",
+          "key": "raw_output",
+          "note": "executable not found: libcamera-hello",
+          "source": "libcamera-hello --list-cameras",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "media.gstreamer.version",
+          "key": "raw_output",
+          "source": "gst-inspect-1.0 --version",
+          "state": "observed",
+          "value": "gst-inspect-1.0 version 1.26.2\nGStreamer 1.26.2\nhttps://tracker.debian.org/pkg/gstreamer1.0"
+        },
+        {
+          "id": "media.gstreamer.libcamera",
+          "key": "raw_output",
+          "source": "gst-inspect-1.0 --exists libcamerasrc",
+          "state": "observed",
+          "value": null
+        },
+        {
+          "id": "media.gstreamer.h264",
+          "key": "raw_output",
+          "source": "gst-inspect-1.0 --exists v4l2h264enc",
+          "state": "observed",
+          "value": null
+        },
+        {
+          "id": "media.ffmpeg.version",
+          "key": "raw_output",
+          "note": "executable not found: ffmpeg",
+          "source": "ffmpeg -version",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "media.ffmpeg.encoders",
+          "key": "raw_output",
+          "note": "executable not found: ffmpeg",
+          "source": "ffmpeg -hide_banner -encoders",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "media.ffprobe.version",
+          "key": "raw_output",
+          "note": "executable not found: ffprobe",
+          "source": "ffprobe -version",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "media.v4l2.nodes",
+          "key": "raw_output",
+          "source": "v4l2-ctl --list-devices",
+          "state": "observed",
+          "value": "unicam (platform:3f801000.csi):\n\t/dev/video0\n\t/dev/media3\n\nbcm2835-codec-decode (platform:bcm2835-codec):\n\t/dev/video10\n\t/dev/video11\n\t/dev/video12\n\t/dev/video18\n\t/dev/video31\n\nbcm2835-isp (platform:bcm2835-isp):\n\t/dev/video13\n\t/dev/video14\n\t/dev/video15\n\t/dev/video16\n\t/dev/video20\n\t/dev/video21\n\t/dev/video22\n\t/dev/video23\n\t/dev/media0\n\t/dev/media1\n\nbcm2835-codec (vchiq:bcm2835-codec):\n\t/dev/media2"
+        }
+      ],
+      "state": "observed",
+      "warnings": [
+        {
+          "code": "media.libcamera.cameras.state",
+          "message": "executable not found: libcamera-hello"
+        },
+        {
+          "code": "media.ffmpeg.version.state",
+          "message": "executable not found: ffmpeg"
+        },
+        {
+          "code": "media.ffmpeg.encoders.state",
+          "message": "executable not found: ffmpeg"
+        },
+        {
+          "code": "media.ffprobe.version.state",
+          "message": "executable not found: ffprobe"
+        }
+      ]
+    },
+    "os": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "os.uname",
+          "key": "raw_output",
+          "source": "uname -srvmo",
+          "state": "observed",
+          "value": "Linux 6.18.34+rpt-rpi-v7 #1 SMP Raspbian 1:6.18.34-1+rpt1 (2026-06-09) armv7l GNU/Linux"
+        },
+        {
+          "id": "os.architecture",
+          "key": "raw_output",
+          "source": "uname -m",
+          "state": "observed",
+          "value": "armv7l"
+        },
+        {
+          "id": "os.python",
+          "key": "raw_output",
+          "source": "python3 --version",
+          "state": "observed",
+          "value": "Python 3.13.5"
+        },
+        {
+          "id": "os.systemd",
+          "key": "raw_output",
+          "source": "systemctl --version",
+          "state": "observed",
+          "value": "systemd 257 (257.9-1~deb13u1+rpi1)\n+PAM +AUDIT +SELINUX +APPARMOR +IMA +IPE +SMACK +SECCOMP +GCRYPT -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBCRYPTSETUP_PLUGINS +LIBFDISK +PCRE2 +PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -BPF_FRAMEWORK -BTF -XKBCOMMON -UTMP +SYSVINIT +LIBARCHIVE"
+        },
+        {
+          "id": "os.release",
+          "key": "raw_output",
+          "source": "/etc/os-release",
+          "state": "observed",
+          "value": "PRETTY_NAME=\"Raspbian GNU/Linux 13 (trixie)\"\nNAME=\"Raspbian GNU/Linux\"\nVERSION_ID=\"13\"\nVERSION=\"13 (trixie)\"\nVERSION_CODENAME=trixie\nDEBIAN_VERSION_FULL=13.4\nID=raspbian\nID_LIKE=debian\nHOME_URL=\"http://www.raspbian.org/\"\nSUPPORT_URL=\"http://www.raspbian.org/RaspbianForums\"\nBUG_REPORT_URL=\"http://www.raspbian.org/RaspbianBugs\""
+        }
+      ],
+      "state": "observed",
+      "warnings": []
+    },
+    "storage": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "storage.block.layout",
+          "key": "raw_output",
+          "source": "lsblk --json --output NAME,KNAME,TYPE,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS,RO",
+          "state": "observed",
+          "value": "{\n   \"blockdevices\": [\n      {\n         \"name\": \"loop0\",\n         \"kname\": \"loop0\",\n         \"type\": \"loop\",\n         \"size\": \"424M\",\n         \"fstype\": \"swap\",\n         \"label\": null,\n         \"uuid\": null,\n         \"mountpoints\": [],\n         \"ro\": false\n      },{\n         \"name\": \"mmcblk0\",\n         \"kname\": \"mmcblk0\",\n         \"type\": \"disk\",\n         \"size\": \"29.3G\",\n         \"fstype\": null,\n         \"label\": null,\n         \"uuid\": null,\n         \"mountpoints\": [],\n         \"ro\": false,\n         \"children\": [\n            {\n               \"name\": \"mmcblk0p1\",\n               \"kname\": \"mmcblk0p1\",\n               \"type\": \"part\",\n               \"size\": \"512M\",\n               \"fstype\": \"vfat\",\n               \"label\": \"bootfs\",\n               \"uuid\": \"89F4-4546\",\n               \"mountpoints\": [\n                   \"/boot/firmware\"\n               ],\n               \"ro\": false\n            },{\n               \"name\": \"mmcblk0p2\",\n               \"kname\": \"mmcblk0p2\",\n               \"type\": \"part\",\n               \"size\": \"28.8G\",\n               \"fstype\": \"ext4\",\n               \"label\": \"rootfs\",\n               \"uuid\": \"e9ef4083-101b-46b4-b87d-de84fe1169f8\",\n               \"mountpoints\": [\n                   \"/\"\n               ],\n               \"ro\": false\n            }\n         ]\n      },{\n         \"name\": \"zram0\",\n         \"kname\": \"zram0\",\n         \"type\": \"disk\",\n         \"size\": \"424M\",\n         \"fstype\": \"swap\",\n         \"label\": \"zram0\",\n         \"uuid\": \"2889c092-0450-4e23-9ea1-5e7a9cd0ad51\",\n         \"mountpoints\": [\n             \"[SWAP]\"\n         ],\n         \"ro\": false\n      }\n   ]\n}"
+        },
+        {
+          "id": "storage.recording.mount",
+          "key": "raw_output",
+          "note": "command exited with status 1",
+          "source": "findmnt --json --output SOURCE,TARGET,FSTYPE,OPTIONS,LABEL,UUID /srv/dashcam",
+          "state": "error",
+          "value": null
+        },
+        {
+          "id": "storage.recording.space",
+          "key": "raw_output",
+          "note": "command exited with status 1",
+          "source": "df --output=source,fstype,size,used,avail,pcent,target -B1 /srv/dashcam",
+          "state": "error",
+          "value": "[stderr]\ndf: /srv/dashcam: No such file or directory"
+        },
+        {
+          "id": "storage.exfat.module",
+          "key": "raw_output",
+          "note": "executable not found: modinfo",
+          "source": "modinfo exfat",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "storage.exfat.fsck",
+          "key": "raw_output",
+          "note": "executable not found: fsck.exfat",
+          "source": "fsck.exfat -V",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "storage.exfat.mkfs",
+          "key": "raw_output",
+          "note": "executable not found: mkfs.exfat",
+          "source": "mkfs.exfat -V",
+          "state": "unavailable",
+          "value": null
+        },
+        {
+          "id": "storage.filesystems",
+          "key": "raw_output",
+          "source": "/proc/filesystems",
+          "state": "observed",
+          "value": "nodev\tsysfs\nnodev\ttmpfs\nnodev\tbdev\nnodev\tproc\nnodev\tcgroup\nnodev\tcgroup2\nnodev\tcpuset\nnodev\tdevtmpfs\nnodev\tconfigfs\nnodev\tdebugfs\nnodev\ttracefs\nnodev\tsecurityfs\nnodev\tsockfs\nnodev\tbpf\nnodev\tpipefs\nnodev\tramfs\nnodev\trpc_pipefs\nnodev\tdevpts\n\text3\n\text2\n\text4\n\tvfat\n\tmsdos\nnodev\tnfs\nnodev\tnfs4\nnodev\tautofs\n\tf2fs\nnodev\tmqueue\nnodev\tpstore\n\tfuseblk\nnodev\tfuse\nnodev\tfusectl\nnodev\tbinfmt_misc"
+        }
+      ],
+      "state": "observed",
+      "warnings": [
+        {
+          "code": "storage.recording.mount.state",
+          "message": "command exited with status 1"
+        },
+        {
+          "code": "storage.recording.space.state",
+          "message": "command exited with status 1"
+        },
+        {
+          "code": "storage.exfat.module.state",
+          "message": "executable not found: modinfo"
+        },
+        {
+          "code": "storage.exfat.fsck.state",
+          "message": "executable not found: fsck.exfat"
+        },
+        {
+          "code": "storage.exfat.mkfs.state",
+          "message": "executable not found: mkfs.exfat"
+        }
+      ]
+    },
+    "target_identity": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "target.model",
+          "key": "raw_output",
+          "source": "/proc/device-tree/model",
+          "state": "observed",
+          "value": "Raspberry Pi Zero 2 W Rev 1.0"
+        }
+      ],
+      "state": "observed",
+      "warnings": []
+    },
+    "thermal": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "thermal.throttled",
+          "key": "raw_output",
+          "source": "vcgencmd get_throttled",
+          "state": "observed",
+          "value": "throttled=0x0"
+        },
+        {
+          "id": "thermal.temperature",
+          "key": "raw_output",
+          "source": "vcgencmd measure_temp",
+          "state": "observed",
+          "value": "temp=48.3'C"
+        },
+        {
+          "id": "thermal.sysfs.temperature",
+          "key": "raw_output",
+          "source": "/sys/class/thermal/thermal_zone0/temp",
+          "state": "observed",
+          "value": "47774"
+        }
+      ],
+      "state": "observed",
+      "warnings": []
+    },
+    "uart": {
+      "evidence_artifact_paths": [],
+      "facts": [
+        {
+          "id": "uart.serial0.mapping",
+          "key": "raw_output",
+          "source": "readlink -e /dev/serial0",
+          "state": "observed",
+          "value": "/dev/ttyAMA0"
+        },
+        {
+          "id": "uart.kernel.cmdline",
+          "key": "raw_output",
+          "source": "/proc/cmdline",
+          "state": "observed",
+          "value": "coherent_pool=1M 8250.nr_uarts=1 snd_bcm2835.enable_headphones=0 cgroup_disable=memory snd_bcm2835.enable_hdmi=1 snd_bcm2835.enable_hdmi=0  smsc95xx.macaddr=B8:27:EB:6A:51:1B vc_mem.mem_base=0x1ec00000 vc_mem.mem_size=0x20000000  console=tty1 root=PARTUUID=624667df-02 rootfstype=ext4 fsck.repair=yes rootwait ds=nocloud;i=rpi-imager-1784877025772 cfg80211.ieee80211_regdom=IL"
+        },
+        {
+          "id": "uart.boot.config",
+          "key": "raw_output",
+          "source": "/boot/firmware/config.txt",
+          "state": "observed",
+          "value": "# For more options and information see\n# http://rptl.io/configtxt\n# Some settings may impact device functionality. See link above for details\n\n# Uncomment some or all of these to enable the optional hardware interfaces\n#dtparam=i2c_arm=on\n#dtparam=i2s=on\n#dtparam=spi=on\n\n# Enable audio (loads snd_bcm2835)\ndtparam=audio=on\n\n# Additional overlays and parameters are documented\n# /boot/firmware/overlays/README\n\n# Use the explicitly identified IMX219 CSI camera.\ncamera_auto_detect=0\n\n# Automatically load overlays for detected DSI displays\ndisplay_auto_detect=1\n\n# Automatically load initramfs files, if found\nauto_initramfs=1\n\n# Enable DRM VC4 V3D driver\ndtoverlay=vc4-kms-v3d\nmax_framebuffers=2\n\n# Don't have the firmware create an initial video= setting in cmdline.txt.\n# Use the kernel's default instead.\ndisable_fw_kms_setup=1\n\n# Disable compensation for displays with overscan\ndisable_overscan=1\n\n# Run as fast as firmware / board allows\narm_boost=1\n\n[cm4]\n# Enable host mode on the 2711 built-in XHCI USB controller.\n# This line should be removed if the legacy DWC2 controller is required\n# (e.g. for USB device mode) or if USB support is not required.\notg_mode=1\n\n[cm5]\ndtoverlay=dwc2,dr_mode=host\n\n[pi5]\ndtoverlay=nospi10\n\n[all]\ndtoverlay=imx219\n\n# Give the GPS a stable, hardware-timed primary UART on GPIO 14/15.\n# Bluetooth is deliberately disabled; this product does not use it.\nenable_uart=1\ndtoverlay=disable-bt"
+        },
+        {
+          "id": "uart.legacy.boot.config",
+          "key": "raw_output",
+          "source": "/boot/config.txt",
+          "state": "observed",
+          "value": "DO NOT EDIT THIS FILE\n\nThe file you are looking for has moved to /boot/firmware/config.txt"
+        }
+      ],
+      "state": "observed",
+      "warnings": []
+    }
+  },
+  "schema_version": 1,
+  "status": "partial",
+  "target": {
+    "declared_model": "Raspberry Pi Zero 2 W Rev 1.0",
+    "identity_state": "observed",
+    "kind": "raspberry_pi"
+  },
+  "warnings": [
+    {
+      "code": "media.libcamera.cameras.state",
+      "message": "executable not found: libcamera-hello"
+    },
+    {
+      "code": "media.ffmpeg.version.state",
+      "message": "executable not found: ffmpeg"
+    },
+    {
+      "code": "media.ffmpeg.encoders.state",
+      "message": "executable not found: ffmpeg"
+    },
+    {
+      "code": "media.ffprobe.version.state",
+      "message": "executable not found: ffprobe"
+    },
+    {
+      "code": "storage.recording.mount.state",
+      "message": "command exited with status 1"
+    },
+    {
+      "code": "storage.recording.space.state",
+      "message": "command exited with status 1"
+    },
+    {
+      "code": "storage.exfat.module.state",
+      "message": "executable not found: modinfo"
+    },
+    {
+      "code": "storage.exfat.fsck.state",
+      "message": "executable not found: fsck.exfat"
+    },
+    {
+      "code": "storage.exfat.mkfs.state",
+      "message": "executable not found: mkfs.exfat"
+    }
+  ]
+}

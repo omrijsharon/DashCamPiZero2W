@@ -1,0 +1,52 @@
+{
+  "identity": {
+    "resolved_path": "/dev/mmcblk9",
+    "serial": "fe34325344000000200000031a0192d1",
+    "size_bytes": 31457280000,
+    "partition_table_fingerprint": "17eee4a5eb7d0641bf6ea6a2013ff5203c09aa72b7420ff990bd82ec08406ae6"
+  },
+  "device_path_is_resolved": true,
+  "table_type": "dos",
+  "mbr_disk_id": "0x4f2c9ea0",
+  "sector_size_bytes": 512,
+  "total_sectors": 61440000,
+  "is_system_disk": false,
+  "is_root_disk": false,
+  "unpartitioned_data_signatures": [],
+  "partitions": [
+    {
+      "number": 1,
+      "start_sector": 16384,
+      "end_sector": 1064959,
+      "filesystem": "vfat",
+      "label": "bootfs",
+      "uuid": "89F4-4546",
+      "mount_points": [],
+      "has_data_signature": false,
+      "partition_type": "0x0c",
+      "bootable": false,
+      "partuuid": "4f2c9ea0-01"
+    },
+    {
+      "number": 2,
+      "start_sector": 1064960,
+      "end_sector": 5226495,
+      "filesystem": "ext4",
+      "label": "rootfs",
+      "uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8",
+      "mount_points": [],
+      "has_data_signature": false,
+      "partition_type": "0x83",
+      "bootable": false,
+      "partuuid": "4f2c9ea0-02"
+    }
+  ],
+  "state_marker_layout_version": null,
+  "state_marker_serial": null,
+  "state_marker_uuid": null,
+  "state_marker_source_table_fingerprint": null,
+  "volume_sentinel_layout_version": null,
+  "volume_sentinel_serial": null,
+  "volume_sentinel_uuid": null,
+  "volume_sentinel_source_table_fingerprint": null
+}

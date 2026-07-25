@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "target": {
+    "profile": "pi-zero-2-w-armv7l",
+    "architecture": "armv7l",
+    "kernel_filename": "kernel7.img",
+    "initramfs_filename": "initramfs7",
+    "auto_initramfs_required": true
+  },
+  "input": {
+    "size_bytes": 14257002,
+    "sha256": "3f5288ed963028accc5103f13f5a03a9d6d26ef3f58ad38a31736d3802d452b1",
+    "main_offset": 3924992,
+    "main_compressed_size_bytes": 10332010,
+    "main_compressed_sha256": "e9700e154fca461536ae0987ed4e4dcd95d0a48d70eee0fdf6be77179491d209",
+    "main_uncompressed_size_bytes": 34104832,
+    "main_uncompressed_sha256": "73f89f5ccd0638675c555584b5d1547d55ad09ee848801f25b3eeb123cb1eefb",
+    "early_entry_count": 328,
+    "main_entry_count": 467
+  },
+  "stock_hook": {
+    "path": "scripts/local-premount/resize_early",
+    "required_count": 1,
+    "replacement_sha256": "0eb9d53e6c0c6b5e16f7214803f7a61d5cdc50f6f0cc3aa34562055c3b59eeee"
+  },
+  "injection": {
+    "directory": "etc/dashcam",
+    "directory_mode": 16877,
+    "mtime": 1750291200
+  },
+  "contracts": [
+    {
+      "destination": "etc/dashcam/firstboot-initramfs-v1.conf",
+      "content": "schema=v1\ndisk=/dev/mmcblk0\nroot=/dev/mmcblk0p2\ncid=fe34325344000000200000031a0192d1\ndevice_sectors=61440000\nboot_partuuid=4f2c9ea0-01\nroot_partuuid=4f2c9ea0-02\nsource_root_sectors=4161536\ntarget_root_sectors=12582912\ndata_start_sector=13647872\ndata_size_sectors=47790080\n",
+      "sha256": "f6295f64aadfcba9903a81721c4cc241be8444c79311da94ba1a9348f7f33b82",
+      "mode": 33060,
+      "mtime": 1750291200
+    },
+    {
+      "destination": "etc/dashcam/source-table-v1.sfdisk",
+      "content": "label: dos\nlabel-id: 0x4f2c9ea0\ndevice: /dev/mmcblk0\nunit: sectors\nsector-size: 512\n\n/dev/mmcblk0p1 : start=16384, size=1048576, type=c\n/dev/mmcblk0p2 : start=1064960, size=4161536, type=83\n",
+      "sha256": "96cd63919db38bbfab4921ab7d6458e7a3721c94d5cc211eceec90726ac6f41c",
+      "mode": 33060,
+      "mtime": 1750291200
+    },
+    {
+      "destination": "etc/dashcam/target-table-v1.sfdisk",
+      "content": "label: dos\nlabel-id: 0x4f2c9ea0\ndevice: /dev/mmcblk0\nunit: sectors\nsector-size: 512\n\n/dev/mmcblk0p1 : start=16384, size=1048576, type=c\n/dev/mmcblk0p2 : start=1064960, size=12582912, type=83\n/dev/mmcblk0p3 : start=13647872, size=47790080, type=7\n",
+      "sha256": "ef8d7b4101b7e308f9f79e4d59e8d79bfc24138d2cc1dd5225152c6de382d00e",
+      "mode": 33060,
+      "mtime": 1750291200
+    }
+  ],
+  "artifacts": [
+    {
+      "key": "resize2fs",
+      "source_path": "/usr/sbin/resize2fs",
+      "destination": "usr/sbin/resize2fs",
+      "sha256": "ae09115ff8fc5dc358034a764e67f42f3e60bbd66fb7f4a9b5ab2ad18031066d",
+      "mode": 33261,
+      "mtime": 1749581969
+    },
+    {
+      "key": "dumpe2fs",
+      "source_path": "/usr/sbin/dumpe2fs",
+      "destination": "usr/sbin/dumpe2fs",
+      "sha256": "abbcbd8c85cfbc3b3a1bdb178acfa9b0f615fdcb8adc9f030a9e70ca35c138fe",
+      "mode": 33261,
+      "mtime": 1749581969
+    },
+    {
+      "key": "sfdisk",
+      "source_path": "/usr/sbin/sfdisk",
+      "destination": "usr/sbin/sfdisk",
+      "sha256": "d3aaf9f941fb06a9e6e8c21214a30dbb5deb29cab31186db8c7e7c52f1920c49",
+      "mode": 33261,
+      "mtime": 1746831247
+    },
+    {
+      "key": "libfdisk",
+      "source_path": "/usr/lib/arm-linux-gnueabihf/libfdisk.so.1.1.0",
+      "destination": "usr/lib/arm-linux-gnueabihf/libfdisk.so.1",
+      "sha256": "70e7e97e29c10b4f271a8b25a6e6a4296f1e3dec230008713eaf4ced680b8643",
+      "mode": 33188,
+      "mtime": 1746831247
+    }
+  ],
+  "elf_closure": {
+    "root_artifact_keys": [
+      "resize2fs",
+      "dumpe2fs",
+      "sfdisk",
+      "libfdisk"
+    ],
+    "required_stock_entries": [
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/ld-linux-armhf.so.3",
+        "sha256": "28f7d1bc1217e9aceb034ca61b6e1c1d9278e12a35fbe0965362935119092acd",
+        "mode": 33261
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libblkid.so.1",
+        "sha256": "c6f3004caf3586c483099404abe5045d36675a544bde5c9929f34d6e9bef4c23",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libblkid.so.1.1.0",
+        "sha256": "9972ba0ff82e5656d35332c95bfe6bc5af1b12a87054bf401e73537012af222d",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libc.so.6",
+        "sha256": "abe352709a75ac13f2a3e76b3232eb193b444f1322c62ce843bde62c05194d87",
+        "mode": 33261
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libcom_err.so.2",
+        "sha256": "409e93e870abb4313a4b8640c036271d350530f2303742312ff6afd13fc56795",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libcom_err.so.2.1",
+        "sha256": "4dc1a3fbeccedab07752e01117cea3f50fd3120b52fff65fc2e0172adba82016",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libe2p.so.2",
+        "sha256": "fa956189dddee06e84e2cd127ff873ea94680a51f5dbddf2d8219f4707318e58",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libe2p.so.2.3",
+        "sha256": "214fbe83ba5971aeacdb43846c3ac822fe7e0a39e2fc0e3df7565b8b744606d8",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libext2fs.so.2",
+        "sha256": "a4df4b26b9e2cda589915afbc75037883ffc5285d590990563d9443cf4e1c32e",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libext2fs.so.2.4",
+        "sha256": "24bdd0d1a7449885c13188e9380dd13b67808b6691b76c5f7ce1afedba1a1df9",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libreadline.so.8",
+        "sha256": "2f0f7e1af1f9b791a6fa8cfcc5c115cd2bc4f14cb7c25902aeb576ee4e8f9fbc",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libreadline.so.8.2",
+        "sha256": "73b7942451a61e7f1120d396370f02d9e4220f9ccce2ccc1b5949285b183cfe2",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libsmartcols.so.1",
+        "sha256": "704126d709744e1a260147a3c74f10b7360536a84a6a0be95dd4517de6cb1fc1",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libsmartcols.so.1.1.0",
+        "sha256": "f852d958c1b6c2f9de8bc11ad637f69d2aa86f968546b5a0fad89a4c63d03fb5",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libtinfo.so.6",
+        "sha256": "3802ace610bace6a4630434ffb827553d811bb6ccd7e93f21636dd4f9950ee12",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libtinfo.so.6.5",
+        "sha256": "ad66a6b83316ee56b029609c2c2faaef8aee3480d37c3baaa1e381c9a329d058",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libuuid.so.1",
+        "sha256": "5106e5a2079097d6cf84a73ae5d9dd53a3279a06006e7616d60be7afdb144556",
+        "mode": 41471
+      },
+      {
+        "destination": "usr/lib/arm-linux-gnueabihf/libuuid.so.1.3.0",
+        "sha256": "0b1a68fea2e1ae494b9ef3a0fcf469d19da39a72e8d433b3681db290df7edb27",
+        "mode": 33188
+      },
+      {
+        "destination": "usr/lib/ld-linux-armhf.so.3",
+        "sha256": "13c98c5a2d83830645ac929e52f6c87791657dcf79252aac1d47301556416b87",
+        "mode": 41471
+      }
+    ]
+  },
+  "runtime_gate": {
+    "destination": "etc/dashcam/firstboot-runtime-v1.enabled",
+    "content": "EXACT_IMAGE_RUNTIME_VALIDATED=v1\n",
+    "sha256": "63011e33524f0c45d1def101947267fd6b44ab610be673758f8a82d75c67b3b9",
+    "mode": 33024,
+    "mtime": 1750291200
+  },
+  "zstd": {
+    "compression_level": 19,
+    "threads": 1,
+    "checksum": true
+  },
+  "maximum_output_bytes": 20971520
+}

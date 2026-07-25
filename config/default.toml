@@ -1,0 +1,76 @@
+schema_version = 1
+device_name = "Dashcam"
+
+[video]
+width = 1920
+height = 1080
+fps = 30
+codec = "h264"
+hardware_encoder_required = true
+bitrate_bps = 8000000
+keyframe_interval_frames = 30
+clip_duration_s = 60
+container = "mp4"
+
+[audio]
+enabled = true
+device_match = "usb-VID_PID-or-stable-name"
+sample_rate_hz = 48000
+channels = 1
+codec = "aac"
+bitrate_bps = 128000
+
+[gps]
+device = "/dev/serial0"
+baud = 115200
+stale_after_s = 2.0
+max_sample_hz = 10
+
+[time]
+timezone = "Asia/Jerusalem"
+filename_timezone = "UTC"
+discipline_system_clock = true
+system_clock_owner = "chrony"
+
+[overlay]
+enabled = true
+show_local_datetime = true
+show_utc_offset = true
+show_rec = true
+show_speed = true
+speed_unit = "kmh"
+show_coordinates = true
+coordinate_decimals = 5
+show_altitude = true
+show_satellites = true
+show_hdop = false
+
+[preview]
+enabled = true
+width = 640
+height = 360
+fps = 15
+max_clients = 1
+latency_target_ms = 500
+
+[storage]
+recording_root = "/srv/dashcam"
+required_filesystem = "exfat"
+required_volume_label = "DASHCAM"
+require_distinct_mount = true
+low_watermark_percent = 15
+high_watermark_percent = 20
+minimum_free_gib = 2.0
+emergency_free_mib = 256
+protect_previous_clips = 2
+protect_next_clips = 1
+
+[network]
+ap_enabled = true
+ssid_prefix = "Dashcam"
+address = "192.168.50.1/24"
+
+[service]
+watchdog_s = 20
+restart_backoff_min_s = 1
+restart_backoff_max_s = 60

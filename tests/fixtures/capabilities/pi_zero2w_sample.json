@@ -1,0 +1,40 @@
+{
+  "commands": {
+    "os.uname": {"state": "observed", "value": "Linux 6.6.31+rpt-rpi-v7 #1 SMP armv7l GNU/Linux"},
+    "os.architecture": {"state": "observed", "value": "armv7l"},
+    "os.python": {"state": "observed", "value": "Python 3.11.2"},
+    "os.systemd": {"state": "observed", "value": "systemd 252 (252.30-1~deb12u2)"},
+    "media.rpicam.cameras": {"state": "observed", "value": "Available cameras\\n-----------------\\n0 : imx219 [3280x2464 10-bit RGGB]"},
+    "media.rpicam.version": {"state": "observed", "value": "rpicam-apps build: sample-fixture"},
+    "media.libcamera.cameras": {"state": "unavailable", "value": "", "note": "executable not found: libcamera-hello"},
+    "media.gstreamer.version": {"state": "observed", "value": "gst-inspect-1.0 version 1.22.0"},
+    "media.gstreamer.libcamera": {"state": "observed", "value": "Factory Details: libcamerasrc"},
+    "media.gstreamer.h264": {"state": "observed", "value": "Factory Details: v4l2h264enc"},
+    "media.ffmpeg.version": {"state": "observed", "value": "ffmpeg version 5.1.6"},
+    "media.ffmpeg.encoders": {"state": "observed", "value": " V..... h264_v4l2m2m V4L2 mem2mem H.264 encoder"},
+    "media.ffprobe.version": {"state": "observed", "value": "ffprobe version 5.1.6"},
+    "media.v4l2.nodes": {"state": "observed", "value": "bcm2835-codec-decode (platform:bcm2835-codec):\\n\\t/dev/video10"},
+    "audio.capture.devices": {"state": "observed", "value": "card 1: USB [USB Audio], device 0: USB Audio"},
+    "audio.capture.pcms": {"state": "observed", "value": "hw:CARD=USB,DEV=0"},
+    "uart.serial0.mapping": {"state": "observed", "value": "/dev/ttyS0"},
+    "storage.block.layout": {"state": "observed", "value": "{\"blockdevices\":[{\"name\":\"mmcblk0\",\"type\":\"disk\"}]}"},
+    "storage.recording.mount": {"state": "observed", "value": "{\"filesystems\":[{\"target\":\"/srv/dashcam\",\"fstype\":\"exfat\",\"label\":\"DASHCAM\"}]}"},
+    "storage.recording.space": {"state": "observed", "value": "Filesystem Type 1B-blocks Used Avail Use% Mounted on\\n/dev/mmcblk0p3 exfat 20000000000 0 20000000000 0% /srv/dashcam"},
+    "storage.exfat.module": {"state": "observed", "value": "filename: /lib/modules/sample/kernel/fs/exfat/exfat.ko.xz"},
+    "storage.exfat.fsck": {"state": "observed", "value": "exfatprogs version : 1.2.0"},
+    "storage.exfat.mkfs": {"state": "observed", "value": "exfatprogs version : 1.2.0"},
+    "thermal.throttled": {"state": "observed", "value": "throttled=0x0"},
+    "thermal.temperature": {"state": "observed", "value": "temp=42.8'C"}
+  },
+  "files": {
+    "target.model": {"state": "observed", "value": "Raspberry Pi Zero 2 W Rev 1.0"},
+    "os.release": {"state": "observed", "value": "PRETTY_NAME=\"Raspberry Pi OS Lite fixture\"\\nVERSION_ID=\"12\""},
+    "hardware.cpuinfo": {"state": "observed", "value": "processor : 0\\nmodel name : ARMv7 Processor rev 4"},
+    "hardware.meminfo": {"state": "observed", "value": "MemTotal: 437232 kB\\nMemAvailable: 350000 kB"},
+    "uart.kernel.cmdline": {"state": "observed", "value": "console=tty1 root=PARTUUID=fixture-02 rootfstype=ext4"},
+    "uart.boot.config": {"state": "observed", "value": "enable_uart=1\\nforce_turbo=0"},
+    "uart.legacy.boot.config": {"state": "unavailable", "value": "", "note": "file not found"},
+    "storage.filesystems": {"state": "observed", "value": "nodev sysfs\\n\\texfat\\n\\text4"},
+    "thermal.sysfs.temperature": {"state": "observed", "value": "42800"}
+  }
+}

@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dashcampizerow.local/schemas/capability-report-v1.schema.json",
+  "title": "DashCamPiZero2W capability report v1",
+  "description": "A bounded report separating raw observations from evaluated capability decisions. It supports not-probed and unknown states and does not itself assert target results.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_utc",
+    "producer",
+    "status",
+    "target",
+    "raw_observations",
+    "evaluated_capabilities",
+    "evidence_artifacts",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_utc": { "$ref": "#/$defs/utcTimestamp" },
+    "producer": { "$ref": "#/$defs/producer" },
+    "status": { "type": "string", "enum": ["complete", "partial", "failed", "not_probed"] },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identity_state"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["raspberry_pi", "local_fixture", "windows_host", "other"] },
+        "identity_state": { "$ref": "#/$defs/probeState" },
+        "target_id": { "$ref": "#/$defs/identifier" },
+        "declared_model": { "$ref": "#/$defs/shortText" }
+      }
+    },
+    "raw_observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_identity", "os", "hardware", "media", "audio", "uart", "storage", "thermal"],
+      "properties": {
+        "target_identity": { "$ref": "#/$defs/probeSection" },
+        "os": { "$ref": "#/$defs/probeSection" },
+        "hardware": { "$ref": "#/$defs/probeSection" },
+        "media": { "$ref": "#/$defs/probeSection" },
+        "audio": { "$ref": "#/$defs/probeSection" },
+        "uart": { "$ref": "#/$defs/probeSection" },
+        "storage": { "$ref": "#/$defs/probeSection" },
+        "thermal": { "$ref": "#/$defs/probeSection" }
+      }
+    },
+    "evaluated_capabilities": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/capabilityDecision" }
+    },
+    "evidence_artifacts": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/evidenceArtifact" }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/warning" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "maxLength": 128
+    },
+    "shortText": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+      "maxLength": 40
+    },
+    "probeState": {
+      "type": "string",
+      "enum": ["observed", "not_probed", "unknown", "unavailable", "error", "not_applicable"]
+    },
+    "relativePath": {
+      "type": "string",
+      "description": "A repository-relative, forward-slash path; it must not be absolute or traverse upward.",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$",
+      "maxLength": 240
+    },
+    "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$", "maxLength": 64 },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "build_id"],
+      "properties": {
+        "name": { "$ref": "#/$defs/shortText" },
+        "version": { "$ref": "#/$defs/identifier" },
+        "build_id": { "$ref": "#/$defs/identifier" },
+        "source_revision": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "evidenceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "kind": { "type": "string", "enum": ["probe_log", "command_output", "json", "text", "image", "video", "audio", "other"] },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "description": { "$ref": "#/$defs/shortText" }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/identifier" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state", "key", "value"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "state": { "$ref": "#/$defs/probeState" },
+        "key": { "$ref": "#/$defs/identifier" },
+        "value": {
+          "description": "Observed raw value; secret values must never be included.",
+          "oneOf": [
+            { "type": "string", "maxLength": 16384 },
+            { "type": "number", "minimum": -1000000000000, "maximum": 1000000000000 },
+            { "type": "boolean" },
+            { "type": "null" }
+          ]
+        },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "source": { "$ref": "#/$defs/shortText" },
+        "evidence_artifact_paths": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "note": { "$ref": "#/$defs/shortText" }
+      }
+    },
+    "probeSection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "facts", "evidence_artifact_paths", "warnings"],
+      "properties": {
+        "state": { "$ref": "#/$defs/probeState" },
+        "facts": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/observation" } },
+        "evidence_artifact_paths": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "warnings": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/warning" } }
+      }
+    },
+    "capabilityDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "decision", "basis_observation_ids", "rationale"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "decision": { "type": "string", "enum": ["supported", "unsupported", "conditional", "unknown", "not_probed", "blocked"] },
+        "basis_observation_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "evidence_artifact_paths": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "rationale": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "constraints": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/shortText" }
+        }
+      }
+    }
+  }
+}

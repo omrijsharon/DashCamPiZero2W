@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {
+      "monotonic_ns": 1000000000,
+      "rss_bytes": 50000000,
+      "memory_available_bytes": 300000000,
+      "swap_used_bytes": 0,
+      "cpu_percent": 50.0,
+      "temperature_c": 60.0,
+      "throttled": false,
+      "undervoltage": false,
+      "dropped_frames": 0,
+      "bitrate_bps": 8000000,
+      "restart_count": 0
+    },
+    {
+      "monotonic_ns": 2000000000,
+      "rss_bytes": 100000000,
+      "memory_available_bytes": 1000000,
+      "swap_used_bytes": 4096,
+      "cpu_percent": 150.0,
+      "temperature_c": 90.0,
+      "throttled": true,
+      "undervoltage": true,
+      "dropped_frames": 10,
+      "bitrate_bps": 3000000,
+      "restart_count": 2
+    }
+  ]
+}

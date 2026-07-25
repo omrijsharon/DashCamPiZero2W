@@ -1,0 +1,12 @@
+{
+  "responses": {
+    "/usr/bin/readlink -f /dev/mmcblk9": "/dev/mmcblk9\n",
+    "/usr/bin/lsblk --json --bytes --output PATH,KNAME,PKNAME,TYPE,SERIAL,SIZE,LOG-SEC,MOUNTPOINTS": "{\"blockdevices\":[{\"path\":\"/dev/mmcblk0\",\"kname\":\"mmcblk0\",\"pkname\":null,\"type\":\"disk\",\"serial\":\"fe34325344000000200000031a0192d1\",\"size\":31457280000,\"log-sec\":512,\"mountpoints\":[],\"children\":[{\"path\":\"/dev/mmcblk0p1\",\"kname\":\"mmcblk0p1\",\"pkname\":\"mmcblk0\",\"type\":\"part\",\"serial\":null,\"size\":536870912,\"log-sec\":512,\"mountpoints\":[\"/boot/firmware\"]},{\"path\":\"/dev/mmcblk0p2\",\"kname\":\"mmcblk0p2\",\"pkname\":\"mmcblk0\",\"type\":\"part\",\"serial\":null,\"size\":30920409088,\"log-sec\":512,\"mountpoints\":[\"/\"]}]},{\"path\":\"/dev/mmcblk9\",\"kname\":\"mmcblk9\",\"pkname\":null,\"type\":\"disk\",\"serial\":\"fe34325344000000200000031a0192d1\",\"size\":31457280000,\"log-sec\":512,\"mountpoints\":[],\"children\":[{\"path\":\"/dev/mmcblk9p1\",\"kname\":\"mmcblk9p1\",\"pkname\":\"mmcblk9\",\"type\":\"part\",\"serial\":null,\"size\":536870912,\"log-sec\":512,\"mountpoints\":[]},{\"path\":\"/dev/mmcblk9p2\",\"kname\":\"mmcblk9p2\",\"pkname\":\"mmcblk9\",\"type\":\"part\",\"serial\":null,\"size\":2123005952,\"log-sec\":512,\"mountpoints\":[]}]}]}",
+    "/usr/sbin/sfdisk --json /dev/mmcblk9": "{\"partitiontable\":{\"label\":\"dos\",\"id\":\"0x4f2c9ea0\",\"device\":\"/dev/mmcblk9\",\"unit\":\"sectors\",\"sectorsize\":512,\"partitions\":[{\"node\":\"/dev/mmcblk9p1\",\"start\":16384,\"size\":1048576,\"type\":\"c\"},{\"node\":\"/dev/mmcblk9p2\",\"start\":1064960,\"size\":4161536,\"type\":\"83\"}]}}",
+    "/usr/bin/cat /sys/class/block/mmcblk9/device/cid": "fe34325344000000200000031a0192d1\n",
+    "/usr/bin/findmnt --noheadings --output SOURCE /": "/dev/mmcblk0p2\n",
+    "/usr/sbin/blkid --probe --output export /dev/mmcblk9p1": "DEVNAME=/dev/mmcblk9p1\nTYPE=vfat\nLABEL=bootfs\nUUID=89F4-4546\nPART_ENTRY_SCHEME=dos\nPART_ENTRY_UUID=4f2c9ea0-01\nPART_ENTRY_TYPE=0xc\nPART_ENTRY_NUMBER=1\n",
+    "/usr/sbin/blkid --probe --output export /dev/mmcblk9p2": "DEVNAME=/dev/mmcblk9p2\nTYPE=ext4\nLABEL=rootfs\nUUID=e9ef4083-101b-46b4-b87d-de84fe1169f8\nPART_ENTRY_SCHEME=dos\nPART_ENTRY_UUID=4f2c9ea0-02\nPART_ENTRY_TYPE=0x83\nPART_ENTRY_NUMBER=2\n",
+    "/usr/sbin/wipefs --noheadings --json /dev/mmcblk9": "{\"signatures\":[{\"type\":\"dos\",\"offset\":\"0x1fe\"}]}"
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-24",
+  "status": "passed",
+  "environment": {
+    "host": "WSL2 Linux regular files",
+    "sfdisk_package": "fdisk 2.37.2-4ubuntu3.5",
+    "privilege_escalation_used": false,
+    "loop_devices_used": false,
+    "mounts_used": false,
+    "block_devices_used": false,
+    "temporary_disk_usage_du": "1.2M"
+  },
+  "cases": [
+    {
+      "capacity_bytes": 31457280000,
+      "mbr_disk_id": "0x4f2c9ea0",
+      "boot_start_sector": 16384,
+      "boot_size_sectors": 1048576,
+      "root_start_sector": 1064960,
+      "root_size_sectors": 12582912,
+      "data_start_sector": 13647872,
+      "data_end_sector": 61437951,
+      "data_size_sectors": 47790080,
+      "backup_restore_sha256": "6c2e306ffb8d1bbd4d4d89af822373949e905b4fa380dfeed8e5af4d74609c95",
+      "backup_identity_refusal": true,
+      "recognized_exfat_signature_refusal": true,
+      "idempotent_target_recheck": true
+    },
+    {
+      "capacity_bytes": 64000000000,
+      "mbr_disk_id": "0x4f2c9ea0",
+      "boot_start_sector": 16384,
+      "boot_size_sectors": 1048576,
+      "root_start_sector": 1064960,
+      "root_size_sectors": 12582912,
+      "data_start_sector": 13647872,
+      "data_end_sector": 124997631,
+      "data_size_sectors": 111349760,
+      "backup_restore_sha256": "c11dd3f5a72477f3453e8aafe478bc0dd70be31c5932941840aced1ba53111b4",
+      "backup_identity_refusal": true,
+      "recognized_exfat_signature_refusal": true,
+      "idempotent_target_recheck": true
+    }
+  ],
+  "fault_injection": {
+    "all_contained": true,
+    "stops_after": [
+      "backup",
+      "validate_backup",
+      "write_target",
+      "verify_target",
+      "restore_backup",
+      "verify_restore",
+      "write_final",
+      "verify_final"
+    ]
+  },
+  "limitations": [
+    "This proves DOS/MBR regular-file table behavior, not filesystem growth/format/mount behavior.",
+    "This is not Raspberry Pi boot evidence and did not execute the gated first-boot runtime.",
+    "No SD card or other hardware storage target was accessed."
+  ]
+}

@@ -1,0 +1,1 @@
+"""Local recorder control boundary."""

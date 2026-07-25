@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-25",
+  "status": "v3_regular_file_image_verified_exact_card_flash_pending",
+  "scope": "Offline regular-file build and readback only. The physical authorized card remains offline and untouched.",
+  "authorization": {
+    "cid": "fe34325344000000200000031a0192d1",
+    "size_bytes": 31457280000,
+    "sector_count": 61440000
+  },
+  "v2_forensic_basis": {
+    "proven": "V2 committed the target partition table but made no root filesystem write; the root remained at the source extent.",
+    "not_proven": "V2 did not durably record the exact failing command.",
+    "leading_hypothesis_not_fact": "The forced e2fsck stage and its timeout remain the leading hypothesis."
+  },
+  "v3_recovery_and_diagnostics": {
+    "initramfs_hook_sha256": "289a03bdfa364d04679f13a913162b4c51ba17c13eae494f8b9b4589ff7d7b9f",
+    "e2fsck": {
+      "command_contract": "timeout -k 10 120 e2fsck -p",
+      "accepted_exit_codes": [0, 1],
+      "timeout_support": "The exact BusyBox timeout is v1.37.0 and supports -k (+s:k:)."
+    },
+    "resize2fs": "Uses explicit status handling.",
+    "progress_record": {
+      "path": "dashcam-provision/initramfs-v1.progress",
+      "storage": "FAT",
+      "write_contract": "separate bounded atomic record of at most 512 bytes",
+      "stages": ["before_e2fsck", "before_resize2fs", "complete", "refusal"]
+    },
+    "growth_validation": {
+      "expected_block_count": 1572864,
+      "expected_block_size_bytes": 4096,
+      "expected_device_size_bytes": 6442450944,
+      "reason": "Avoids shell multiplication when validating grown filesystem size."
+    }
+  },
+  "plan_binding": {
+    "target_profile": "pi-zero-2-w-armv7l",
+    "closure_manifest_size_bytes": 7791,
+    "closure_manifest_sha256": "3b392ebf879528df5ad2f46c87b96bdf11a60238f968788fed0f739b7ddffdbe"
+  },
+  "output": {
+    "path": "artifacts/images/dashcam-release-authorized-fe34325344000000200000031a0192d1-v3.img",
+    "size_bytes": 2675965952,
+    "sha256": "05f08ca82c7578a007c30653daf461832e882fe15db9d6d9ca79b2c6279ad28a",
+    "build_exit_code": 0,
+    "build_duration_seconds": 597.3,
+    "selected_initramfs": {
+      "filename": "initramfs7",
+      "size_bytes": 13449304,
+      "sha256": "c3ed7c04f05eadbb2296fd1fc743d2cdea77b33aed72512989be6079161a319d"
+    }
+  },
+  "independent_readback": {
+    "cpio_hook_sha256_matches": true,
+    "bounded_cmdline_trigger_present": true,
+    "active_auto_initramfs_assignments": 1,
+    "full_validation": "809 passed, 1 skipped (Windows has no native POSIX sh)",
+    "ruff": "passed",
+    "mypy": "passed for 69 files",
+    "wsl_posix_shell_syntax_check": "passed"
+  },
+  "imager_manifest": {
+    "updated_by_main_agent": true,
+    "v3_image_size_and_sha256_match_output": true
+  },
+  "retired_images": {
+    "v1": "must not flash; it customized the generic initramfs rather than initramfs7",
+    "v2": "must not retry; it stopped before root filesystem growth and lacks adequate durable diagnostic detail"
+  },
+  "next_gate": "The authorized card is offline in Windows Disk 1. Keep it untouched until the main agent initiates an explicit, identity-checked v3 Imager workflow; do not mark Milestone 5 complete."
+}

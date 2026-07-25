@@ -1,0 +1,21 @@
+# Copy to a builder-private config and replace every REQUIRED value.
+IMG_NAME='dashcam-bootstrap-v1'
+RELEASE='trixie'
+ARCH='armhf'
+TARGET_HOSTNAME='dashcam'
+ENABLE_SSH='1'
+LOCALE_DEFAULT='en_GB.UTF-8'
+KEYBOARD_KEYMAP='us'
+TIMEZONE_DEFAULT='Etc/UTC'
+
+# The release wrapper must record these exact immutable identities.
+# The pinned-raw executor uses build-requirements.json. These pi-gen values are
+# only for the alternative custom-stage integration and are still fail-closed.
+PI_GEN_COMMIT='REQUIRED_FULL_40_HEX_COMMIT'
+PI_GEN_CONTAINER_DIGEST='REQUIRED_SHA256_DIGEST'
+DEBIAN_SNAPSHOT='REQUIRED_TIMESTAMPED_SNAPSHOT'
+APP_COMMIT='REQUIRED_FULL_40_HEX_COMMIT'
+PACKAGE_LOCK_SHA256='REQUIRED_SHA256'
+
+# Add deploy/bootstrap/image/pi-gen-stage after the ordinary Lite stage.
+# Do not include an initramfs-customization stage.

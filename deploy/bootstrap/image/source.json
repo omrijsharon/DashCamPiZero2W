@@ -1,0 +1,12 @@
+{
+  "architecture": "armhf",
+  "compressed_sha256": "ea4e84c501d6dd4f4b1d04eb84df133a03f90a05ee2e8ab849185c17c2b0707b",
+  "compressed_size_bytes": 549086704,
+  "extracted_sha256": "235aae6e32f40eb294b6485f99232d9ea5b6ee0251c8dc40e370177fac4754c2",
+  "extracted_size_bytes": 2675965952,
+  "filename": "2026-06-18-raspios-trixie-armhf-lite.img.xz",
+  "init_format": "cloudinit-rpi",
+  "os_release": "Raspberry Pi OS Lite 32-bit (Debian Trixie), 2026-06-18",
+  "schema_version": 1,
+  "url": "https://downloads.raspberrypi.com/raspios_lite_armhf/images/raspios_lite_armhf-2026-06-19/2026-06-18-raspios-trixie-armhf-lite.img.xz"
+}

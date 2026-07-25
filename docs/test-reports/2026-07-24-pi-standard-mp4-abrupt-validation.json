@@ -1,0 +1,22 @@
+{
+  "boundaries": [],
+  "overall": "fail",
+  "schema_version": 1,
+  "validations": [
+    {
+      "checks": [
+        {
+          "code": "probe_run",
+          "expected": 0,
+          "observed": 1,
+          "outcome": "fail",
+          "summary": "ffprobe must finish successfully with complete bounded output"
+        }
+      ],
+      "media_path": "C:\\Users\\tamipinhasi\\Documents\\repos\\DashCamPiZero2W\\artifacts\\pi\\2026-07-24\\mux-standard-abrupt-20260724-01.mp4",
+      "overall": "fail",
+      "schema_version": 1,
+      "timeline": null
+    }
+  ]
+}

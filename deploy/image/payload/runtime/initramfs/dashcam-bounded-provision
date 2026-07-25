@@ -1,0 +1,656 @@
+#!/bin/sh
+# Exact-image, exact-card bounded partition hook. Deliberately disabled unless
+# the separately injected validation gate and all immutable contracts match.
+set -efu
+umask 077
+
+PREREQ=""
+prereqs()
+{
+    printf '%s\n' "$PREREQ"
+}
+
+case "${1:-}" in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+"")
+    ;;
+*)
+    exit 125
+    ;;
+esac
+
+. /scripts/functions
+
+GATE=/etc/dashcam/firstboot-runtime-v1.enabled
+CONFIG=/etc/dashcam/firstboot-initramfs-v1.conf
+SOURCE_CONTRACT=/etc/dashcam/source-table-v1.sfdisk
+TARGET_CONTRACT=/etc/dashcam/target-table-v1.sfdisk
+EXPECTED_CID=fe34325344000000200000031a0192d1
+EXPECTED_DISK_SECTORS=61440000
+EXPECTED_BOOT_PARTUUID=4f2c9ea0-01
+EXPECTED_ROOT_PARTUUID=4f2c9ea0-02
+EXPECTED_BOOT_UUID=89F4-4546
+EXPECTED_ROOT_UUID=e9ef4083-101b-46b4-b87d-de84fe1169f8
+SOURCE_ROOT_SECTORS=4161536
+TARGET_ROOT_SECTORS=12582912
+BOOT_MOUNT=/run/dashcam-firstboot/boot
+WORK=/run/dashcam-firstboot/work
+STATE_DIR=$BOOT_MOUNT/dashcam-provision
+JOURNAL=$STATE_DIR/initramfs-v1.state
+PROGRESS=$STATE_DIR/initramfs-v1.progress
+PROGRESS_TMP=$STATE_DIR/.initramfs-v1.progress.tmp
+BACKUP_MBR=$STATE_DIR/source-first-sector-v1.bin
+BACKUP_TABLE=$STATE_DIR/source-table-v1.sfdisk
+BACKUP_SHA=$STATE_DIR/source-backup-v1.sha256
+BOOT_MOUNTED=0
+STATE_READY=0
+JOURNAL_PHASE=none
+REBOOT_COUNT=0
+BACKUP_MANIFEST_HASH=
+IDENTITY_FAILURE=not_checked
+IDENTITY_RETRY_MAX=10
+IDENTITY_RETRY_SLEEP_SECONDS=1
+IDENTITY_RETRY_ATTEMPT=0
+
+EXPECTED_CONFIG='schema=v1
+disk=/dev/mmcblk0
+root=/dev/mmcblk0p2
+cid=fe34325344000000200000031a0192d1
+device_sectors=61440000
+boot_partuuid=4f2c9ea0-01
+root_partuuid=4f2c9ea0-02
+source_root_sectors=4161536
+target_root_sectors=12582912
+data_start_sector=13647872
+data_size_sectors=47790080'
+EXPECTED_SOURCE_TABLE='label:dos
+label-id:0x4f2c9ea0
+device:/dev/mmcblk0
+unit:sectors
+sector-size:512
+/dev/mmcblk0p1:start=16384,size=1048576,type=c
+/dev/mmcblk0p2:start=1064960,size=4161536,type=83'
+EXPECTED_TARGET_TABLE='label:dos
+label-id:0x4f2c9ea0
+device:/dev/mmcblk0
+unit:sectors
+sector-size:512
+/dev/mmcblk0p1:start=16384,size=1048576,type=c
+/dev/mmcblk0p2:start=1064960,size=12582912,type=83
+/dev/mmcblk0p3:start=13647872,size=47790080,type=7'
+
+cleanup()
+{
+    if [ "$BOOT_MOUNTED" -eq 1 ]; then
+        /usr/bin/timeout 15 /usr/bin/umount "$BOOT_MOUNT" >/dev/null 2>&1 || :
+        BOOT_MOUNTED=0
+    fi
+}
+
+refuse()
+{
+    if [ "$STATE_READY" -eq 1 ]; then
+        refusal_status=$(printf '%s' "$*" |
+            /usr/bin/sed 's/[^[:alnum:]._-]/_/g' |
+            /usr/bin/cut -c 1-64) || refusal_status=unknown
+        case "$refusal_status" in
+        ""|*[![:alnum:]._-]*)
+            refusal_status=unknown
+            ;;
+        esac
+        write_progress refusal "refused_$refusal_status" || :
+    fi
+    printf '%s\n' "dashcam bounded provision refused: $*" >&2
+    exit 125
+}
+
+trap cleanup EXIT HUP INT TERM
+
+require_regular_exact()
+{
+    [ -f "$1" ] || refuse "required contract is absent: $1"
+    [ "$(/usr/bin/readlink -f "$1")" = "$1" ] || refuse "required contract is not exact: $1"
+    size=$(/usr/bin/wc -c < "$1")
+    case "$size" in
+    ""|*[!0-9]*)
+        refuse "required contract has invalid size: $1"
+        ;;
+    esac
+    [ "$size" -le 4096 ] || refuse "required contract is too large: $1"
+}
+
+normalize_table()
+{
+    /usr/bin/sed -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' "$1"
+}
+
+identity_is_exact()
+{
+    IDENTITY_FAILURE=unknown
+    [ "${ROOT:-}" = "PARTUUID=$EXPECTED_ROOT_PARTUUID" ] || {
+        identity_fail root_token
+        return 1
+    }
+    resolved_root=$(resolve_device "$ROOT") || {
+        identity_fail root_resolve
+        return 1
+    }
+    resolved_root=$(/usr/bin/readlink -f "$resolved_root") || {
+        identity_fail root_readlink
+        return 1
+    }
+    [ "$resolved_root" = /dev/mmcblk0p2 ] || {
+        identity_fail root_device_path
+        return 1
+    }
+    [ "$(/usr/bin/cat /sys/class/block/mmcblk0p2/partition)" = 2 ] ||
+    {
+        identity_fail root_partition
+        return 1
+    }
+    [ "$(/usr/bin/cat /sys/class/block/mmcblk0p2/start)" = 1064960 ] ||
+    {
+        identity_fail root_start
+        return 1
+    }
+    root_sys=$(/usr/bin/readlink -f /sys/class/block/mmcblk0p2) ||
+    {
+        identity_fail root_sysfs_parent
+        return 1
+    }
+    case "$root_sys" in
+    */block/mmcblk0/mmcblk0p2)
+        ;;
+    *)
+        identity_fail root_sysfs_parent
+        return 1
+        ;;
+    esac
+    [ "$(/usr/bin/cat /sys/class/block/mmcblk0/device/cid)" = "$EXPECTED_CID" ] ||
+    {
+        identity_fail card_cid
+        return 1
+    }
+    [ "$(/usr/bin/cat /sys/class/block/mmcblk0/size)" = "$EXPECTED_DISK_SECTORS" ] ||
+    {
+        identity_fail card_capacity
+        return 1
+    }
+    [ "$(/usr/sbin/blkid -s PARTUUID -o value /dev/mmcblk0p1)" = "$EXPECTED_BOOT_PARTUUID" ] ||
+    {
+        identity_fail boot_partuuid
+        return 1
+    }
+    [ "$(/usr/sbin/blkid -s PARTUUID -o value /dev/mmcblk0p2)" = "$EXPECTED_ROOT_PARTUUID" ] ||
+    {
+        identity_fail root_partuuid
+        return 1
+    }
+    [ "$(/usr/sbin/blkid -s UUID -o value /dev/mmcblk0p1)" = "$EXPECTED_BOOT_UUID" ] ||
+    {
+        identity_fail boot_uuid
+        return 1
+    }
+    [ "$(/usr/sbin/blkid -s TYPE -o value /dev/mmcblk0p1)" = vfat ] ||
+    {
+        identity_fail boot_type
+        return 1
+    }
+    [ "$(/usr/sbin/blkid -s UUID -o value /dev/mmcblk0p2)" = "$EXPECTED_ROOT_UUID" ] ||
+    {
+        identity_fail root_uuid
+        return 1
+    }
+    [ "$(/usr/sbin/blkid -s TYPE -o value /dev/mmcblk0p2)" = ext4 ] ||
+    {
+        identity_fail root_type
+        return 1
+    }
+    return 0
+}
+
+identity_fail()
+{
+    case "$1" in
+    root_token|root_resolve|root_readlink|root_device_path|root_partition|root_start|\
+    root_sysfs_parent|card_cid|card_capacity|boot_partuuid|root_partuuid|\
+    boot_uuid|boot_type|root_uuid|root_type|retry_sleep|retry_bound)
+        IDENTITY_FAILURE=$1
+        ;;
+    *)
+        IDENTITY_FAILURE=invalid_identity_check
+        ;;
+    esac
+    return 1
+}
+
+identity_is_exact_with_retry()
+{
+    identity_attempt=1
+    while [ "$identity_attempt" -le "$IDENTITY_RETRY_MAX" ]; do
+        IDENTITY_RETRY_ATTEMPT=$identity_attempt
+        if identity_is_exact; then
+            return 0
+        fi
+        [ "$identity_attempt" -lt "$IDENTITY_RETRY_MAX" ] || return 1
+        /usr/bin/timeout 2 /usr/bin/sleep "$IDENTITY_RETRY_SLEEP_SECONDS" || {
+            identity_fail retry_sleep
+            return 1
+        }
+        identity_attempt=$((identity_attempt + 1))
+    done
+    identity_fail retry_bound
+}
+
+capture_actual_table()
+{
+    actual=$WORK/actual-table.sfdisk
+    normalized=$WORK/actual-table.normalized
+    /usr/bin/timeout 15 /usr/sbin/sfdisk --dump /dev/mmcblk0 > "$actual" ||
+        refuse "cannot dump the exact partition table"
+    normalize_table "$actual" > "$normalized" ||
+        refuse "cannot normalize the exact partition table"
+}
+
+classify_layout()
+{
+    capture_actual_table
+    actual_text=$(/usr/bin/cat "$WORK/actual-table.normalized")
+    if [ "$actual_text" = "$EXPECTED_SOURCE_TABLE" ]; then
+        printf '%s\n' source
+        return 0
+    fi
+    if [ "$actual_text" = "$EXPECTED_TARGET_TABLE" ]; then
+        printf '%s\n' target
+        return 0
+    fi
+    return 1
+}
+
+bounded_sync()
+{
+    /usr/bin/timeout 30 /usr/bin/sync || refuse "durable sync timed out or failed"
+}
+
+write_progress()
+{
+    progress_phase=$1
+    progress_status=$2
+    case "$progress_phase:$progress_status" in
+    before_e2fsck:running|before_resize2fs:running|complete:success)
+        ;;
+    refusal:refused_?*)
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+    [ "$STATE_READY" -eq 1 ] || return 1
+    [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || return 1
+    if [ -e "$PROGRESS" ]; then
+        [ -f "$PROGRESS" ] && [ ! -L "$PROGRESS" ] || return 1
+        [ "$(/usr/bin/wc -c < "$PROGRESS")" -le 512 ] || return 1
+    fi
+    if [ -e "$PROGRESS_TMP" ]; then
+        [ -f "$PROGRESS_TMP" ] && [ ! -L "$PROGRESS_TMP" ] || return 1
+        [ "$(/usr/bin/wc -c < "$PROGRESS_TMP")" -le 512 ] || return 1
+        /usr/bin/busybox rm -f -- "$PROGRESS_TMP" || return 1
+    fi
+    expected_progress=$(printf '%s\n' \
+        "phase=$progress_phase" \
+        "status=$progress_status" \
+        "cid=$EXPECTED_CID" \
+        "sectors=$EXPECTED_DISK_SECTORS" \
+        "reboot_count=$REBOOT_COUNT")
+    [ "$(printf '%s\n' "$expected_progress" | /usr/bin/wc -c)" -le 512 ] || return 1
+    (
+        set -C
+        exec 3> "$PROGRESS_TMP"
+        printf '%s\n' "$expected_progress" >&3
+        exec 3>&-
+    ) || return 1
+    /usr/bin/timeout 30 /usr/bin/sync || return 1
+    /usr/bin/mv "$PROGRESS_TMP" "$PROGRESS" || return 1
+    /usr/bin/timeout 30 /usr/bin/sync || return 1
+}
+
+validate_backup()
+{
+    [ -f "$BACKUP_MBR" ] && [ ! -L "$BACKUP_MBR" ] ||
+        refuse "exclusive MBR backup is absent or unsafe"
+    [ "$(/usr/bin/wc -c < "$BACKUP_MBR")" = 512 ] ||
+        refuse "exclusive MBR backup has the wrong size"
+    [ -f "$BACKUP_TABLE" ] && [ ! -L "$BACKUP_TABLE" ] ||
+        refuse "exclusive table backup is absent or unsafe"
+    [ -f "$BACKUP_SHA" ] && [ ! -L "$BACKUP_SHA" ] ||
+        refuse "backup checksum manifest is absent or unsafe"
+    /usr/bin/sha256sum -c "$BACKUP_SHA" >/dev/null 2>&1 ||
+        refuse "backup checksum validation failed"
+    [ "$(normalize_table "$BACKUP_TABLE")" = "$EXPECTED_SOURCE_TABLE" ] ||
+        refuse "backup table is not the exact source layout"
+    BACKUP_MANIFEST_HASH=$(/usr/bin/sha256sum "$BACKUP_SHA" | /usr/bin/cut -d ' ' -f 1)
+    printf '%s\n' "$BACKUP_MANIFEST_HASH" |
+        /usr/bin/grep -Eq '^[0-9a-f]{64}$' ||
+        refuse "backup manifest digest is malformed"
+}
+
+create_or_validate_backup()
+{
+    if [ -e "$BACKUP_MBR" ] || [ -e "$BACKUP_TABLE" ] || [ -e "$BACKUP_SHA" ]; then
+        validate_backup
+        current_mbr_sha=$(
+            /usr/bin/dd if=/dev/mmcblk0 bs=512 count=1 status=none |
+                /usr/bin/sha256sum |
+                /usr/bin/cut -d ' ' -f 1
+        )
+        backup_mbr_sha=$(/usr/bin/sha256sum "$BACKUP_MBR" | /usr/bin/cut -d ' ' -f 1)
+        [ "$current_mbr_sha" = "$backup_mbr_sha" ] ||
+            refuse "source MBR changed after the durable backup"
+        return 0
+    fi
+
+    (
+        set -C
+        exec 3> "$BACKUP_MBR"
+        /usr/bin/dd if=/dev/mmcblk0 bs=512 count=1 status=none >&3
+        exec 3>&-
+    ) || refuse "cannot create the exclusive first-sector backup"
+    (
+        set -C
+        exec 3> "$BACKUP_TABLE"
+        /usr/bin/cat "$WORK/actual-table.sfdisk" >&3
+        exec 3>&-
+    ) || refuse "cannot create the exclusive table backup"
+    (
+        set -C
+        exec 3> "$BACKUP_SHA"
+        /usr/bin/sha256sum "$BACKUP_MBR" "$BACKUP_TABLE" >&3
+        exec 3>&-
+    ) || refuse "cannot create the exclusive checksum manifest"
+    bounded_sync
+    validate_backup
+}
+
+load_journal()
+{
+    if [ ! -e "$JOURNAL" ]; then
+        JOURNAL_PHASE=none
+        REBOOT_COUNT=0
+        return 0
+    fi
+    [ -f "$JOURNAL" ] && [ ! -L "$JOURNAL" ] || refuse "journal is not a regular file"
+    [ "$(/usr/bin/wc -l < "$JOURNAL")" = 5 ] || refuse "journal line count is invalid"
+    /usr/bin/grep -Fx "cid=$EXPECTED_CID" "$JOURNAL" >/dev/null ||
+        refuse "journal CID is invalid"
+    /usr/bin/grep -Fx "sectors=$EXPECTED_DISK_SECTORS" "$JOURNAL" >/dev/null ||
+        refuse "journal capacity is invalid"
+    JOURNAL_PHASE=$(/usr/bin/sed -n 's/^phase=//p' "$JOURNAL")
+    REBOOT_COUNT=$(/usr/bin/sed -n 's/^reboot_count=//p' "$JOURNAL")
+    journal_backup=$(/usr/bin/sed -n 's/^backup_manifest_sha256=//p' "$JOURNAL")
+    case "$JOURNAL_PHASE" in
+    source_backup_validated|table_committed|early_complete)
+        ;;
+    *)
+        refuse "journal phase is invalid"
+        ;;
+    esac
+    case "$REBOOT_COUNT" in
+    0|1)
+        ;;
+    *)
+        refuse "journal reboot count is invalid"
+        ;;
+    esac
+    validate_backup
+    [ "$journal_backup" = "$BACKUP_MANIFEST_HASH" ] ||
+        refuse "journal backup binding is invalid"
+}
+
+write_journal()
+{
+    new_phase=$1
+    new_reboots=$2
+    case "$new_phase:$new_reboots" in
+    source_backup_validated:0|table_committed:0|table_committed:1|early_complete:0|early_complete:1)
+        ;;
+    *)
+        refuse "attempted journal transition is outside the bounded state machine"
+        ;;
+    esac
+    validate_backup
+    journal_tmp=$STATE_DIR/.initramfs-v1.state.tmp
+    expected_journal=$(
+        printf '%s\n' \
+            "phase=$new_phase" \
+            "reboot_count=$new_reboots" \
+            "cid=$EXPECTED_CID" \
+            "sectors=$EXPECTED_DISK_SECTORS" \
+            "backup_manifest_sha256=$BACKUP_MANIFEST_HASH"
+    )
+    if [ -e "$journal_tmp" ]; then
+        [ -f "$journal_tmp" ] && [ ! -L "$journal_tmp" ] ||
+            refuse "journal temporary file is unsafe"
+        [ "$(/usr/bin/wc -c < "$journal_tmp")" -le 512 ] ||
+            refuse "journal temporary file is too large"
+        [ "$(/usr/bin/cat "$journal_tmp")" = "$expected_journal" ] ||
+            refuse "journal temporary file does not match the retried transition"
+    else
+        (
+            set -C
+            exec 3> "$journal_tmp"
+            printf '%s\n' "$expected_journal" >&3
+            exec 3>&-
+        ) || refuse "cannot create the exclusive journal temporary file"
+    fi
+    bounded_sync
+    /usr/bin/mv "$journal_tmp" "$JOURNAL" || refuse "cannot atomically replace the journal"
+    bounded_sync
+    JOURNAL_PHASE=$new_phase
+    REBOOT_COUNT=$new_reboots
+}
+
+filesystem_matches_partition()
+{
+    header=$WORK/dumpe2fs-header.txt
+    /usr/bin/timeout 30 /usr/sbin/dumpe2fs -h /dev/mmcblk0p2 > "$header" 2>/dev/null ||
+        return 1
+    fs_blocks=$(/usr/bin/sed -n 's/^Block count:[[:space:]]*//p' "$header")
+    fs_block_size=$(/usr/bin/sed -n 's/^Block size:[[:space:]]*//p' "$header")
+    case "$fs_blocks:$fs_block_size" in
+    1572864:4096)
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+    device_bytes=$(/usr/sbin/blockdev --getsize64 /dev/mmcblk0p2) || return 1
+    [ "$device_bytes" = 6442450944 ] || return 1
+    return 0
+}
+
+trigger_count=0
+resize_count=0
+for token in $(/usr/bin/cat /proc/cmdline); do
+    case "$token" in
+    dashcam.bounded_provision=v1)
+        trigger_count=$((trigger_count + 1))
+        ;;
+    resize)
+        resize_count=$((resize_count + 1))
+        ;;
+    esac
+done
+[ "$trigger_count" -eq 1 ] || refuse "bounded kernel trigger is absent or duplicated"
+[ "$resize_count" -eq 0 ] || refuse "stock resize token is forbidden"
+
+for program in \
+    /usr/bin/busybox /usr/bin/cat /usr/bin/cmp /usr/bin/cp /usr/bin/cut /usr/bin/dd \
+    /usr/bin/findmnt /usr/bin/grep /usr/bin/mkdir /usr/bin/mount /usr/bin/mv \
+    /usr/bin/readlink /usr/bin/sed /usr/bin/sha256sum /usr/bin/sleep \
+    /usr/bin/sync /usr/bin/timeout /usr/bin/umount /usr/bin/wc \
+    /usr/sbin/sfdisk /usr/sbin/blockdev /usr/sbin/blkid \
+    /usr/sbin/e2fsck /usr/sbin/resize2fs /usr/sbin/partprobe \
+    /usr/sbin/dumpe2fs; do
+    [ -x "$program" ] || refuse "required initramfs executable is absent: $program"
+done
+
+require_regular_exact "$GATE"
+[ "$(/usr/bin/cat "$GATE")" = EXACT_IMAGE_RUNTIME_VALIDATED=v1 ] ||
+    refuse "exact-image runtime gate is not enabled"
+require_regular_exact "$CONFIG"
+[ "$(/usr/bin/cat "$CONFIG")" = "$EXPECTED_CONFIG" ] ||
+    refuse "exact initramfs configuration does not match"
+require_regular_exact "$SOURCE_CONTRACT"
+[ "$(normalize_table "$SOURCE_CONTRACT")" = "$EXPECTED_SOURCE_TABLE" ] ||
+    refuse "source table contract does not match"
+require_regular_exact "$TARGET_CONTRACT"
+[ "$(normalize_table "$TARGET_CONTRACT")" = "$EXPECTED_TARGET_TABLE" ] ||
+    refuse "target table contract does not match"
+
+identity_is_exact || refuse "identity_initial_$IDENTITY_FAILURE"
+[ ! -e /dev/mmcblk0p3 ] ||
+    [ "$(/usr/sbin/blkid -s PARTUUID -o value /dev/mmcblk0p3)" = 4f2c9ea0-03 ] ||
+    refuse "partition 3 identity is unexpected"
+/usr/bin/grep -F "/dev/mmcblk0p2 " /proc/mounts >/dev/null &&
+    refuse "root partition is already mounted"
+/usr/bin/grep -F "/dev/mmcblk0p3 " /proc/mounts >/dev/null &&
+    refuse "data partition is unexpectedly mounted"
+
+/usr/bin/mkdir -p "$BOOT_MOUNT" "$WORK" || refuse "cannot create bounded runtime directories"
+boot_device=$(/usr/sbin/blkid -t "PARTUUID=$EXPECTED_BOOT_PARTUUID" -o device)
+boot_device=$(/usr/bin/readlink -f "$boot_device")
+[ "$boot_device" = /dev/mmcblk0p1 ] || refuse "boot partition resolution changed"
+/usr/bin/timeout 15 /usr/bin/mount -t vfat \
+    -o rw,nosuid,nodev,noexec,umask=0077 "$boot_device" "$BOOT_MOUNT" ||
+    refuse "cannot mount the exact boot partition"
+BOOT_MOUNTED=1
+[ "$(/usr/bin/readlink -f "$(/usr/bin/findmnt -n -o SOURCE "$BOOT_MOUNT")")" = "$boot_device" ] ||
+    refuse "mounted boot source does not match the exact partition"
+[ "$(/usr/bin/findmnt -n -o FSTYPE "$BOOT_MOUNT")" = vfat ] ||
+    refuse "mounted boot filesystem is not vfat"
+boot_options=$(/usr/bin/findmnt -n -o OPTIONS "$BOOT_MOUNT")
+for option in rw nosuid nodev noexec; do
+    printf '%s\n' "$boot_options" | /usr/bin/grep -Eq "(^|,)$option(,|$)" ||
+        refuse "mounted boot filesystem lacks required option $option"
+done
+/usr/bin/mkdir -p "$STATE_DIR" || refuse "cannot create the bounded durable state directory"
+[ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] ||
+    refuse "durable state path is not an exact directory"
+STATE_READY=1
+
+layout=$(classify_layout) || refuse "partition table is neither exact source nor exact target"
+load_journal
+
+if [ "$layout" = source ]; then
+    case "$JOURNAL_PHASE" in
+    none|source_backup_validated)
+        ;;
+    *)
+        refuse "source layout contradicts the durable journal phase"
+        ;;
+    esac
+    [ "$REBOOT_COUNT" -eq 0 ] || refuse "source layout has a nonzero reboot count"
+    create_or_validate_backup
+    write_journal source_backup_validated 0
+    identity_is_exact || refuse "identity_before_table_$IDENTITY_FAILURE"
+    [ "$(classify_layout)" = source ] ||
+        refuse "source layout changed immediately before the table write"
+
+    /usr/bin/timeout 30 /usr/sbin/sfdisk --no-reread --force /dev/mmcblk0 \
+        < "$TARGET_CONTRACT" ||
+        refuse "bounded target table write failed"
+    [ "$(classify_layout)" = target ] ||
+        refuse "written table does not match the exact target contract"
+    /usr/bin/timeout 15 /usr/sbin/sfdisk --verify /dev/mmcblk0 ||
+        refuse "written target table failed verification"
+    write_journal table_committed 0
+    set +e
+    /usr/bin/timeout 15 /usr/sbin/blockdev --rereadpt /dev/mmcblk0 >/dev/null 2>&1
+    rereadpt_status=$?
+    set -e
+    partprobe_status=none
+    if [ "$rereadpt_status" -ne 0 ]; then
+        set +e
+        /usr/bin/timeout 15 /usr/sbin/partprobe /dev/mmcblk0 >/dev/null 2>&1
+        partprobe_status=$?
+        set -e
+    fi
+    identity_is_exact_with_retry ||
+        refuse "identity_settle_${IDENTITY_FAILURE}_a${IDENTITY_RETRY_ATTEMPT}_r${rereadpt_status}_p${partprobe_status}"
+    layout=target
+fi
+
+[ "$layout" = target ] || refuse "internal layout classification escaped its bounds"
+case "$JOURNAL_PHASE" in
+none|source_backup_validated)
+    validate_backup
+    write_journal table_committed 0
+    ;;
+table_committed|early_complete)
+    ;;
+*)
+    refuse "target layout contradicts the durable journal phase"
+    ;;
+esac
+identity_is_exact || refuse "identity_after_target_$IDENTITY_FAILURE"
+[ "$(classify_layout)" = target ] || refuse "target table changed after commit"
+
+if [ "$(/usr/bin/cat /sys/class/block/mmcblk0p2/size)" != "$TARGET_ROOT_SECTORS" ]; then
+    if [ "$REBOOT_COUNT" -ne 0 ]; then
+        refuse "kernel did not adopt the target table after the one permitted reboot"
+    fi
+    write_journal table_committed 1
+    bounded_sync
+    /usr/bin/timeout 10 /usr/bin/busybox reboot -f
+    refuse "the one permitted forced reboot returned without restarting"
+fi
+
+if [ "$JOURNAL_PHASE" = early_complete ]; then
+    filesystem_matches_partition ||
+        refuse "early-complete journal does not match the ext4/device size"
+    write_progress complete success ||
+        refuse "cannot persist complete progress state"
+    /usr/bin/timeout 15 /usr/bin/umount "$BOOT_MOUNT" ||
+        refuse "cannot unmount the durable boot state"
+    BOOT_MOUNTED=0
+    trap - EXIT HUP INT TERM
+    exit 0
+fi
+
+identity_is_exact || refuse "identity_before_ext4_$IDENTITY_FAILURE"
+[ "$(classify_layout)" = target ] ||
+    refuse "target layout changed immediately before ext4 maintenance"
+write_progress before_e2fsck running ||
+    refuse "cannot persist before_e2fsck progress state"
+set +e
+/usr/bin/timeout -k 10 120 /usr/sbin/e2fsck -p /dev/mmcblk0p2 >/dev/null 2>&1
+e2fsck_status=$?
+set -e
+case "$e2fsck_status" in
+0|1)
+    ;;
+*)
+    refuse "bounded e2fsck failed with status $e2fsck_status"
+    ;;
+esac
+write_progress before_resize2fs running ||
+    refuse "cannot persist before_resize2fs progress state"
+set +e
+/usr/bin/timeout -k 10 120 /usr/sbin/resize2fs /dev/mmcblk0p2 >/dev/null 2>&1
+resize2fs_status=$?
+set -e
+[ "$resize2fs_status" -eq 0 ] ||
+    refuse "bounded ext4 growth failed with status $resize2fs_status"
+filesystem_matches_partition ||
+    refuse "grown ext4 block count does not equal the partition byte count"
+write_progress complete success ||
+    refuse "cannot persist complete progress state"
+write_journal early_complete "$REBOOT_COUNT"
+/usr/bin/timeout 15 /usr/bin/umount "$BOOT_MOUNT" ||
+    refuse "cannot unmount the durable boot state"
+BOOT_MOUNTED=0
+trap - EXIT HUP INT TERM
+exit 0

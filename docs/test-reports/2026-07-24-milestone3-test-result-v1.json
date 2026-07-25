@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-23T23:00:55.843Z",
+  "producer": {
+    "name": "codex-local-deployment-diagnostics",
+    "version": "0.1.0.dev0",
+    "build_id": "milestone3-local-20260724"
+  },
+  "status": "passed",
+  "suite": {
+    "id": "milestone3-local",
+    "name": "Milestone 3 local deployment diagnostics and harnesses",
+    "run_id": "20260724-local-003",
+    "command": "See docs/test-reports/2026-07-24-milestone3-local.md",
+    "tags": ["local", "diagnostics", "dry-run", "bounded-input"]
+  },
+  "summary": {
+    "duration_ms": 30000,
+    "total": 10,
+    "passed": 10,
+    "failed": 0,
+    "errored": 0,
+    "skipped": 0
+  },
+  "cases": [
+    {
+      "id": "lock",
+      "name": "uv lockfile synchronization",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "format",
+      "name": "Ruff formatting",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "lint",
+      "name": "Ruff lint",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "mypy",
+      "name": "Strict mypy",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "pytest-py311",
+      "name": "261 tests on Python 3.11",
+      "status": "passed",
+      "duration_ms": 3170
+    },
+    {
+      "id": "pytest-py312",
+      "name": "261 tests on Python 3.12",
+      "status": "passed",
+      "duration_ms": 3170
+    },
+    {
+      "id": "pytest-py313",
+      "name": "261 tests on Python 3.13",
+      "status": "passed",
+      "duration_ms": 3390
+    },
+    {
+      "id": "build",
+      "name": "Source distribution and wheel build",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "fixture-clis",
+      "name": "Layout provision-plan and endurance fixture CLIs",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "destructive-audit",
+      "name": "Dry-run refusal and deployment safety audit",
+      "status": "passed",
+      "duration_ms": 0
+    }
+  ],
+  "evidence_artifacts": [
+    {
+      "path": "docs/test-reports/2026-07-24-milestone3-local.md",
+      "kind": "text",
+      "description": "Local scope commands integration corrections results and limitations"
+    },
+    {
+      "path": "deploy/storage/layout-v1.toml",
+      "kind": "text",
+      "description": "Provisional declarative partition-layout policy"
+    }
+  ],
+  "measurements": [
+    {
+      "name": "unit_tests_per_interpreter",
+      "value": 261,
+      "unit": "tests"
+    },
+    {
+      "name": "python_interpreters_tested",
+      "value": 3,
+      "unit": "interpreters"
+    },
+    {
+      "name": "provisioning_commands_executed",
+      "value": 0,
+      "unit": "commands"
+    }
+  ],
+  "warnings": [
+    {
+      "code": "LOCAL_FIXTURES_ONLY",
+      "message": "No Pi hardware media performance filesystem durability provisioning or Windows claim was evaluated."
+    },
+    {
+      "code": "PARTITION_TABLE_UNSELECTED",
+      "message": "The checked-in GPT layout is a fixture candidate; production must match the exact Phase 0B image."
+    }
+  ],
+  "environment": {
+    "kind": "local",
+    "os": "Microsoft Windows 11 Pro",
+    "os_version": "10.0.26200",
+    "architecture": "AMD64",
+    "python_version": "3.12.6",
+    "machine_class": "development-workstation"
+  }
+}

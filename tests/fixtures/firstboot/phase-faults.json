@@ -1,0 +1,16 @@
+{
+  "recoverable_phases": [
+    "source_verified",
+    "backup_validated",
+    "table_committed",
+    "root_checked",
+    "root_ready",
+    "signature_verified",
+    "data_formatted",
+    "early_complete",
+    "volume_mounted",
+    "sentinel_durable"
+  ],
+  "retry_limit": 3,
+  "reboot_limit": 1
+}

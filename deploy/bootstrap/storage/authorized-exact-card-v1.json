@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "bootstrap_trigger": "dashcam.bootstrap=v1",
+  "cid": "fe34325344000000200000031a0192d1",
+  "size_bytes": 31457280000,
+  "sector_size": 512,
+  "source": {
+    "boot_start_sector": 16384,
+    "boot_size_sectors": 1048576,
+    "root_start_sector": 1064960,
+    "root_size_sectors": 8388608
+  },
+  "target": {
+    "root_size_bytes": 6442450944,
+    "minimum_device_bytes": 30064771072,
+    "minimum_data_bytes": 8589934592,
+    "alignment_bytes": 1048576,
+    "trailing_reserve_bytes": 1048576
+  }
+}

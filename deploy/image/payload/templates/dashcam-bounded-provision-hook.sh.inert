@@ -1,0 +1,12 @@
+#!/bin/sh
+# INERT REVIEW TEMPLATE -- DO NOT INSTALL AS AN INITRAMFS HOOK.
+#
+# A reviewed hook must copy only the separately validated bounded runtime and
+# its closed contract into the initramfs.  It must prove all required programs
+# and shared libraries are present before update-initramfs succeeds.  The exact
+# Raspberry Pi OS image and resulting initramfs must then be inspected again.
+#
+# This placeholder deliberately refuses instead of guessing at initramfs-tools
+# hook behavior.
+echo "dashcam bounded-provision hook is inert pending Pi validation" >&2
+exit 125

@@ -1,0 +1,6 @@
+{
+  "resolved_path": "/dev/mmcblk9",
+  "serial": "fe34325344000000200000031a0192d1",
+  "size_bytes": 31457280000,
+  "partition_table_fingerprint": "17eee4a5eb7d0641bf6ea6a2013ff5203c09aa72b7420ff990bd82ec08406ae6"
+}

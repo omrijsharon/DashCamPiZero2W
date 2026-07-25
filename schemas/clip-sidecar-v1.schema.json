@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dashcam.local/schemas/clip-sidecar-v1.schema.json",
+  "title": "Dashcam clip sidecar v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "clip_id", "boot_id", "sequence", "video_file", "metadata_file",
+    "start_utc", "end_utc", "start_monotonic_ns", "end_monotonic_ns",
+    "gps_time_state", "system_clock_state", "timestamp_quality", "time_anchor",
+    "timezone", "start_local", "video", "audio", "gps", "protected",
+    "protection_reason", "software_version", "warnings"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "clip_id": { "type": "string", "format": "uuid" },
+    "boot_id": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 0, "maximum": 999999 },
+    "video_file": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z0-9._-]+\\.mp4$" },
+    "metadata_file": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z0-9._-]+\\.json$" },
+    "start_utc": { "$ref": "#/$defs/nullableDateTime" },
+    "end_utc": { "$ref": "#/$defs/nullableDateTime" },
+    "start_monotonic_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+    "end_monotonic_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+    "gps_time_state": { "enum": ["UNSYNCED", "GPS_TIME_VALID", "GPS_TIME_STALE"] },
+    "system_clock_state": { "enum": ["UNSET", "SYNCING", "SYNCHRONIZED", "ERROR"] },
+    "timestamp_quality": { "$ref": "#/$defs/timestampQuality" },
+    "time_anchor": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/timeAnchor" }] },
+    "timezone": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "start_local": { "$ref": "#/$defs/nullableDateTime" },
+    "video": { "$ref": "#/$defs/video" },
+    "audio": { "$ref": "#/$defs/audio" },
+    "gps": { "$ref": "#/$defs/gps" },
+    "protected": { "type": "boolean" },
+    "protection_reason": { "anyOf": [{ "type": "null" }, { "type": "string", "minLength": 1, "maxLength": 128 }] },
+    "software_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "warnings": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+    }
+  },
+  "$defs": {
+    "nonnegativeInteger": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+    "nullableDateTime": { "anyOf": [{ "type": "null" }, { "type": "string", "format": "date-time" }] },
+    "nullableNumber": { "anyOf": [{ "type": "null" }, { "type": "number" }] },
+    "nullableInteger": { "anyOf": [{ "type": "null" }, { "type": "integer" }] },
+    "timestampQuality": { "enum": ["MONOTONIC_ONLY", "GPS_ANCHORED", "SYSTEM_DERIVED"] },
+    "timeAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "monotonic_ns", "utc", "uncertainty_ns", "provenance"],
+      "properties": {
+        "source": { "enum": ["GPS", "SYSTEM_CLOCK"] },
+        "monotonic_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "utc": { "type": "string", "format": "date-time" },
+        "uncertainty_ns": { "type": "integer", "minimum": 0, "maximum": 86400000000000 },
+        "provenance": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "video": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["codec", "width", "height", "fps_nominal", "target_bitrate_bps", "measured_bitrate_bps", "frames_written", "dropped_frames"],
+      "properties": {
+        "codec": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "fps_nominal": { "type": "number", "minimum": 0.1, "maximum": 1000 },
+        "target_bitrate_bps": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+        "measured_bitrate_bps": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+        "frames_written": { "$ref": "#/$defs/nonnegativeInteger" },
+        "dropped_frames": { "$ref": "#/$defs/nonnegativeInteger" }
+      }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "codec", "sample_rate_hz", "channels", "target_bitrate_bps"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "codec": { "anyOf": [{ "type": "null" }, { "type": "string", "minLength": 1, "maxLength": 32 }] },
+        "sample_rate_hz": { "$ref": "#/$defs/nullableInteger" },
+        "channels": { "$ref": "#/$defs/nullableInteger" },
+        "target_bitrate_bps": { "$ref": "#/$defs/nullableInteger" }
+      }
+    },
+    "gpsSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["monotonic_ns", "utc", "timestamp_quality", "lat_deg", "lon_deg", "speed_mps", "course_deg", "altitude_m", "fix_quality", "satellites", "hdop"],
+      "properties": {
+        "monotonic_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "utc": { "$ref": "#/$defs/nullableDateTime" },
+        "timestamp_quality": { "$ref": "#/$defs/timestampQuality" },
+        "lat_deg": { "$ref": "#/$defs/nullableNumber" },
+        "lon_deg": { "$ref": "#/$defs/nullableNumber" },
+        "speed_mps": { "$ref": "#/$defs/nullableNumber" },
+        "course_deg": { "$ref": "#/$defs/nullableNumber" },
+        "altitude_m": { "$ref": "#/$defs/nullableNumber" },
+        "fix_quality": { "$ref": "#/$defs/nullableInteger" },
+        "satellites": { "$ref": "#/$defs/nullableInteger" },
+        "hdop": { "$ref": "#/$defs/nullableNumber" }
+      }
+    },
+    "gps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "first_fix_utc", "samples"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "first_fix_utc": { "$ref": "#/$defs/nullableDateTime" },
+        "samples": { "type": "array", "maxItems": 600, "items": { "$ref": "#/$defs/gpsSample" } }
+      }
+    }
+  }
+}

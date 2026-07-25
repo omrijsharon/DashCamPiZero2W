@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dashcam-pizero2w"
+version = "0.1.0.dev0"
+description = "Reliability-first Raspberry Pi Zero 2 W GPS dashcam"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "Tami Pinhasi" }]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: No Input/Output (Daemon)",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "tzdata>=2025.2,<2027",
+]
+
+[project.scripts]
+dashcam-version = "dashcam.cli:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.130,<7",
+  "jsonschema>=4.23,<5",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<10",
+  "ruff>=0.11,<1",
+  "types-jsonschema>=4.23,<5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dashcam", "src/dashcam_web"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [".venv", "artifacts"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dashcam", "dashcam_web"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+testpaths = ["tests"]
+markers = [
+  "hardware: requires an explicitly authorized Raspberry Pi or attached hardware",
+  "integration: crosses component or process boundaries",
+  "windows: requires a supported Windows host or card reader",
+]

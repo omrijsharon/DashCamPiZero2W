@@ -1,0 +1,14 @@
+[Unit]
+Description=DashCam bounded Wi-Fi client-first fallback AP
+Requires=NetworkManager.service
+Wants=cloud-final.service
+After=NetworkManager.service cloud-final.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/dashcam/venv/bin/python -m dashcam.network_fallback
+TimeoutStartSec=120
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

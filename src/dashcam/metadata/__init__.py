@@ -1,0 +1,1 @@
+"""Versioned clip metadata domain."""

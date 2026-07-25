@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-24",
+  "scope": "native-WSL regular-file-only disabled-runtime image build",
+  "source_archive": {
+    "path": "artifacts/images/2026-06-18-raspios-trixie-armhf-lite.img.xz",
+    "size_bytes": 549086704,
+    "sha256": "ea4e84c501d6dd4f4b1d04eb84df133a03f90a05ee2e8ab849185c17c2b0707b"
+  },
+  "output": {
+    "path": "artifacts/images/dashcam-release-disabled-v1.img",
+    "size_bytes": 2675965952,
+    "sha256": "3fd152c0309a8ed24a81f5d534dc592c22cc912445792b620a1088e9f921cc58",
+    "customized": true,
+    "runtime_gate_created": false,
+    "elapsed_seconds": 862.4
+  },
+  "verified_raw_contract": {
+    "mbr_disk_id": "0x4f2c9ea0",
+    "boot": {
+      "number": 1,
+      "start_sector": 16384,
+      "size_sectors": 1048576,
+      "partition_type": "0x0c",
+      "filesystem": "vfat",
+      "filesystem_uuid": "89F4-4546",
+      "bootable": false
+    },
+    "root": {
+      "number": 2,
+      "start_sector": 1064960,
+      "size_sectors": 4161536,
+      "partition_type": "0x83",
+      "filesystem": "ext4",
+      "filesystem_uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8",
+      "bootable": false
+    }
+  },
+  "boot_readback": {
+    "cmdline": "console=serial0,115200 console=tty1 root=PARTUUID=4f2c9ea0-02 rootfstype=ext4 fsck.repair=yes rootwait dashcam.bounded_provision=v1",
+    "stock_resize_token_present": false,
+    "bounded_trigger_count": 1,
+    "initramfs_size_bytes": 13452681,
+    "initramfs_sha256": "b9d288874682de0d57ba48cd8abf6b6dd23ef8bb9d41394df81c508e6964cf77",
+    "matches_two_independent_real_customizer_runs": true
+  },
+  "tool_versions": {
+    "python": "CPython 3.13.14 linux-x86_64",
+    "uv": "0.11.31",
+    "xz": "5.2.5",
+    "mtools": "4.0.32",
+    "debugfs": "1.46.5",
+    "zstd": "1.4.8"
+  },
+  "repository_validation": {
+    "pytest_passed": 752,
+    "pytest_skipped": 1,
+    "skipped_reason": "Windows host has no POSIX sh; independent WSL /bin/sh -n passed",
+    "ruff_format": "passed, 153 files",
+    "ruff_check": "passed",
+    "mypy_strict": "passed, 69 source files"
+  },
+  "safety": {
+    "physical_device_accessed": false,
+    "block_device_interface_present": false,
+    "loop_device_used": false,
+    "filesystem_mounted": false,
+    "sudo_used": false,
+    "root_partition_written": false,
+    "runtime_enable_gate_present": false,
+    "output_created_exclusively": true,
+    "output_reopened_and_verified": true
+  }
+}

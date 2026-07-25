@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-23T22:14:58.229Z",
+  "producer": {
+    "name": "codex-local-foundation",
+    "version": "0.1.0.dev0",
+    "build_id": "milestone1-local-20260724"
+  },
+  "status": "passed",
+  "suite": {
+    "id": "milestone1-local",
+    "name": "Milestone 1 local repository foundation",
+    "run_id": "20260724-local-001",
+    "command": "See docs/test-reports/2026-07-24-milestone1-local.md",
+    "tags": [
+      "local",
+      "foundation"
+    ]
+  },
+  "summary": {
+    "duration_ms": 13950,
+    "total": 10,
+    "passed": 10,
+    "failed": 0,
+    "errored": 0,
+    "skipped": 0
+  },
+  "cases": [
+    {
+      "id": "lock",
+      "name": "uv lockfile synchronization",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "format",
+      "name": "Ruff formatting",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "lint",
+      "name": "Ruff lint",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "mypy",
+      "name": "Strict mypy",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "pytest-py311",
+      "name": "pytest on Python 3.11",
+      "status": "passed",
+      "duration_ms": 3480
+    },
+    {
+      "id": "pytest-py312",
+      "name": "pytest on Python 3.12",
+      "status": "passed",
+      "duration_ms": 2800
+    },
+    {
+      "id": "pytest-py313",
+      "name": "pytest on Python 3.13",
+      "status": "passed",
+      "duration_ms": 4670
+    },
+    {
+      "id": "schemas",
+      "name": "Draft 2020-12 report schemas",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "build",
+      "name": "Source distribution and wheel build",
+      "status": "passed",
+      "duration_ms": 0
+    },
+    {
+      "id": "fresh-source",
+      "name": "Fresh isolated source-copy quality suite",
+      "status": "passed",
+      "duration_ms": 1500
+    }
+  ],
+  "evidence_artifacts": [
+    {
+      "path": "docs/test-reports/2026-07-24-milestone1-local.md",
+      "kind": "text",
+      "description": "Human-readable commands, versions, results, and limitations"
+    }
+  ],
+  "measurements": [
+    {
+      "name": "unit_tests_per_interpreter",
+      "value": 9,
+      "unit": "tests"
+    },
+    {
+      "name": "python_interpreters_tested",
+      "value": 3,
+      "unit": "interpreters"
+    }
+  ],
+  "warnings": [
+    {
+      "code": "NO_GIT_HEAD",
+      "message": "No initial commit exists; clean checkout and hosted CI are pending."
+    }
+  ],
+  "environment": {
+    "kind": "local",
+    "os": "Microsoft Windows 11 Pro",
+    "os_version": "10.0.26200",
+    "architecture": "AMD64",
+    "python_version": "3.12.6",
+    "machine_class": "development-workstation"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "binfmt_marker": "/proc/sys/fs/binfmt_misc/qemu-arm",
+  "builder_container_digest": "REQUIRED_SHA256_CONTAINER_DIGEST",
+  "debian_snapshot": "REQUIRED_IMMUTABLE_DEBIAN_SNAPSHOT_URL",
+  "raspberrypi_snapshot": "REQUIRED_IMMUTABLE_RASPBERRY_PI_SNAPSHOT_URL",
+  "schema_version": 2,
+  "tools": [
+    {
+      "executable": "/usr/bin/bash",
+      "name": "bash",
+      "version_argv": [
+        "--version"
+      ],
+      "version_output_sha256": "REQUIRED_SHA256_VERSION_OUTPUT"
+    },
+    {
+      "executable": "/usr/bin/git",
+      "name": "git",
+      "version_argv": [
+        "--version"
+      ],
+      "version_output_sha256": "REQUIRED_SHA256_VERSION_OUTPUT"
+    },
+    {
+      "executable": "/usr/bin/guestfish",
+      "name": "guestfish",
+      "version_argv": [
+        "--version"
+      ],
+      "version_output_sha256": "REQUIRED_SHA256_VERSION_OUTPUT"
+    },
+    {
+      "executable": "/usr/bin/guestmount",
+      "name": "guestmount",
+      "version_argv": [
+        "--version"
+      ],
+      "version_output_sha256": "REQUIRED_SHA256_VERSION_OUTPUT"
+    },
+    {
+      "executable": "/usr/bin/guestunmount",
+      "name": "guestunmount",
+      "version_argv": [
+        "--version"
+      ],
+      "version_output_sha256": "REQUIRED_SHA256_VERSION_OUTPUT"
+    },
+    {
+      "executable": "/usr/bin/qemu-arm-static",
+      "name": "qemu-arm",
+      "version_argv": [
+        "--version"
+      ],
+      "version_output_sha256": "REQUIRED_SHA256_VERSION_OUTPUT"
+    }
+  ]
+}

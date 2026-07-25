@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-25",
+  "status": "v3_first_boot_refused_after_target_table_commit_before_e2fsck_offline_read_only_evidence",
+  "scope": "Forensic capture only. No write, repair, resize, repartition, or format was performed after the owner powered off the Pi and inserted the card in the Windows reader.",
+  "network_observation": {
+    "timezone": "+03:00",
+    "started_at": "11:45:09",
+    "ended_at": "11:55:39",
+    "duration_seconds": 630,
+    "expected_wifi_mac": "2c:cf:67:98:4c:49",
+    "expected_wifi_mac_present": false,
+    "hostname": "dashcam-pi.local",
+    "hostname_resolved": false,
+    "old_address": "192.168.68.110",
+    "old_address_tcp_22_open": false,
+    "rejected_other_pi": {
+      "address": "192.168.68.113",
+      "mac": "2c:cf:67:16:28:70",
+      "reason": "MAC does not match the authorized reference Pi."
+    }
+  },
+  "authorized_card": {
+    "windows_disk_number": 1,
+    "friendly_name": "Generic MassStorageClass",
+    "usb_serial": "000000002960",
+    "size_bytes": 31457280000,
+    "sector_size_bytes": 512,
+    "sector_count": 61440000,
+    "cid": "fe34325344000000200000031a0192d1",
+    "read_only_forensic_handling": true
+  },
+  "observed_target_partition_table": {
+    "partition_1": {
+      "start_sector": 16384,
+      "sector_count": 1048576,
+      "type": "0x0c",
+      "filesystem": "FAT32 bootfs"
+    },
+    "partition_2": {
+      "start_sector": 1064960,
+      "sector_count": 12582912,
+      "type": "0x83",
+      "filesystem": "ext4"
+    },
+    "partition_3": {
+      "start_sector": 13647872,
+      "sector_count": 47790080,
+      "type": "0x07",
+      "filesystem": "unformatted"
+    }
+  },
+  "fat_durable_state": {
+    "journal_path": "dashcam-provision/initramfs-v1.state",
+    "journal_phase": "table_committed",
+    "reboot_count": 0,
+    "cid": "fe34325344000000200000031a0192d1",
+    "sector_count": 61440000,
+    "backup_manifest_sha256": "f1e6174b69aa61172162ce403434734780596a63df04bc22d74ff51d161a77cf",
+    "backup_manifest_valid": true,
+    "progress_path": "dashcam-provision/initramfs-v1.progress",
+    "progress_phase": "refusal",
+    "progress_status": "refused_identity_changed_after_the_target_table_commit",
+    "progress_cid_matches_authorized_card": true,
+    "progress_sector_count_matches_authorized_card": true
+  },
+  "root_filesystem": {
+    "inspection_mode": "raw read-only",
+    "ext4_magic": "ef53",
+    "clean": true,
+    "block_size_bytes": 4096,
+    "block_count": 520192,
+    "size_bytes": 2130706432,
+    "grown_to_partition_size": false,
+    "evidence_of_root_filesystem_write": false
+  },
+  "bounded_conclusion": {
+    "proven": "V3 durably committed the target partition table, then its post-table reread aggregate identity check refused before e2fsck. Its FAT progress record made the stopping boundary observable.",
+    "disproven_for_this_v3_run": "A forced e2fsck timeout cannot be the reason this V3 transaction stopped, because e2fsck was not reached.",
+    "not_proven": "The individual identity field that changed, if any, cannot be determined from V3's aggregate refusal record.",
+    "leading_hypothesis_not_fact": "A transient /dev, sysfs, or blkid identity race during the post-table reread is the most likely explanation, but it is not proven.",
+    "next_gate": "Keep the card read-only after insertion. Retire V3 and do not retry or mutate it; a reviewed V4 fix with field-level diagnostic evidence is required before another exact-card trial. Milestone 5 remains unchecked."
+  }
+}

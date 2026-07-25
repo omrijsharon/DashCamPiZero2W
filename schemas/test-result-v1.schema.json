@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dashcampizerow.local/schemas/test-result-v1.schema.json",
+  "title": "DashCamPiZero2W test result v1",
+  "description": "A bounded, machine-readable record of one test-suite run. It is not a hardware capability claim.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_utc",
+    "producer",
+    "status",
+    "suite",
+    "summary",
+    "cases",
+    "evidence_artifacts",
+    "measurements",
+    "warnings",
+    "environment"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_utc": { "$ref": "#/$defs/utcTimestamp" },
+    "producer": { "$ref": "#/$defs/producer" },
+    "status": {
+      "type": "string",
+      "enum": ["passed", "failed", "error", "incomplete", "skipped"]
+    },
+    "suite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "run_id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "name": { "$ref": "#/$defs/shortText" },
+        "run_id": { "$ref": "#/$defs/identifier" },
+        "command": { "$ref": "#/$defs/commandText" },
+        "tags": { "$ref": "#/$defs/tags" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration_ms", "total", "passed", "failed", "errored", "skipped"],
+      "properties": {
+        "duration_ms": { "$ref": "#/$defs/durationMs" },
+        "total": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "passed": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "failed": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "errored": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "skipped": { "type": "integer", "minimum": 0, "maximum": 500 }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/testCase" }
+    },
+    "evidence_artifacts": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/evidenceArtifact" }
+    },
+    "measurements": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/measurement" }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/warning" }
+    },
+    "environment": {
+      "type": "object",
+      "description": "Non-secret execution facts only; credentials, tokens, passwords, private addresses, and unrestricted environment-variable dumps are prohibited.",
+      "additionalProperties": false,
+      "required": ["kind", "os", "architecture", "python_version"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["local", "fixture", "pi", "windows", "ci", "other"] },
+        "os": { "$ref": "#/$defs/shortText" },
+        "os_version": { "$ref": "#/$defs/shortText" },
+        "architecture": { "$ref": "#/$defs/shortText" },
+        "python_version": { "$ref": "#/$defs/shortText" },
+        "machine_class": { "$ref": "#/$defs/shortText" },
+        "ci_provider": { "$ref": "#/$defs/shortText" },
+        "source_revision": { "$ref": "#/$defs/identifier" }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "maxLength": 128
+    },
+    "shortText": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "commandText": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+      "maxLength": 40
+    },
+    "durationMs": { "type": "integer", "minimum": 0, "maximum": 864000000 },
+    "relativePath": {
+      "type": "string",
+      "description": "A repository-relative, forward-slash path; it must not be absolute or traverse upward.",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$",
+      "maxLength": 240
+    },
+    "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$", "maxLength": 64 },
+    "tags": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "build_id"],
+      "properties": {
+        "name": { "$ref": "#/$defs/shortText" },
+        "version": { "$ref": "#/$defs/identifier" },
+        "build_id": { "$ref": "#/$defs/identifier" },
+        "source_revision": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "evidenceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "kind": { "type": "string", "enum": ["log", "json", "junit", "text", "image", "video", "audio", "other"] },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "description": { "$ref": "#/$defs/shortText" }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "value": { "type": "number", "minimum": -1000000000000, "maximum": 1000000000000 },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "scope": { "$ref": "#/$defs/identifier" },
+        "note": { "$ref": "#/$defs/shortText" }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/identifier" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "testCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "status", "duration_ms"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "name": { "$ref": "#/$defs/shortText" },
+        "status": { "type": "string", "enum": ["passed", "failed", "error", "skipped", "not_run"] },
+        "duration_ms": { "$ref": "#/$defs/durationMs" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "tags": { "$ref": "#/$defs/tags" },
+        "evidence_artifacts": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/evidenceArtifact" }
+        },
+        "measurements": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/measurement" }
+        }
+      }
+    }
+  }
+}

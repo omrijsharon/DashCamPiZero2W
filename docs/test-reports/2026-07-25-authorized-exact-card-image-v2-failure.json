@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-25",
+  "status": "v2_first_boot_stopped_before_root_filesystem_growth_offline_read_only_evidence",
+  "scope": "Forensic capture only. No write, repair, resize, repartition, or format was performed on the card.",
+  "authorized_card": {
+    "windows_disk_number": 1,
+    "friendly_name": "Generic MassStorageClass",
+    "usb_serial": "000000002960",
+    "size_bytes": 31457280000,
+    "sector_size_bytes": 512,
+    "sector_count": 61440000,
+    "mbr_disk_id": "0x4f2c9ea0",
+    "cid": "fe34325344000000200000031a0192d1",
+    "read_only_forensic_handling": true
+  },
+  "observed_partition_table": {
+    "partition_1": {
+      "start_sector": 16384,
+      "sector_count": 1048576,
+      "type": "0x0c",
+      "filesystem": "FAT32 bootfs"
+    },
+    "partition_2": {
+      "start_sector": 1064960,
+      "sector_count": 12582912,
+      "type": "0x83",
+      "filesystem": "ext4"
+    },
+    "partition_3": {
+      "start_sector": 13647872,
+      "sector_count": 47790080,
+      "type": "0x07",
+      "filesystem": "unformatted"
+    }
+  },
+  "fat_durable_state": {
+    "path": "dashcam-provision/initramfs-v1.state",
+    "phase": "table_committed",
+    "reboot_count": 0,
+    "cid": "fe34325344000000200000031a0192d1",
+    "sector_count": 61440000,
+    "backup_manifest_sha256": "f1e6174b69aa61172162ce403434734780596a63df04bc22d74ff51d161a77cf",
+    "backup_manifest_valid": true
+  },
+  "root_filesystem": {
+    "filesystem_uuid": "e9ef4083-101b-46b4-b87d-de84fe1169f8",
+    "clean": true,
+    "block_size_bytes": 4096,
+    "block_count": 520192,
+    "size_bytes": 2130706432,
+    "grown_to_partition_size": false,
+    "captured_read_only_extent": {
+      "path": "artifacts/pi/2026-07-25-v2-firstboot-failure/root-source-extent-readonly.img",
+      "size_bytes": 2130706432,
+      "sha256": "ec82536b1906f25817ef84e8f6a7b3d8665852018b62f9a06233a11a8ac556b6",
+      "matches_v2_image_root_extent": true
+    }
+  },
+  "filesystem_check_evidence": {
+    "exact_v2_initramfs_e2fsck": {
+      "architecture": "armhf",
+      "e2fsprogs_version": "1.47.2",
+      "sha256": "b321caa91bb834fd90498cffa862c303387b023d81e87fea2d2dc11460029633",
+      "elf_closure_complete": true
+    },
+    "host_e2fsck_1_46_5": {
+      "result": "refused FEATURE_C12",
+      "interpretation": "Old-tool incompatibility with ext4 orphan_file, not evidence of card corruption."
+    },
+    "docker_desktop_e2fsck_1_47_0": {
+      "command_mode": "-fn",
+      "exit_code": 0,
+      "result": "clean read-only check passed"
+    }
+  },
+  "bounded_conclusion": {
+    "proven": "The early transaction wrote and durably recorded the target partition table, then stopped before a successful root filesystem growth. The captured root extent matches the v2 source image root extent, proving no root filesystem write occurred.",
+    "not_proven": "The exact failing command cannot be recovered from this v2 run because its refusal/failure diagnostics were not persisted durably.",
+    "leading_hypothesis_not_fact": "The forced e2fsck stage with its 120-second timeout is the leading hypothesis; it is not proven by the available durable state.",
+    "next_gate": "Keep the card offline and read-only pending review of a v3 recovery/diagnostic design. Do not retry v2 or mutate this card."
+  }
+}

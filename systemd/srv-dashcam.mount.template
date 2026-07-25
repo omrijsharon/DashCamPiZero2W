@@ -1,0 +1,14 @@
+[Unit]
+Description=Dashcam exFAT recording volume
+Before=dashcam-storage-check.service
+JobRunningTimeoutSec=20s
+
+[Mount]
+What=/dev/disk/by-uuid/REPLACE_WITH_VERIFIED_DASHCAM_UUID
+Where=/srv/dashcam
+Type=exfat
+Options=noatime,nosuid,nodev,noexec,uid=REPLACE_DASHCAM_UID,gid=REPLACE_STORAGE_GID,umask=0007
+TimeoutSec=20s
+
+[Install]
+WantedBy=local-fs.target

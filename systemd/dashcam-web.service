@@ -1,0 +1,46 @@
+[Unit]
+Description=Dashcam local web UI
+Documentation=file:/opt/dashcam/docs/installation.md
+After=network.target dashcamd.socket
+Requires=dashcamd.socket
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=dashcam-web
+Group=dashcam-web
+SupplementaryGroups=dashcam-api
+WorkingDirectory=/var/lib/dashcam-web
+ExecStart=/opt/dashcam/venv/bin/python -m dashcam_web
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+WatchdogSec=30s
+RuntimeDirectory=dashcam-web
+RuntimeDirectoryMode=0750
+StateDirectory=dashcam-web
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

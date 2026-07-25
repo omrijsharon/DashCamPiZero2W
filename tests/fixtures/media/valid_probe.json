@@ -1,0 +1,48 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "h264",
+      "codec_type": "video",
+      "start_time": "0.000000",
+      "duration": "60.000000",
+      "bit_rate": "8000000"
+    },
+    {
+      "index": 1,
+      "codec_name": "aac",
+      "codec_type": "audio",
+      "start_time": "0.020000",
+      "duration": "59.960000",
+      "bit_rate": "128000"
+    }
+  ],
+  "format": {
+    "duration": "60.000000",
+    "size": "60960000",
+    "bit_rate": "8128000"
+  },
+  "packets": [
+    {
+      "codec_type": "video",
+      "pts_time": "0.000000",
+      "duration_time": "0.033333",
+      "flags": "K_",
+      "data": "00000000: 0000 0001 65aa bbcc"
+    },
+    {
+      "codec_type": "audio",
+      "pts_time": "0.020000",
+      "duration_time": "0.021333",
+      "flags": "K_"
+    }
+  ],
+  "frames": [
+    {
+      "media_type": "video",
+      "key_frame": 1,
+      "pict_type": "I",
+      "best_effort_timestamp_time": "0.000000"
+    }
+  ]
+}

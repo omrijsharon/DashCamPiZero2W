@@ -1,0 +1,78 @@
+{
+  "boundaries": [],
+  "overall": "fail",
+  "schema_version": 1,
+  "validations": [
+    {
+      "checks": [
+        {
+          "code": "video_codec_h264",
+          "expected": "h264",
+          "observed": "h264",
+          "outcome": "pass",
+          "summary": "video stream must use H.264"
+        },
+        {
+          "code": "audio_codec_aac",
+          "expected": null,
+          "observed": null,
+          "outcome": "not_applicable",
+          "summary": "no audio stream was declared"
+        },
+        {
+          "code": "decoder_run",
+          "expected": 0,
+          "observed": 0,
+          "outcome": "pass",
+          "summary": "independent decoder must consume the selected video stream without errors"
+        },
+        {
+          "code": "first_video_packet_keyframe",
+          "expected": true,
+          "observed": false,
+          "outcome": "fail",
+          "summary": "first video packet must be marked as a keyframe"
+        },
+        {
+          "code": "first_video_frame_keyframe",
+          "expected": true,
+          "observed": false,
+          "outcome": "fail",
+          "summary": "first probed video frame must be marked as a keyframe"
+        },
+        {
+          "code": "first_video_packet_idr",
+          "expected": true,
+          "observed": true,
+          "outcome": "pass",
+          "summary": "first video packet must contain an H.264 IDR NAL unit"
+        },
+        {
+          "code": "duration",
+          "expected": "14.447482..14.947482",
+          "observed": null,
+          "outcome": "fail",
+          "summary": "clip duration must be within the configured tolerance"
+        },
+        {
+          "code": "video_bitrate",
+          "expected": "6000000..10000000",
+          "observed": null,
+          "outcome": "fail",
+          "summary": "measured video bitrate must be within the documented tolerance"
+        },
+        {
+          "code": "av_skew",
+          "expected": null,
+          "observed": null,
+          "outcome": "not_applicable",
+          "summary": "video-only clip"
+        }
+      ],
+      "media_path": "C:\\Users\\tamipinhasi\\Documents\\repos\\DashCamPiZero2W\\artifacts\\pi\\2026-07-24\\dashcam-h264-1080p30-20260724-01.h264",
+      "overall": "fail",
+      "schema_version": 1,
+      "timeline": null
+    }
+  ]
+}

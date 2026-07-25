@@ -1,0 +1,45 @@
+schema_version = 1
+table_type = "dos"
+sector_size_bytes = 512
+alignment_mib = 1
+minimum_device_gib = 28.0
+root_target_gib = 6.0
+minimum_data_gib = 8.0
+trailing_reserve_mib = 1
+
+[marker]
+state_path = "/var/lib/dashcam/provisioning/layout-v1.complete.json"
+volume_sentinel_name = ".dashcam-volume"
+
+[boot]
+number = 1
+role = "boot"
+filesystem = "vfat"
+label = "bootfs"
+preserve = true
+source_start_sector = 16384
+source_size_sectors = 1048576
+partition_type = "0x0c"
+bootable = false
+filesystem_uuid = "89F4-4546"
+
+[root]
+number = 2
+role = "root"
+filesystem = "ext4"
+label = "rootfs"
+preserve = false
+source_start_sector = 1064960
+source_size_sectors = 4161536
+partition_type = "0x83"
+bootable = false
+filesystem_uuid = "e9ef4083-101b-46b4-b87d-de84fe1169f8"
+
+[data]
+number = 3
+role = "recording"
+filesystem = "exfat"
+label = "DASHCAM"
+preserve = false
+partition_type = "0x07"
+bootable = false

@@ -1,0 +1,28 @@
+# TEMPLATE ONLY. Provisioning must replace every REPLACE_* token, inject a
+# unique secret out of band, set mode 0600, and validate with nmcli before use.
+[connection]
+id=dashcam-ap
+uuid=REPLACE_WITH_GENERATED_CONNECTION_UUID
+type=wifi
+interface-name=REPLACE_WITH_PROBED_WIFI_INTERFACE
+autoconnect=true
+autoconnect-priority=10
+
+[wifi]
+mode=ap
+band=bg
+ssid=Dashcam-REPLACE_WITH_SHORT_DEVICE_ID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=REPLACE_WITH_UNIQUE_DEVICE_PASSPHRASE
+
+[ipv4]
+method=shared
+address1=192.168.50.1/24
+shared-dhcp-range=192.168.50.20,192.168.50.100
+
+[ipv6]
+method=disabled
+
+[proxy]

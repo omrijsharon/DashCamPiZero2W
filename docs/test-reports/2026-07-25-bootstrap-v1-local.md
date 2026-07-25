@@ -12,9 +12,9 @@ transaction, fail-closed recorder preflight, and NetworkManager fallback policy
 are implemented and locally tested. No SD-card read, write, format, flash, or Pi
 operation was performed during this work.
 
-The release image itself is **not built or flash-ready**. The executable image
-builder correctly refuses while its Linux builder identities are unresolved
-and while the repository has no committed `HEAD`.
+The release image itself is **not built or flash-ready**. The repository now
+has an initial committed baseline, but the executable image builder still
+correctly refuses while its Linux builder identities are unresolved.
 
 ## Pinned source contract
 
@@ -107,8 +107,9 @@ The following remain deliberately unchecked:
    locations in `deploy/bootstrap/image/build-requirements.json` with a
    reviewed, executable Linux contract. No validated immutable Raspberry Pi
    package snapshot has yet been selected.
-2. Create a clean committed application identity and produce a wheel/dependency
-   bundle cryptographically tied to that commit and `uv.lock`.
+2. Produce the application wheel and dependency bundle from one clean recorded
+   commit and bind their complete installed identities to that commit and
+   `uv.lock`.
 3. Replace the bare armhf `chroot` execution with a reviewed private chroot
    environment (or official image-build helper) that supplies bounded
    `/proc`, `/sys`, `/dev`, `/run`, DNS, qemu/binfmt validation, and guaranteed

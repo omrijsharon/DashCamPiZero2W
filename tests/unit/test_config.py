@@ -11,6 +11,7 @@ import pytest
 import dashcam.config as config_module
 from dashcam.config import (
     CONFIG_FILE_MODE,
+    AudioConfig,
     ConfigError,
     ConfigMigrationError,
     config_from_mapping,
@@ -39,8 +40,28 @@ def test_checked_in_defaults_are_valid_and_round_trip() -> None:
     assert parse_config_toml(config_to_toml(loaded)) == loaded
     assert loaded.video.width == 1920
     assert loaded.time.timezone == "Asia/Jerusalem"
+    assert loaded.time.discipline_system_clock is False
+    assert loaded.time.system_clock_owner == "systemd-timesyncd"
     assert loaded.preview.max_clients == 1
     assert loaded.storage.recording_root == "/srv/dashcam"
+
+
+def test_enabled_audio_requires_stable_selector_and_exact_production_format() -> None:
+    selector_mapping = config_to_mapping(default_config())
+    selector_audio = selector_mapping["audio"]
+    assert isinstance(selector_audio, dict)
+    selector_audio["device_match"] = "hw:1,0"
+    with pytest.raises(ConfigError, match="device_match"):
+        config_from_mapping(selector_mapping)
+
+    format_mapping = config_to_mapping(default_config())
+    format_audio = format_mapping["audio"]
+    assert isinstance(format_audio, dict)
+    format_audio["sample_rate_hz"] = 44_100
+    with pytest.raises(ConfigError, match="fixed production"):
+        config_from_mapping(format_mapping)
+
+    assert AudioConfig(enabled=False, device_match="unused").enabled is False
 
 
 @pytest.mark.parametrize(
@@ -49,9 +70,17 @@ def test_checked_in_defaults_are_valid_and_round_trip() -> None:
         (("video", "fps"), "30"),
         (("video", "width"), 1919),
         (("video", "hardware_encoder_required"), False),
+        (("gps", "baud"), 19_200),
         (("gps", "stale_after_s"), 0.0),
+        (("gps", "max_sample_hz"), 11),
+        (("gps", "anchor_earliest_utc"), "2024-01-01"),
+        (("gps", "anchor_latest_utc"), "not-a-date"),
+        (("gps", "anchor_uncertainty_ms"), 0),
+        (("gps", "anchor_max_interval_s"), 0),
         (("time", "timezone"), "../localtime"),
         (("time", "timezone"), "Area/Definitely_Not_A_Real_Zone"),
+        (("time", "discipline_system_clock"), True),
+        (("time", "system_clock_owner"), "chrony"),
         (("overlay", "coordinate_decimals"), 9),
         (("preview", "max_clients"), 3),
         (("storage", "recording_root"), "/tmp/dashcam"),
@@ -88,6 +117,18 @@ def test_rejects_cross_field_failures(
     section.update(values)
 
     with pytest.raises(ConfigError):
+        config_from_mapping(raw_config)
+
+
+def test_rejects_inverted_gps_anchor_plausibility_window(
+    raw_config: dict[str, object],
+) -> None:
+    gps = raw_config["gps"]
+    assert isinstance(gps, dict)
+    gps["anchor_earliest_utc"] = "2100-01-01T00:00:00Z"
+    gps["anchor_latest_utc"] = "2024-01-01T00:00:00Z"
+
+    with pytest.raises(ConfigError, match="must be after"):
         config_from_mapping(raw_config)
 
 

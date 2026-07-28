@@ -24,6 +24,8 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, cast
 
 TRIGGER: Final = "dashcam.bootstrap=v1"
+SSH_DEV_TRIGGER: Final = "dashcam.bootstrap=ssh-dev-v1"
+_SUPPORTED_TRIGGERS: Final = frozenset({TRIGGER, SSH_DEV_TRIGGER})
 STATE_PATH: Final = "/var/lib/dashcam/provisioning/bootstrap-v1.json"
 COMPLETE_PATH: Final = "/var/lib/dashcam/provisioning/layout-v1.complete.json"
 BOOT_MIRROR: Final = "/boot/firmware/dashcam-bootstrap"
@@ -40,9 +42,14 @@ GIB: Final = 1024**3
 MBR_SIZE: Final = 512
 MAX_STATE_BYTES: Final = 64 * 1024
 DATA_ZERO_PREFIX_BYTES: Final = 4 * MIB
+KNOWN_CLOUD_INIT_WARNING: Final = (
+    "Could not find module named cc_netplan_nm_patch "
+    "(searched ['cc_netplan_nm_patch', 'cloudinit.config.cc_netplan_nm_patch'])"
+)
 
 _SFDISK: Final = "/usr/sbin/sfdisk"
 _RESIZE2FS: Final = "/usr/sbin/resize2fs"
+_DUMPE2FS: Final = "/usr/sbin/dumpe2fs"
 _MKFS_EXFAT: Final = "/usr/sbin/mkfs.exfat"
 _BLKID: Final = "/usr/sbin/blkid"
 _MOUNT: Final = "/usr/bin/mount"
@@ -56,6 +63,7 @@ _ALLOWED = frozenset(
     {
         _SFDISK,
         _RESIZE2FS,
+        _DUMPE2FS,
         _MKFS_EXFAT,
         _BLKID,
         _MOUNT,
@@ -71,6 +79,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _CID_RE = re.compile(r"[0-9a-f]{32}")
 _UUID_RE = re.compile(r"[A-Za-z0-9-]{3,64}")
 _DEVICE_RE = re.compile(r"/dev/[A-Za-z0-9._/+:-]{1,120}")
+_SYSFS_COMPONENT_RE = re.compile(r"[A-Za-z0-9._:+@-]{1,255}")
 
 
 class BootstrapError(RuntimeError):
@@ -170,11 +179,23 @@ class Authorization:
     root_source_size: int = 8_388_608
     sector_size: int = 512
     mbr_disk_id: int | None = None
+    bootstrap_trigger: str = TRIGGER
+    journal_schema_version: int = 1
+    require_authored_zero_prefix: bool = True
 
 
 EXACT_CARD_AUTHORIZATION: Final = Authorization(
     cid=AUTHORIZED_CID,
     size_bytes=AUTHORIZED_SIZE_BYTES,
+)
+
+EXACT_STOCK_CARD_AUTHORIZATION: Final = Authorization(
+    cid=AUTHORIZED_CID,
+    size_bytes=AUTHORIZED_SIZE_BYTES,
+    root_source_size=4_161_536,
+    bootstrap_trigger=SSH_DEV_TRIGGER,
+    journal_schema_version=2,
+    require_authored_zero_prefix=False,
 )
 
 
@@ -206,6 +227,7 @@ class Evidence:
     data_uuid: str | None = None
     data_signatures: tuple[str, ...] = ()
     data_zero_prefix_bytes: int = 0
+    data_prefix_sha256: str | None = None
     complete_identity: Mapping[str, object] | None = None
     mounted_source: str | None = None
     mounted_filesystem: str | None = None
@@ -229,6 +251,7 @@ class Journal:
     data_uuid: str | None = None
     refusal_code: str | None = None
     refusal_message: str | None = None
+    data_prefix_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,9 +340,7 @@ def parse_mbr(mbr: bytes) -> tuple[int, tuple[Partition, ...]]:
     return disk_id, tuple(parts)
 
 
-def table_matches(
-    partitions: Sequence[Partition], boot: Partition, geometry: Geometry
-) -> bool:
+def table_matches(partitions: Sequence[Partition], boot: Partition, geometry: Geometry) -> bool:
     expected = (boot, geometry.root, geometry.data)
     actual = tuple(sorted(partitions, key=lambda item: item.number))
     return actual == expected
@@ -343,7 +364,7 @@ def plan_stage_a(
             (Action(ActionKind.DEFER, detail="Raspberry Pi Imager first-run active"),),
             journal,
         )
-    if evidence.cloud_init_status != "done":
+    if not _cloud_init_ready(evidence.cloud_init_status, authorization):
         return Plan(
             (
                 Action(
@@ -353,8 +374,9 @@ def plan_stage_a(
             ),
             journal,
         )
-    if TRIGGER not in evidence.cmdline:
-        return _refusal_plan(evidence, journal, RefusalCode.TRIGGER_MISSING, "trigger is absent")
+    trigger_error = _trigger_error(evidence.cmdline, authorization)
+    if trigger_error is not None:
+        return _refusal_plan(evidence, journal, RefusalCode.TRIGGER_MISSING, trigger_error)
 
     try:
         geometry, boot = _validate_identity_and_geometry(evidence, authorization, policy)
@@ -364,7 +386,7 @@ def plan_stage_a(
     source_is_present = _source_matches(evidence.partitions, authorization)
 
     if journal is not None:
-        conflict = _journal_conflict(journal, evidence, geometry)
+        conflict = _journal_conflict(journal, evidence, geometry, authorization)
         if conflict is not None:
             return _refusal_plan(evidence, journal, RefusalCode.JOURNAL_CONFLICT, conflict)
         if journal.phase in {Phase.STAGE_A_INTENT, Phase.TABLE_WRITE_STARTED}:
@@ -379,6 +401,16 @@ def plan_stage_a(
                     journal,
                     code,
                     "table-write intent exists but the exact target table is absent; no retry",
+                )
+            if authorization.journal_schema_version == 2 and (
+                not _is_sha256(evidence.data_prefix_sha256)
+                or evidence.data_prefix_sha256 != journal.data_prefix_sha256
+            ):
+                return _refusal_plan(
+                    evidence,
+                    journal,
+                    RefusalCode.FORMAT_NOT_BLANK,
+                    "post-table raw prefix hash drifted from pre-Stage-A provenance",
                 )
             committed = replace(
                 journal,
@@ -437,9 +469,16 @@ def plan_stage_a(
             else RefusalCode.SOURCE_LAYOUT_MISMATCH
         )
         return _refusal_plan(evidence, None, code, "neither authorized source nor journaled target")
+    if authorization.journal_schema_version == 2 and not _is_sha256(evidence.data_prefix_sha256):
+        return _refusal_plan(
+            evidence,
+            None,
+            RefusalCode.FORMAT_NOT_BLANK,
+            "future partition 3 lacks a bounded pre-Stage-A prefix hash",
+        )
     data_partition = partition_path(evidence.disk, 3)
     intent = Journal(
-        schema_version=1,
+        schema_version=authorization.journal_schema_version,
         phase=Phase.STAGE_A_INTENT,
         disk=evidence.disk,
         root_partition=evidence.root_partition,
@@ -449,6 +488,7 @@ def plan_stage_a(
         stage_a_boot_id=evidence.boot_id,
         source_mbr_sha256=_sha256(evidence.mbr),
         target=geometry,
+        data_prefix_sha256=evidence.data_prefix_sha256,
     )
     source_disk_id, _parts = parse_mbr(evidence.mbr)
     sfdisk_input = _sfdisk_input(evidence.disk, boot, geometry, source_disk_id)
@@ -488,7 +528,7 @@ def plan_stage_b(
             (Action(ActionKind.DEFER, detail="Raspberry Pi Imager first-run active"),),
             journal,
         )
-    if evidence.cloud_init_status != "done":
+    if not _cloud_init_ready(evidence.cloud_init_status, authorization):
         return Plan(
             (
                 Action(
@@ -498,6 +538,9 @@ def plan_stage_b(
             ),
             journal,
         )
+    trigger_error = _trigger_error(evidence.cmdline, authorization)
+    if trigger_error is not None:
+        return _refusal_plan(evidence, journal, RefusalCode.TRIGGER_MISSING, trigger_error)
     if journal is None:
         return _refusal_plan(
             evidence,
@@ -511,7 +554,7 @@ def plan_stage_b(
         geometry, boot = _validate_identity_and_geometry(evidence, authorization, policy)
     except Refusal as exc:
         return _refusal_plan(evidence, journal, exc.code, str(exc))
-    conflict = _journal_conflict(journal, evidence, geometry)
+    conflict = _journal_conflict(journal, evidence, geometry, authorization)
     if conflict is not None:
         return _refusal_plan(evidence, journal, RefusalCode.JOURNAL_CONFLICT, conflict)
     if evidence.boot_id == journal.stage_a_boot_id:
@@ -540,6 +583,23 @@ def plan_stage_b(
                 RefusalCode.FOREIGN_FILESYSTEM,
                 "partition 3 has a filesystem before format intent",
             )
+        if evidence.data_signatures:
+            return _refusal_plan(
+                evidence,
+                journal,
+                RefusalCode.FORMAT_NOT_BLANK,
+                "partition 3 has a wipefs signature before root resize",
+            )
+        if not authorization.require_authored_zero_prefix and (
+            not _is_sha256(evidence.data_prefix_sha256)
+            or evidence.data_prefix_sha256 != journal.data_prefix_sha256
+        ):
+            return _refusal_plan(
+                evidence,
+                journal,
+                RefusalCode.FORMAT_NOT_BLANK,
+                "post-Stage-A raw prefix hash drifted from stock provenance",
+            )
         target_bytes = geometry.root.size_sectors * geometry.sector_size
         if evidence.root_filesystem_bytes > target_bytes:
             return _refusal_plan(
@@ -550,9 +610,7 @@ def plan_stage_b(
             )
         actions: tuple[Action, ...]
         if evidence.root_filesystem_bytes == target_bytes:
-            actions = (
-                Action(ActionKind.WRITE_STATE, detail="exact root resize already observed"),
-            )
+            actions = (Action(ActionKind.WRITE_STATE, detail="exact root resize already observed"),)
         else:
             actions = (
                 Action(
@@ -565,16 +623,32 @@ def plan_stage_b(
             )
         return Plan(actions, replace(journal, phase=Phase.ROOT_RESIZED))
     if journal.phase is Phase.ROOT_RESIZED:
+        if evidence.data_filesystem is not None or evidence.data_signatures:
+            return _refusal_plan(
+                evidence,
+                journal,
+                RefusalCode.FORMAT_NOT_BLANK,
+                "partition 3 has a recognized filesystem or wipefs signature",
+            )
         if (
-            evidence.data_filesystem is not None
-            or evidence.data_signatures
-            or evidence.data_zero_prefix_bytes != DATA_ZERO_PREFIX_BYTES
+            authorization.require_authored_zero_prefix
+            and evidence.data_zero_prefix_bytes != DATA_ZERO_PREFIX_BYTES
         ):
             return _refusal_plan(
                 evidence,
                 journal,
                 RefusalCode.FORMAT_NOT_BLANK,
-                "partition 3 lacks exact blank signatures and the image-proven zero prefix",
+                "partition 3 lacks the exact image-authored zero prefix",
+            )
+        if not authorization.require_authored_zero_prefix and (
+            not _is_sha256(evidence.data_prefix_sha256)
+            or evidence.data_prefix_sha256 != journal.data_prefix_sha256
+        ):
+            return _refusal_plan(
+                evidence,
+                journal,
+                RefusalCode.FORMAT_NOT_BLANK,
+                "bounded raw prefix hash drifted from exact pre-Stage-A stock provenance",
             )
         return Plan(
             (
@@ -592,7 +666,7 @@ def plan_stage_b(
             evidence.data_filesystem == "exfat"
             and evidence.data_label == "DASHCAM"
             and evidence.data_uuid is not None
-            and set(evidence.data_signatures) == {"exfat"}
+            and _has_exact_exfat_wipefs_signatures(evidence.data_signatures)
         ):
             return Plan(
                 (Action(ActionKind.WRITE_STATE, detail="capture intended exFAT UUID"),),
@@ -609,7 +683,7 @@ def plan_stage_b(
             evidence.data_filesystem != "exfat"
             or evidence.data_label != "DASHCAM"
             or evidence.data_uuid != journal.data_uuid
-            or set(evidence.data_signatures) != {"exfat"}
+            or not _has_exact_exfat_wipefs_signatures(evidence.data_signatures)
         ):
             return _refusal_plan(
                 evidence, journal, RefusalCode.FOREIGN_FILESYSTEM, "formatted identity drifted"
@@ -661,9 +735,7 @@ class RuntimeIO(Protocol):
     def atomic_write(self, path: str, data: bytes, mode: int = 0o600) -> None: ...
     def mkdir(self, path: str, mode: int = 0o750) -> None: ...
     def set_owner(self, path: str, uid: int, gid: int, mode: int) -> None: ...
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str: ...
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str: ...
     def sync(self) -> None: ...
 
 
@@ -674,6 +746,35 @@ class PosixRuntime:
         descriptor = self._open_readonly(path, allow_block=True)
         with os.fdopen(descriptor, "rb", buffering=0) as stream:
             return stream.read() if limit is None else stream.read(limit)
+
+    def sha256_region(self, path: str, *, offset: int, length: int) -> str:
+        """Hash one exact bounded raw region without retaining it in memory."""
+
+        if (
+            isinstance(offset, bool)
+            or isinstance(length, bool)
+            or not isinstance(offset, int)
+            or not isinstance(length, int)
+            or offset < 0
+            or length != DATA_ZERO_PREFIX_BYTES
+            or offset > 2**63 - 1 - length
+        ):
+            raise BootstrapError("raw prefix hash range is outside its exact bound")
+        descriptor = self._open_readonly(path, allow_block=True)
+        digest = hashlib.sha256()
+        remaining = length
+        try:
+            if os.lseek(descriptor, offset, os.SEEK_SET) != offset:
+                raise BootstrapError("raw prefix hash seek did not reach the exact offset")
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    raise BootstrapError("raw prefix hash read was short")
+                digest.update(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(descriptor)
+        return digest.hexdigest()
 
     def read_text(self, path: str, *, limit: int = MAX_STATE_BYTES) -> str:
         descriptor = self._open_readonly(path, allow_block=False)
@@ -715,9 +816,7 @@ class PosixRuntime:
             os.replace(temporary, target)
             directory = os.open(
                 target.parent,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
             )
             try:
                 os.fsync(directory)
@@ -740,9 +839,7 @@ class PosixRuntime:
             os.mkdir(current, mode)
             descriptor = os.open(
                 parent,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
             )
             try:
                 os.fsync(descriptor)
@@ -788,9 +885,7 @@ class PosixRuntime:
         finally:
             os.close(descriptor)
 
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
         if not argv or argv[0] not in _ALLOWED:
             raise BootstrapError("runtime command is outside the closed allow-list")
         completed = subprocess.run(
@@ -840,7 +935,7 @@ def journal_from_json(payload: str) -> Journal:
     if not isinstance(raw_value, Mapping):
         raise BootstrapError("journal must be an object")
     raw = cast(Mapping[str, object], raw_value)
-    required = {
+    legacy_required = {
         "schema_version",
         "phase",
         "disk",
@@ -856,7 +951,8 @@ def journal_from_json(payload: str) -> Journal:
         "refusal_code",
         "refusal_message",
     }
-    if set(raw) != required:
+    current_required = legacy_required | {"data_prefix_sha256"}
+    if frozenset(raw) not in {frozenset(legacy_required), frozenset(current_required)}:
         raise BootstrapError("journal keys are not the closed v1 schema")
     target_raw = raw["target"]
     if not isinstance(target_raw, Mapping):
@@ -877,6 +973,9 @@ def journal_from_json(payload: str) -> Journal:
         data_uuid=_optional_str(raw["data_uuid"]),
         refusal_code=_optional_str(raw["refusal_code"]),
         refusal_message=_optional_str(raw["refusal_message"]),
+        data_prefix_sha256=(
+            _optional_str(raw["data_prefix_sha256"]) if "data_prefix_sha256" in raw else None
+        ),
     )
     _validate_journal(journal)
     return journal
@@ -941,9 +1040,7 @@ def execute_stage_a(
         boot = _boot_partition(evidence.partitions)
         if disk_id != expected_disk_id or not table_matches(actual, boot, intent.target):
             raise Refusal(RefusalCode.TORN_TABLE, "raw LBA0 readback is not the exact target")
-        committed = replace(
-            started, phase=Phase.TABLE_COMMITTED, committed_mbr_sha256=_sha256(raw)
-        )
+        committed = replace(started, phase=Phase.TABLE_COMMITTED, committed_mbr_sha256=_sha256(raw))
         runtime.atomic_write(STATE_PATH, journal_json(committed))
         runtime.sync()
     except Exception as exc:
@@ -1036,8 +1133,8 @@ def execute_stage_b(
                         policy=policy,
                         already_mounted=current_evidence.mounted_uuid == next_journal.data_uuid,
                     )
-                    mounted_source, mounted_filesystem, mounted_uuid = (
-                        _observe_mount(runtime, MOUNT_POINT)
+                    mounted_source, mounted_filesystem, mounted_uuid = _observe_mount(
+                        runtime, MOUNT_POINT
                     )
                     sentinel = _read_optional_json(runtime, SENTINEL_PATH)
                     current_evidence = replace(
@@ -1072,6 +1169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m dashcam.provisioning.bootstrap")
     parser.add_argument("--stage", required=True, choices=("a", "b"))
     parser.add_argument("--contract", default=CONTRACT_PATH)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if sys.platform != "linux":
         print("DashCam Bootstrap v1 refuses to run outside Linux", file=sys.stderr)
@@ -1085,7 +1183,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         journal = (
             journal_from_json(runtime.read_text(STATE_PATH)) if runtime.exists(STATE_PATH) else None
         )
-        evidence = collect_evidence(runtime, journal)
+        evidence = collect_evidence(
+            runtime,
+            journal,
+            authorization=authorization,
+            policy=policy,
+        )
+        if args.dry_run:
+            result = (
+                plan_stage_a(
+                    evidence,
+                    journal,
+                    authorization=authorization,
+                    policy=policy,
+                )
+                if args.stage == "a"
+                else plan_stage_b(
+                    evidence,
+                    journal,
+                    authorization=authorization,
+                    policy=policy,
+                )
+            )
+            ready = _dry_run_ready(stage=args.stage, plan=result)
+            print(
+                _dry_run_json(
+                    stage=args.stage,
+                    authorization=authorization,
+                    evidence=evidence,
+                    plan=result,
+                    ready=ready,
+                )
+            )
+            return 0 if ready else 3
         if args.stage == "a":
             result = execute_stage_a(
                 evidence,
@@ -1096,9 +1226,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             if journal is None:
-                if evidence.firstrun_active or any(
-                    token.startswith("systemd.run=") for token in evidence.cmdline
-                ) or evidence.cloud_init_status != "done":
+                if (
+                    evidence.firstrun_active
+                    or any(token.startswith("systemd.run=") for token in evidence.cmdline)
+                    or not _cloud_init_ready(evidence.cloud_init_status, authorization)
+                ):
                     return 0
                 raise Refusal(RefusalCode.JOURNAL_CONFLICT, "Stage B requires Stage A state")
             result = execute_stage_b(
@@ -1124,7 +1256,125 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def collect_evidence(runtime: RuntimeIO, journal: Journal | None) -> Evidence:
+def _dry_run_json(
+    *,
+    stage: str,
+    authorization: Authorization,
+    evidence: Evidence,
+    plan: Plan,
+    ready: bool,
+) -> str:
+    journal = plan.journal
+    refused = journal is not None and journal.phase is Phase.REFUSED
+    deferred = any(action.kind is ActionKind.DEFER for action in plan.actions)
+    latched = any(action.kind is ActionKind.LATCH for action in plan.actions)
+    outcome = (
+        "refused"
+        if refused or latched
+        else "deferred"
+        if deferred
+        else "ready"
+        if ready
+        else "not_ready"
+    )
+    target = (
+        {
+            "total_sectors": journal.target.total_sectors,
+            "sector_size": journal.target.sector_size,
+            "root": asdict(journal.target.root),
+            "data": asdict(journal.target.data),
+        }
+        if journal is not None
+        else None
+    )
+    report = {
+        "schema_version": 1,
+        "dry_run": True,
+        "ready": ready,
+        "outcome": outcome,
+        "stage": stage,
+        "authorization": {
+            "bootstrap_trigger": authorization.bootstrap_trigger,
+            "journal_schema_version": authorization.journal_schema_version,
+            "cid": authorization.cid,
+            "size_bytes": authorization.size_bytes,
+            "sector_size": authorization.sector_size,
+            "source": {
+                "boot_start_sector": authorization.boot_start,
+                "boot_size_sectors": authorization.boot_size,
+                "root_start_sector": authorization.root_start,
+                "root_size_sectors": authorization.root_source_size,
+            },
+        },
+        "evidence": {
+            "boot_id": evidence.boot_id,
+            "cloud_init_status": evidence.cloud_init_status,
+            "root_partition": evidence.root_partition,
+            "disk": evidence.disk,
+            "cid": evidence.cid,
+            "size_bytes": evidence.size_bytes,
+            "sector_size": evidence.sector_size,
+            "mbr_sha256": _sha256(evidence.mbr),
+            "data_prefix_sha256": evidence.data_prefix_sha256,
+            "partitions": [asdict(partition) for partition in evidence.partitions],
+        },
+        "actions": [
+            {
+                "kind": action.kind.value,
+                "argv": list(action.argv),
+                "has_stdin": action.stdin is not None,
+                "detail": action.detail,
+            }
+            for action in plan.actions
+        ],
+        "journal": (
+            {
+                "schema_version": journal.schema_version,
+                "phase": journal.phase.value,
+                "source_mbr_sha256": journal.source_mbr_sha256,
+                "data_prefix_sha256": journal.data_prefix_sha256,
+                "committed_mbr_sha256": journal.committed_mbr_sha256,
+                "refusal_code": journal.refusal_code,
+                "refusal_message": journal.refusal_message,
+                "target": target,
+            }
+            if journal is not None
+            else None
+        ),
+        "refusal": (
+            {
+                "code": journal.refusal_code,
+                "message": journal.refusal_message,
+            }
+            if refused and journal is not None
+            else None
+        ),
+    }
+    payload = json.dumps(report, sort_keys=True, separators=(",", ":"))
+    if len(payload.encode()) > MAX_STATE_BYTES:
+        raise BootstrapError("dry-run report exceeded its output bound")
+    return payload
+
+
+def _dry_run_ready(*, stage: str, plan: Plan) -> bool:
+    if stage not in {"a", "b"}:
+        raise BootstrapError("dry-run stage is invalid")
+    if plan.journal is None:
+        return False
+    if plan.journal.phase is Phase.REFUSED:
+        return False
+    if any(action.kind in {ActionKind.DEFER, ActionKind.LATCH} for action in plan.actions):
+        return False
+    return bool(plan.actions)
+
+
+def collect_evidence(
+    runtime: RuntimeIO,
+    journal: Journal | None,
+    *,
+    authorization: Authorization = EXACT_CARD_AUTHORIZATION,
+    policy: CapacityPolicy = DEFAULT_CAPACITY_POLICY,
+) -> Evidence:
     """Collect bounded live evidence while deriving root/disk from the mounted root."""
 
     cmdline = tuple(runtime.read_text("/proc/cmdline", limit=16 * 1024).split())
@@ -1143,12 +1393,13 @@ def collect_evidence(runtime: RuntimeIO, journal: Journal | None) -> Evidence:
             "-J",
             "-b",
             "-o",
-            "PATH,TYPE,PKNAME,SIZE,LOG-SEC,PARTN,FSTYPE,FSSIZE,LABEL,UUID,PARTUUID,START",
+            "PATH,TYPE,PKNAME,SIZE,LOG-SEC,PARTN,FSTYPE,LABEL,UUID,PARTUUID,START",
         )
     )
     disk, size_bytes, sector_size, nodes = _derive_disk(lsblk, root_partition)
     disk_name = PurePosixPath(disk).name
-    cid = runtime.read_text(f"/sys/class/block/{disk_name}/device/cid", limit=128).strip().lower()
+    cid_path = _canonical_sysfs_cid_path(disk_name)
+    cid = runtime.read_text(cid_path, limit=128).strip().lower()
     mbr = runtime.read_bytes(disk, limit=MBR_SIZE)
     _disk_id, partitions = parse_mbr(mbr)
     data_node = partition_path(disk, 3)
@@ -1167,9 +1418,28 @@ def collect_evidence(runtime: RuntimeIO, journal: Journal | None) -> Evidence:
     )
     zero_prefix_bytes = (
         _zero_prefix_bytes(runtime, data_node, DATA_ZERO_PREFIX_BYTES)
-        if any(part.number == 3 for part in partitions)
+        if (
+            authorization.require_authored_zero_prefix
+            and any(part.number == 3 for part in partitions)
+        )
         else 0
     )
+    prefix_sha256: str | None = None
+    if authorization.journal_schema_version == 2:
+        geometry = compute_geometry(
+            size_bytes=size_bytes,
+            sector_size=sector_size,
+            root_start_sector=authorization.root_start,
+            policy=policy,
+        )
+        prefix_offset = geometry.data.start_sector * sector_size
+        if prefix_offset < 0 or prefix_offset + DATA_ZERO_PREFIX_BYTES > size_bytes:
+            raise BootstrapError("future partition 3 prefix is outside the exact disk")
+        prefix_sha256 = runtime.sha256_region(
+            disk,
+            offset=prefix_offset,
+            length=DATA_ZERO_PREFIX_BYTES,
+        )
     complete = _read_optional_json(runtime, COMPLETE_PATH)
     sentinel = _read_optional_json(runtime, SENTINEL_PATH)
     mounted = _findmnt_fields(MOUNT_POINT, allow_absent=True)
@@ -1183,7 +1453,7 @@ def collect_evidence(runtime: RuntimeIO, journal: Journal | None) -> Evidence:
         sector_size=sector_size,
         mbr=mbr,
         partitions=partitions,
-        root_filesystem_bytes=_int(root_node.get("fssize"), "root.fssize"),
+        root_filesystem_bytes=_observe_root_filesystem_size(runtime, root_partition),
         root_filesystem=_optional_mapping_str(root_node, "fstype"),
         root_uuid=_optional_mapping_str(root_node, "uuid"),
         root_partuuid=_optional_mapping_str(root_node, "partuuid"),
@@ -1202,10 +1472,9 @@ def collect_evidence(runtime: RuntimeIO, journal: Journal | None) -> Evidence:
         data_uuid=fs_fields.get("UUID"),
         data_signatures=signatures,
         data_zero_prefix_bytes=zero_prefix_bytes,
+        data_prefix_sha256=prefix_sha256,
         complete_identity=complete,
-        mounted_source=(
-            os.path.realpath(mounted["source"]) if mounted is not None else None
-        ),
+        mounted_source=(os.path.realpath(mounted["source"]) if mounted is not None else None),
         mounted_filesystem=mounted["fstype"] if mounted is not None else None,
         mounted_uuid=mounted["uuid"] if mounted is not None else None,
         sentinel_identity=sentinel,
@@ -1213,7 +1482,7 @@ def collect_evidence(runtime: RuntimeIO, journal: Journal | None) -> Evidence:
 
 
 def load_bootstrap_contract(payload: str) -> tuple[Authorization, CapacityPolicy]:
-    """Load the closed, checked exact-card destructive authorization."""
+    """Load one closed, checked exact-card destructive authorization."""
 
     if len(payload.encode()) > MAX_STATE_BYTES:
         raise BootstrapError("Bootstrap contract is oversized")
@@ -1234,8 +1503,13 @@ def load_bootstrap_contract(payload: str) -> tuple[Authorization, CapacityPolicy
         raise BootstrapError("Bootstrap contract keys are not the closed v1 schema")
     if _int(raw["schema_version"], "schema_version") != 1:
         raise BootstrapError("unsupported Bootstrap contract version")
-    if _str(raw["bootstrap_trigger"], "bootstrap_trigger") != TRIGGER:
-        raise BootstrapError("Bootstrap contract trigger does not match the runtime")
+    trigger = _str(raw["bootstrap_trigger"], "bootstrap_trigger")
+    if trigger == TRIGGER:
+        expected_authorization = EXACT_CARD_AUTHORIZATION
+    elif trigger == SSH_DEV_TRIGGER:
+        expected_authorization = EXACT_STOCK_CARD_AUTHORIZATION
+    else:
+        raise BootstrapError("Bootstrap contract trigger does not match a reviewed runtime")
     source_value = raw["source"]
     target_value = raw["target"]
     if not isinstance(source_value, Mapping) or not isinstance(target_value, Mapping):
@@ -1265,18 +1539,22 @@ def load_bootstrap_contract(payload: str) -> tuple[Authorization, CapacityPolicy
         root_start=_int(source["root_start_sector"], "root_start_sector"),
         root_source_size=_int(source["root_size_sectors"], "root_size_sectors"),
         sector_size=_int(raw["sector_size"], "sector_size"),
+        bootstrap_trigger=expected_authorization.bootstrap_trigger,
+        journal_schema_version=expected_authorization.journal_schema_version,
+        require_authored_zero_prefix=(expected_authorization.require_authored_zero_prefix),
     )
     policy = CapacityPolicy(
         root_target_bytes=_int(target["root_size_bytes"], "root_size_bytes"),
         minimum_device_bytes=_int(target["minimum_device_bytes"], "minimum_device_bytes"),
         minimum_data_bytes=_int(target["minimum_data_bytes"], "minimum_data_bytes"),
         alignment_bytes=_int(target["alignment_bytes"], "alignment_bytes"),
-        trailing_reserve_bytes=_int(
-            target["trailing_reserve_bytes"], "trailing_reserve_bytes"
-        ),
+        trailing_reserve_bytes=_int(target["trailing_reserve_bytes"], "trailing_reserve_bytes"),
     )
-    if authorization != EXACT_CARD_AUTHORIZATION:
-        raise BootstrapError("checked contract is not the authorized exact trial card")
+    if authorization != expected_authorization:
+        raise BootstrapError(
+            "checked contract is not the authorized exact trial card "
+            "or reviewed stock source layout"
+        )
     if policy != DEFAULT_CAPACITY_POLICY:
         raise BootstrapError("checked contract geometry differs from Bootstrap v1")
     return authorization, policy
@@ -1303,9 +1581,7 @@ def _validate_identity_and_geometry(
         root_start_sector=authorization.root_start,
         policy=policy,
     )
-    return geometry, Partition(
-        1, authorization.boot_start, authorization.boot_size, 0x0C, False
-    )
+    return geometry, Partition(1, authorization.boot_start, authorization.boot_size, 0x0C, False)
 
 
 def _source_matches(parts: Sequence[Partition], authorization: Authorization) -> bool:
@@ -1316,19 +1592,37 @@ def _source_matches(parts: Sequence[Partition], authorization: Authorization) ->
 
 
 def _journal_conflict(
-    journal: Journal, evidence: Evidence, geometry: Geometry
+    journal: Journal,
+    evidence: Evidence,
+    geometry: Geometry,
+    authorization: Authorization,
 ) -> str | None:
     if (
-        journal.schema_version != 1
+        journal.schema_version != authorization.journal_schema_version
         or journal.disk != evidence.disk
         or journal.root_partition != evidence.root_partition
         or journal.data_partition != partition_path(evidence.disk, 3)
         or journal.cid != evidence.cid
         or journal.size_bytes != evidence.size_bytes
         or journal.target != geometry
+        or (
+            authorization.journal_schema_version == 2 and not _is_sha256(journal.data_prefix_sha256)
+        )
+        or (authorization.journal_schema_version == 1 and journal.data_prefix_sha256 is not None)
     ):
         return "journal is not bound to the current exact target"
     return None
+
+
+def _trigger_error(cmdline: Sequence[str], authorization: Authorization) -> str | None:
+    present = tuple(token for token in cmdline if token in _SUPPORTED_TRIGGERS)
+    if present == (authorization.bootstrap_trigger,):
+        return None
+    if not present:
+        return "reviewed Bootstrap trigger is absent"
+    if authorization.bootstrap_trigger not in present:
+        return "runtime trigger belongs to a different Bootstrap contract"
+    return "multiple Bootstrap contract triggers are present"
 
 
 def _refusal_plan(
@@ -1369,9 +1663,7 @@ def _latch(journal: Journal, code: RefusalCode, message: str) -> Journal:
     )
 
 
-def _sfdisk_input(
-    disk: str, boot: Partition, geometry: Geometry, mbr_disk_id: int
-) -> str:
+def _sfdisk_input(disk: str, boot: Partition, geometry: Geometry, mbr_disk_id: int) -> str:
     if not 0 <= mbr_disk_id <= 0xFFFFFFFF:
         raise BootstrapError("MBR disk ID is outside the 32-bit range")
     lines = ["label: dos", f"label-id: 0x{mbr_disk_id:08x}", "unit: sectors", ""]
@@ -1507,9 +1799,7 @@ def _storage_identity_env(journal: Journal, policy: CapacityPolicy) -> bytes:
 
 
 def _write_completion(runtime: RuntimeIO, journal: Journal, evidence: Evidence) -> None:
-    if not _storage_mount_is_exact(evidence, journal) or not _sentinel_is_exact(
-        evidence, journal
-    ):
+    if not _storage_mount_is_exact(evidence, journal) or not _sentinel_is_exact(evidence, journal):
         raise Refusal(
             RefusalCode.JOURNAL_CONFLICT,
             "completion preconditions do not match the exact mounted target",
@@ -1633,13 +1923,44 @@ def _decimal_identity(value: str, description: str) -> str:
 
 
 def _observe_root_filesystem_size(runtime: RuntimeIO, root_partition: str) -> int:
+    _validate_device(root_partition)
     output = runtime.run(
-        (_LSBLK, "-b", "-n", "-o", "FSSIZE", root_partition),
+        (_DUMPE2FS, "-h", root_partition),
         timeout=15,
-    ).strip()
-    if not output.isdecimal() or int(output) <= 0:
-        raise BootstrapError("lsblk did not report a bounded positive root filesystem size")
-    return int(output)
+    )
+    return _parse_dumpe2fs_header(output)
+
+
+def _parse_dumpe2fs_header(output: str) -> int:
+    """Return ext4's total geometry, not lsblk's usable-byte estimate."""
+
+    if len(output.encode()) > 256 * 1024:
+        raise BootstrapError("dumpe2fs output exceeded its bound")
+    required: dict[str, str] = {}
+    wanted = {"Filesystem magic number", "Block count", "Block size"}
+    for line in output.splitlines():
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        if not separator or key not in wanted:
+            continue
+        if key in required:
+            raise BootstrapError(f"dumpe2fs repeated {key}")
+        required[key] = value.strip()
+    if set(required) != wanted or required["Filesystem magic number"].lower() != "0xef53":
+        raise BootstrapError("dumpe2fs did not report one ext4 filesystem header")
+    block_count = required["Block count"]
+    block_size = required["Block size"]
+    if not block_count.isdecimal() or not block_size.isdecimal():
+        raise BootstrapError("dumpe2fs ext4 geometry is not decimal")
+    count = int(block_count)
+    size = int(block_size)
+    if (
+        count <= 0
+        or size not in {1024, 2048, 4096, 8192, 16384, 32768, 65536}
+        or count > (2**63 - 1) // size
+    ):
+        raise BootstrapError("dumpe2fs ext4 geometry is outside its bound")
+    return count * size
 
 
 def _observe_mount(runtime: RuntimeIO, target: str) -> tuple[str, str, str]:
@@ -1727,12 +2048,19 @@ def _validate_evidence(evidence: Evidence) -> None:
             RefusalCode.IDENTITY_MISMATCH,
             "mounted root lacks exact ext4 UUID/PARTUUID/size evidence",
         )
-    if evidence.cloud_init_status not in {"absent", "running", "done", "error", "unknown"}:
+    if evidence.cloud_init_status not in {
+        "absent",
+        "running",
+        "done",
+        "done_known_degraded",
+        "error",
+        "unknown",
+    }:
         raise BootstrapError("cloud-init status is outside the closed evidence schema")
 
 
 def _validate_journal(journal: Journal) -> None:
-    if journal.schema_version != 1:
+    if journal.schema_version not in {1, 2}:
         raise BootstrapError("unsupported journal version")
     _validate_device(journal.disk)
     _validate_device(journal.root_partition)
@@ -1746,6 +2074,14 @@ def _validate_journal(journal: Journal) -> None:
         and _SHA256_RE.fullmatch(journal.committed_mbr_sha256) is None
     ):
         raise BootstrapError("journal committed MBR hash is malformed")
+    if journal.schema_version == 1 and journal.data_prefix_sha256 is not None:
+        raise BootstrapError("release journal cannot contain stock-prefix provenance")
+    if (
+        journal.schema_version == 2
+        and journal.phase is not Phase.REFUSED
+        and not _is_sha256(journal.data_prefix_sha256)
+    ):
+        raise BootstrapError("stock journal prefix hash is missing or malformed")
 
 
 def _boot_partition(parts: Sequence[Partition]) -> Partition:
@@ -1757,6 +2093,10 @@ def _boot_partition(parts: Sequence[Partition]) -> Partition:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _is_sha256(value: str | None) -> bool:
+    return value is not None and _SHA256_RE.fullmatch(value) is not None
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -1827,9 +2167,7 @@ def _run_discovery(argv: tuple[str, ...], *, allow_absent_mount: bool = False) -
         accepted.add(1)  # findmnt: requested mount target is absent
     if result.returncode not in accepted:
         stderr = result.stderr.strip()[:1000]
-        raise BootstrapError(
-            f"discovery command failed ({result.returncode}): {argv[0]}: {stderr}"
-        )
+        raise BootstrapError(f"discovery command failed ({result.returncode}): {argv[0]}: {stderr}")
     if len(result.stdout.encode()) > 256 * 1024:
         raise BootstrapError("discovery command output exceeded its bound")
     return result.stdout
@@ -1879,6 +2217,50 @@ def _derive_disk(
     )
 
 
+def _canonical_sysfs_cid_path(disk_name: str) -> str:
+    """Resolve one mmc disk's class symlinks to a bound canonical CID file."""
+
+    if not disk_name or "/" in disk_name or _SYSFS_COMPONENT_RE.fullmatch(disk_name) is None:
+        raise Refusal(RefusalCode.IDENTITY_MISMATCH, "derived disk name is unsafe")
+    class_root = f"/sys/class/block/{disk_name}"
+    block_path = _resolved_sysfs_path(class_root, basename=disk_name)
+    device_path = _resolved_sysfs_path(f"{class_root}/device")
+    cid_path = _resolved_sysfs_path(f"{class_root}/device/cid", basename="cid")
+    block = PurePosixPath(block_path)
+    device = PurePosixPath(device_path)
+    cid = PurePosixPath(cid_path)
+    if device not in block.parents:
+        raise Refusal(
+            RefusalCode.IDENTITY_MISMATCH,
+            "canonical sysfs device is not bound to the derived disk",
+        )
+    if cid.parent != device:
+        raise Refusal(
+            RefusalCode.IDENTITY_MISMATCH,
+            "canonical CID is not bound to the derived disk device",
+        )
+    return cid_path
+
+
+def _resolved_sysfs_path(path: str, *, basename: str | None = None) -> str:
+    resolved = os.path.realpath(path)
+    pure = PurePosixPath(resolved)
+    if (
+        not pure.is_absolute()
+        or str(pure) != resolved
+        or resolved == "/sys/devices"
+        or not resolved.startswith("/sys/devices/")
+        or any(_SYSFS_COMPONENT_RE.fullmatch(component) is None for component in pure.parts[3:])
+        or (basename is not None and pure.name != basename)
+        or os.path.realpath(resolved) != resolved
+    ):
+        raise Refusal(
+            RefusalCode.IDENTITY_MISMATCH,
+            "sysfs CID resolution is non-canonical or escaped /sys/devices",
+        )
+    return resolved
+
+
 def _blkid_fields(path: str) -> dict[str, str]:
     output = _run_discovery((_BLKID, "-o", "export", path))
     return _parse_blkid_export(output)
@@ -1921,6 +2303,18 @@ def _parse_wipefs_json(output: str) -> tuple[str, ...]:
     )
 
 
+def _has_exact_exfat_wipefs_signatures(signatures: Sequence[str]) -> bool:
+    """Recognize the exact pair wipefs reports for a normal exFAT volume.
+
+    util-linux reports both the exFAT identity at offset 0x3 and the DOS boot
+    signature at offset 0x1fe.  This predicate is deliberately used only
+    after durable format intent; pre-format blankness still requires no
+    signatures at all.
+    """
+
+    return len(signatures) == 2 and set(signatures) == {"exfat", "dos"}
+
+
 def _firstrun_active(cmdline: Sequence[str]) -> bool:
     if any(token.startswith("systemd.run=") for token in cmdline):
         return True
@@ -1958,21 +2352,36 @@ def _cloud_init_status() -> str:
         return "unknown"
     if not isinstance(value, Mapping):
         return "unknown"
+    return _classify_cloud_init_status(cast(Mapping[str, object], value), result.returncode)
+
+
+def _classify_cloud_init_status(value: Mapping[str, object], returncode: int) -> str:
     status = value.get("status")
     errors = value.get("errors", [])
     recoverable = value.get("recoverable_errors", {})
-    if (
-        result.returncode == 0
-        and status == "done"
-        and errors in ([], None)
-        and recoverable in ({}, None)
-    ):
+    if returncode == 0 and status == "done" and errors in ([], None) and recoverable in ({}, None):
         return "done"
-    if status in {"running", "not run"} or result.returncode == 2:
+    if (
+        returncode == 2
+        and status == "done"
+        and value.get("extended_status") == "degraded done"
+        and errors == []
+        and recoverable == {"WARNING": [KNOWN_CLOUD_INIT_WARNING]}
+        and "stage" in value
+        and value["stage"] is None
+    ):
+        return "done_known_degraded"
+    if status in {"running", "not run"} or returncode == 2:
         return "running"
-    if status in {"error", "degraded done"} or result.returncode == 1:
+    if status in {"error", "degraded done"} or returncode == 1:
         return "error"
     return "unknown"
+
+
+def _cloud_init_ready(status: str, authorization: Authorization) -> bool:
+    return status == "done" or (
+        authorization.journal_schema_version == 2 and status == "done_known_degraded"
+    )
 
 
 def _read_optional_json(runtime: RuntimeIO, path: str) -> Mapping[str, object] | None:
@@ -2008,9 +2417,7 @@ def _parse_findmnt_json(output: str, expected_target: str) -> dict[str, str]:
     return fields
 
 
-def _findmnt_fields(
-    target: str, *, allow_absent: bool = False
-) -> dict[str, str] | None:
+def _findmnt_fields(target: str, *, allow_absent: bool = False) -> dict[str, str] | None:
     output = _run_discovery(
         (_FINDMNT, "-J", "-o", "SOURCE,FSTYPE,UUID,TARGET", target),
         allow_absent_mount=allow_absent,
@@ -2032,8 +2439,10 @@ __all__ = [
     "CONTRACT_PATH",
     "ENV_PATH",
     "EXACT_CARD_AUTHORIZATION",
+    "EXACT_STOCK_CARD_AUTHORIZATION",
     "FSTAB_PATH",
     "MOUNT_POINT",
+    "SSH_DEV_TRIGGER",
     "STATE_PATH",
     "TRIGGER",
     "Action",

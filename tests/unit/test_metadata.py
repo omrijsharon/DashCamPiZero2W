@@ -205,6 +205,10 @@ def test_gps_samples_are_ordered_and_bounded_by_the_clip_interval() -> None:
     with pytest.raises(MetadataValidationError, match="outside the clip interval"):
         replace(sidecar, gps=GpsSummary(True, START, (before_clip,)))
 
+    at_exclusive_end = replace(sample, monotonic_ns=sidecar.end_monotonic_ns)
+    with pytest.raises(MetadataValidationError, match="outside the clip interval"):
+        replace(sidecar, gps=GpsSummary(True, START, (at_exclusive_end,)))
+
     later = replace(sample, monotonic_ns=sample.monotonic_ns + 1)
     with pytest.raises(MetadataValidationError, match="ordered"):
         replace(sidecar, gps=GpsSummary(True, START, (later, sample)))

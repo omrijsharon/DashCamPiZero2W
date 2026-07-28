@@ -8,12 +8,23 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from dashcam.config import ConfigError, DashcamConfig, load_config
+from dashcam.recorder.metrics import RuntimeSnapshotPublisher
 from dashcam.recorder.notifier import NullNotifier, ServiceNotifier
+from dashcam.recorder.runtime import (
+    PipelineRecoveryExhausted,
+    RecorderFinalizationFault,
+    RecorderStorageFault,
+    RuntimeLifecycleEvent,
+    RuntimeLifecycleEventKind,
+)
 from dashcam.recorder.status import RecorderReason, RecorderStatus, RecorderStatusStore
 from dashcam.state import RecorderState
+from dashcam.storage.preflight import PreflightResult
+
+_TaskResult = TypeVar("_TaskResult")
 
 
 class RecorderRuntime(Protocol):
@@ -34,12 +45,23 @@ class ConfigLoader(Protocol):
         """Load and validate one configuration file."""
 
 
+class StorageGate(Protocol):
+    """Fresh in-process recording-volume verification before camera ownership."""
+
+    async def check(self, config: DashcamConfig) -> PreflightResult:
+        """Return bounded storage evidence without opening media hardware."""
+
+
 @dataclass(frozen=True, slots=True)
 class DaemonLimits:
     """Explicit bounds corresponding to service-manager startup/shutdown limits."""
 
     startup_timeout_s: float = 40.0
-    shutdown_timeout_s: float = 25.0
+    storage_timeout_s: float = 20.0
+    # Production runtime phases are 8s EOS + 3s NULL + 6s finalizer drain +
+    # 2s run-task join = 19s.  Keep a five-second orchestration margin and a
+    # further six-second manager margin below TimeoutStopSec=30s.
+    shutdown_timeout_s: float = 24.0
     watchdog_interval_s: float | None = None
 
     def __post_init__(self) -> None:
@@ -49,6 +71,12 @@ class DaemonLimits:
             or not 0 < self.startup_timeout_s <= 300
         ):
             raise ValueError("startup_timeout_s must be between 0 and 300")
+        if (
+            isinstance(self.storage_timeout_s, bool)
+            or not isinstance(self.storage_timeout_s, int | float)
+            or not 0 < self.storage_timeout_s <= 300
+        ):
+            raise ValueError("storage_timeout_s must be between 0 and 300")
         if (
             isinstance(self.shutdown_timeout_s, bool)
             or not isinstance(self.shutdown_timeout_s, int | float)
@@ -70,6 +98,7 @@ class DaemonOutcome(StrEnum):
     STARTUP_TIMEOUT = "STARTUP_TIMEOUT"
     RUNTIME_EXITED = "RUNTIME_EXITED"
     RUNTIME_FAILED = "RUNTIME_FAILED"
+    PIPELINE_NO_PROGRESS = "PIPELINE_NO_PROGRESS"
     SHUTDOWN_FAILED = "SHUTDOWN_FAILED"
     SHUTDOWN_TIMEOUT = "SHUTDOWN_TIMEOUT"
 
@@ -82,6 +111,10 @@ class DaemonResult:
     @property
     def clean(self) -> bool:
         return self.outcome is DaemonOutcome.STOPPED
+
+
+class PipelineNoProgressFault(RuntimeError):
+    """Encoded-frame progress stalled across two recording watchdog samples."""
 
 
 def _exception_detail(error: BaseException) -> str:
@@ -104,18 +137,31 @@ class RecorderDaemon:
         config_path: str | Path,
         runtime: RecorderRuntime,
         config_loader: ConfigLoader = load_config,
+        storage_gate: StorageGate | None = None,
         notifier: ServiceNotifier | None = None,
         status_store: RecorderStatusStore | None = None,
+        snapshot_publisher: RuntimeSnapshotPublisher | None = None,
         limits: DaemonLimits | None = None,
     ) -> None:
         self._config_path = Path(config_path)
         self._runtime = runtime
         self._config_loader = config_loader
+        self._storage_gate = storage_gate
         self._notifier = notifier or NullNotifier()
         self._status_store = status_store or RecorderStatusStore()
+        self._snapshot_publisher = snapshot_publisher
         self._limits = limits or DaemonLimits()
         self._stop_requested = asyncio.Event()
+        self._runtime_events: asyncio.Queue[RuntimeLifecycleEvent] = asyncio.Queue(
+            maxsize=16
+        )
+        self._recording_progress_epoch = 0
         self._started = False
+        bind_observer = getattr(runtime, "bind_lifecycle_observer", None)
+        if bind_observer is not None:
+            if not callable(bind_observer):
+                raise TypeError("runtime lifecycle observer binder must be callable")
+            bind_observer(self._enqueue_runtime_event)
 
     @property
     def status(self) -> RecorderStatus:
@@ -129,6 +175,14 @@ class RecorderDaemon:
         """Request idempotent cooperative shutdown."""
 
         self._stop_requested.set()
+
+    def _enqueue_runtime_event(self, event: RuntimeLifecycleEvent) -> None:
+        """O(1) observer callback; a full queue fails the runtime closed."""
+
+        if not isinstance(event, RuntimeLifecycleEvent):
+            raise TypeError("runtime lifecycle observer received an invalid event")
+        self._recording_progress_epoch += 1
+        self._runtime_events.put_nowait(event)
 
     def _format_status(self, status: RecorderStatus) -> str:
         parts = [f"state={status.state.value}"]
@@ -148,6 +202,15 @@ class RecorderDaemon:
         if not delivered:
             self._status_store.record_notification_failure()
 
+    def _snapshot(self) -> None:
+        if self._snapshot_publisher is None:
+            return
+        try:
+            self._snapshot_publisher.publish(self.status, self._runtime)
+        except Exception:
+            # Observability is optional and must never affect recording.
+            self._status_store.record_notification_failure()
+
     def _publish(
         self,
         state: RecorderState,
@@ -156,41 +219,108 @@ class RecorderDaemon:
         detail: str | None = None,
         config_schema_version: int | None = None,
     ) -> RecorderStatus:
+        previous_state = self._status_store.snapshot().state
         status = self._status_store.transition(
             state,
             reason=reason,
             detail=detail,
             config_schema_version=config_schema_version,
         )
+        if state is not RecorderState.RECORDING or previous_state is not RecorderState.RECORDING:
+            self._recording_progress_epoch += 1
         self._notify(lambda: self._notifier.status(self._format_status(status)))
+        self._snapshot()
         return self.status
 
     async def _watchdog_loop(self, interval_s: float) -> None:
+        baseline_token: int | None = None
+        baseline_epoch: int | None = None
         while not self._stop_requested.is_set():
             try:
                 await asyncio.wait_for(self._stop_requested.wait(), timeout=interval_s)
             except TimeoutError:
                 self._notify(self._notifier.watchdog)
+                self._snapshot()
+                if self.status.state is not RecorderState.RECORDING:
+                    baseline_token = None
+                    baseline_epoch = None
+                    continue
+                progress_reader = getattr(self._runtime, "recording_progress_token", None)
+                if not callable(progress_reader):
+                    baseline_token = None
+                    baseline_epoch = None
+                    continue
+                token = progress_reader()
+                if token is None:
+                    baseline_token = None
+                    baseline_epoch = None
+                    continue
+                if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                    raise RuntimeError(
+                        "runtime returned an invalid recording progress token"
+                    ) from None
+                epoch = self._recording_progress_epoch
+                if baseline_epoch != epoch or baseline_token is None:
+                    baseline_token = token
+                    baseline_epoch = epoch
+                    continue
+                if token <= baseline_token:
+                    raise PipelineNoProgressFault(
+                        f"encoded-frame progress did not advance beyond {baseline_token}"
+                    ) from None
+                baseline_token = token
+
+    async def _wait_for_stop(self) -> None:
+        await self._stop_requested.wait()
+
+    async def _runtime_event_loop(self) -> None:
+        while True:
+            event = await self._runtime_events.get()
+            try:
+                if event.kind is RuntimeLifecycleEventKind.RECOVERING:
+                    self._publish(
+                        RecorderState.FAULTED,
+                        reason=RecorderReason.PIPELINE_RECOVERING,
+                        detail=event.detail,
+                    )
+                elif event.kind is RuntimeLifecycleEventKind.RESTARTING:
+                    self._publish(RecorderState.STARTING)
+                elif event.kind is RuntimeLifecycleEventKind.RECOVERED:
+                    self._publish(RecorderState.RECORDING)
+                elif event.kind is RuntimeLifecycleEventKind.EXHAUSTED:
+                    self._publish(
+                        RecorderState.FAULTED,
+                        reason=RecorderReason.PIPELINE_RECOVERY_EXHAUSTED,
+                        detail=event.detail,
+                    )
+                else:
+                    raise RuntimeError("runtime lifecycle observer received an unknown event")
+            finally:
+                self._runtime_events.task_done()
 
     async def _cancel_task(self, task: asyncio.Task[object] | None) -> None:
-        if task is None or task.done():
+        if task is None:
+            return
+        if task.done():
+            if not task.cancelled():
+                task.exception()
             return
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
 
     @staticmethod
-    def _task_error(task: asyncio.Task[None]) -> BaseException | None:
+    def _task_error(task: asyncio.Task[_TaskResult]) -> BaseException | None:
         if task.cancelled():
             return asyncio.CancelledError()
         return task.exception()
 
     @staticmethod
-    def _consume_task_result(task: asyncio.Task[None]) -> None:
+    def _consume_task_result(task: asyncio.Task[_TaskResult]) -> None:
         if not task.cancelled():
             task.exception()
 
-    def _cancel_without_waiting(self, task: asyncio.Task[None]) -> None:
+    def _cancel_without_waiting(self, task: asyncio.Task[_TaskResult]) -> None:
         task.cancel()
         task.add_done_callback(self._consume_task_result)
 
@@ -216,6 +346,76 @@ class RecorderDaemon:
     def _shutdown_notification(self) -> None:
         status = self.status
         self._notify(lambda: self._notifier.stopping(self._format_status(status)))
+
+    async def _storage_fault(
+        self,
+        *,
+        config: DashcamConfig,
+        detail: str,
+    ) -> DaemonResult:
+        """Remain observable without opening the camera until orderly shutdown."""
+
+        self._publish(
+            RecorderState.FAULTED,
+            reason=RecorderReason.STORAGE_FAULT,
+            detail=detail,
+            config_schema_version=config.schema_version,
+        )
+        self._notify(lambda: self._notifier.ready(self._format_status(self.status)))
+        watchdog_interval = (
+            self._limits.watchdog_interval_s
+            if self._limits.watchdog_interval_s is not None
+            else config.service.watchdog_s / 2
+        )
+        watchdog_task = asyncio.create_task(
+            self._watchdog_loop(watchdog_interval),
+            name="recorder-storage-fault-watchdog",
+        )
+        try:
+            await self._stop_requested.wait()
+        finally:
+            await self._cancel_task(watchdog_task)
+        self._publish(RecorderState.STOPPING)
+        self._shutdown_notification()
+        return DaemonResult(DaemonOutcome.STOPPED, self.status)
+
+    async def _check_storage(self, config: DashcamConfig) -> DaemonResult | None:
+        gate = self._storage_gate
+        if gate is None:
+            return None
+        check_task = asyncio.create_task(
+            gate.check(config),
+            name="recorder-storage-preflight",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {check_task},
+                timeout=self._limits.storage_timeout_s,
+            )
+        except asyncio.CancelledError:
+            self._cancel_without_waiting(check_task)
+            self.request_stop()
+            raise
+        if not done:
+            self._cancel_without_waiting(check_task)
+            return await self._storage_fault(
+                config=config,
+                detail="storage preflight exceeded deadline",
+            )
+        error = self._task_error(check_task)
+        if error is not None:
+            return await self._storage_fault(
+                config=config,
+                detail="storage preflight failed",
+            )
+        result = check_task.result()
+        if not result.ready:
+            reasons = ",".join(reason.value for reason in result.reasons) or "NOT_READY"
+            return await self._storage_fault(
+                config=config,
+                detail=f"storage state={result.state.value} reasons={reasons}"[:512],
+            )
+        return None
 
     async def _external_shutdown(
         self,
@@ -244,6 +444,7 @@ class RecorderDaemon:
             raise RuntimeError("RecorderDaemon instances are single-use")
         self._started = True
         self._notify(lambda: self._notifier.status(self._format_status(self.status)))
+        self._snapshot()
 
         try:
             config = self._config_loader(self._config_path)
@@ -259,6 +460,13 @@ class RecorderDaemon:
             RecorderState.STARTING,
             config_schema_version=config.schema_version,
         )
+        storage_result = await self._check_storage(config)
+        if storage_result is not None:
+            return storage_result
+        if self._stop_requested.is_set():
+            self._publish(RecorderState.STOPPING)
+            self._shutdown_notification()
+            return DaemonResult(DaemonOutcome.STOPPED, self.status)
         start_task = asyncio.create_task(
             self._runtime.start(config),
             name="recorder-runtime-start",
@@ -286,9 +494,15 @@ class RecorderDaemon:
             return DaemonResult(DaemonOutcome.STARTUP_TIMEOUT, self.status)
         startup_error = self._task_error(start_task)
         if startup_error is not None:
+            if isinstance(startup_error, RecorderStorageFault):
+                reason = RecorderReason.STORAGE_FAULT
+            elif isinstance(startup_error, RecorderFinalizationFault):
+                reason = RecorderReason.FINALIZATION_FAILED
+            else:
+                reason = RecorderReason.STARTUP_FAILED
             self._publish(
                 RecorderState.FAULTED,
-                reason=RecorderReason.STARTUP_FAILED,
+                reason=reason,
                 detail=_exception_detail(startup_error),
             )
             await self._cleanup_after_failure(None)
@@ -314,22 +528,58 @@ class RecorderDaemon:
             name="recorder-runtime",
         )
         stop_wait_task = asyncio.create_task(
-            self._stop_requested.wait(),
+            self._wait_for_stop(),
             name="recorder-stop-wait",
         )
         watchdog_task = asyncio.create_task(
             self._watchdog_loop(watchdog_interval),
             name="recorder-watchdog",
         )
+        runtime_event_task = asyncio.create_task(
+            self._runtime_event_loop(),
+            name="recorder-runtime-events",
+        )
 
         try:
-            await asyncio.wait(
-                {run_task, stop_wait_task},
+            done, _ = await asyncio.wait(
+                {run_task, stop_wait_task, watchdog_task, runtime_event_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            await self._cancel_task(watchdog_task)
             if self._stop_requested.is_set():
+                await self._cancel_task(watchdog_task)
                 return await self._external_shutdown(run_task)
+            if watchdog_task in done:
+                watchdog_error = self._task_error(watchdog_task)
+                if isinstance(watchdog_error, PipelineNoProgressFault):
+                    reason = RecorderReason.PIPELINE_NO_PROGRESS
+                    outcome = DaemonOutcome.PIPELINE_NO_PROGRESS
+                    detail = _exception_detail(watchdog_error)
+                else:
+                    reason = RecorderReason.RUNTIME_FAILED
+                    outcome = DaemonOutcome.RUNTIME_FAILED
+                    detail = (
+                        "watchdog task exited unexpectedly"
+                        if watchdog_error is None
+                        else _exception_detail(watchdog_error)
+                    )
+                self._publish(RecorderState.FAULTED, reason=reason, detail=detail)
+                await self._cleanup_after_failure(run_task)
+                return DaemonResult(outcome, self.status)
+            await self._cancel_task(watchdog_task)
+            if runtime_event_task in done:
+                event_error = self._task_error(runtime_event_task)
+                detail = (
+                    "runtime lifecycle event loop exited unexpectedly"
+                    if event_error is None
+                    else _exception_detail(event_error)
+                )
+                self._publish(
+                    RecorderState.FAULTED,
+                    reason=RecorderReason.RUNTIME_FAILED,
+                    detail=detail,
+                )
+                await self._cleanup_after_failure(run_task)
+                return DaemonResult(DaemonOutcome.RUNTIME_FAILED, self.status)
 
             runtime_error = self._task_error(run_task)
             if runtime_error is None:
@@ -337,7 +587,14 @@ class RecorderDaemon:
                 outcome = DaemonOutcome.RUNTIME_EXITED
                 detail = "runtime exited without a stop request"
             else:
-                reason = RecorderReason.RUNTIME_FAILED
+                if isinstance(runtime_error, RecorderStorageFault):
+                    reason = RecorderReason.STORAGE_FAULT
+                elif isinstance(runtime_error, PipelineRecoveryExhausted):
+                    reason = RecorderReason.PIPELINE_RECOVERY_EXHAUSTED
+                elif isinstance(runtime_error, RecorderFinalizationFault):
+                    reason = RecorderReason.FINALIZATION_FAILED
+                else:
+                    reason = RecorderReason.RUNTIME_FAILED
                 outcome = DaemonOutcome.RUNTIME_FAILED
                 detail = _exception_detail(runtime_error)
             self._publish(RecorderState.FAULTED, reason=reason, detail=detail)
@@ -350,3 +607,5 @@ class RecorderDaemon:
             raise
         finally:
             await self._cancel_task(stop_wait_task)
+            await self._cancel_task(watchdog_task)
+            await self._cancel_task(runtime_event_task)

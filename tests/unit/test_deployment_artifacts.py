@@ -13,6 +13,15 @@ def _unit(name: str) -> str:
     return (SYSTEMD_ROOT / name).read_text(encoding="utf-8")
 
 
+def _directive_values(unit: str, key: str) -> list[str]:
+    values: list[str] = []
+    for line in unit.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name == key:
+            values.append(value)
+    return values
+
+
 def test_recorder_unit_has_bounded_notify_restart_and_privilege_contract() -> None:
     unit = _unit("dashcamd.service")
 
@@ -21,7 +30,10 @@ def test_recorder_unit_has_bounded_notify_restart_and_privilege_contract() -> No
         "NotifyAccess=main",
         "User=dashcam",
         "Restart=on-failure",
-        "RestartSec=5s",
+        "RestartSec=1s",
+        "RestartSteps=5",
+        "RestartMaxDelaySec=60s",
+        "RestartMode=normal",
         "TimeoutStartSec=45s",
         "TimeoutStopSec=30s",
         "WatchdogSec=20s",
@@ -32,11 +44,35 @@ def test_recorder_unit_has_bounded_notify_restart_and_privilege_contract() -> No
     ):
         assert directive in unit
     assert "dashcam.daemon" in unit
-    assert "StartLimitBurst=5" in unit
+    assert (
+        "ExecStart=/opt/dashcam/current/venv/bin/python -m dashcam.daemon "
+        "--config /etc/dashcam/config.toml --identity /etc/dashcam/storage-volume.env"
+    ) in unit
+    assert _directive_values(unit, "SupplementaryGroups") == [
+        "audio video render dialout dashcam-storage"
+    ]
+    # systemd counts starts (including restart attempts) across the interval;
+    # this is the finite failure latch for a repeatedly bad camera/encoder.
+    # Pin every effective recovery directive so a future edit cannot make the
+    # loop tight, unbounded, or restart a deliberate clean shutdown.
+    expected_recovery_directives = {
+        "Restart": ["on-failure"],
+        "RestartSec": ["1s"],
+        "RestartSteps": ["5"],
+        "RestartMaxDelaySec": ["60s"],
+        "RestartMode": ["normal"],
+        "StartLimitIntervalSec": ["300"],
+        "StartLimitBurst": ["5"],
+        "StartLimitAction": ["none"],
+    }
+    for key, expected in expected_recovery_directives.items():
+        assert _directive_values(unit, key) == expected
+    assert _directive_values(unit, "SuccessExitStatus") == []
     assert "Wants=dashcam-storage-check.service" in unit
     assert "Requires=dashcam-storage-check.service" not in unit
-    assert "must start in STORAGE_FAULT" in unit
-    assert "must not open" in unit
+    assert "RequiresMountsFor=/srv/dashcam" not in unit
+    assert "BindPaths=/srv/dashcam" in unit
+    assert "invalid or absent volume is observable as STORAGE_FAULT" in unit
 
 
 def test_web_unit_cannot_open_camera_audio_or_uart_groups() -> None:

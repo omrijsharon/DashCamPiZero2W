@@ -28,7 +28,7 @@ This document is both the product specification and the implementation contract 
 14. The system microSD card must never be hot-removed. Provide a controlled “prepare card for removal” action that finalizes the active clip, flushes data, unmounts the recording partition, and powers down the Pi.
 15. exFAT provides Windows interoperability, not journaling or immunity to power-loss corruption. Treat a power hold-up/safe-shutdown circuit as strongly recommended for vehicle deployment.
 16. Treat an MP4 file and its JSON sidecar as one **recoverable logical clip**, not as a filesystem-atomic pair. Persist intent, make each individual file operation atomic where possible, and reconcile interrupted pair operations after reboot.
-17. Do not commit to a camera source element, encoder device, muxer profile, preview transport, or 32/64-bit OS architecture until it is probed and measured on the exact target image.
+17. Do not commit to a camera source element, encoder device, muxer profile, or preview transport until it is probed and measured on the exact target image. The immediate development base is the approved Raspberry Pi OS Lite 32-bit Trixie image; any different general-release architecture remains a measured release decision.
 
 ---
 
@@ -74,18 +74,24 @@ Hardware details that must remain configurable:
 - `systemd` for service management and automatic restart.
 - `tzdata` installed and kept as a declared system dependency.
 - The in-kernel exFAT driver and `exfatprogs` installed as declared dependencies.
-- DashCam Bootstrap v1: a compressed custom Raspberry Pi OS Lite 32-bit image
-  with the application, its environment, dependencies, and first-boot payload
-  preinstalled. The retained release artifact is `.img.xz`, accompanied by an
+- The immediate development base is the official Raspberry Pi OS Lite 32-bit
+  Trixie image, flashed through Raspberry Pi Imager with the declared hostname,
+  user, home Wi-Fi, and SSH public key.
+- The eventual DashCam Bootstrap release remains a compressed custom Raspberry
+  Pi OS Lite image with the application, environment, dependencies, and
+  first-boot payload preinstalled. Its retained artifact is `.img.xz` with an
   Imager manifest and hashes; a raw `.img` is only a temporary build product.
-- No custom initramfs is permitted for DashCam Bootstrap v1. Its first-boot
-  storage transaction runs as ordinary post-root systemd services.
+  Building and validating that artifact is deferred release engineering, not a
+  prerequisite for the current SSH-first hardware work.
+- No custom initramfs is permitted for the eventual release image. Its storage
+  transaction must use ordinary post-root systemd services.
 
-The installation documentation must record the exact tested OS image and release date, 32/64-bit architecture, kernel, camera stack, GStreamer/FFmpeg, Python, exFAT driver, and `exfatprogs` versions. Do not assume plugin names or hardware encoder device nodes without probing the target image. Because the Pi Zero 2 W has only 512 MB RAM, the OS architecture is a measured release decision, not a preference.
+The installation documentation must record the exact tested OS image and release date, 32/64-bit architecture, kernel, camera stack, GStreamer/FFmpeg, Python, exFAT driver, and `exfatprogs` versions. Do not assume plugin names or hardware encoder device nodes without probing the target image. The approved development image is 32-bit; because the Pi Zero 2 W has only 512 MB RAM, retaining or changing that architecture for a general release remains a measured decision, not a preference.
 
 ### 3.1 Primary microSD partition layout and Windows interoperability
 
-The release image must use one physical microSD card with three partitions:
+The SSH-first development installation and the eventual release image must use
+one physical microSD card with three partitions:
 
 | Partition | Label | Filesystem | Purpose | Default sizing policy |
 |---|---|---|---|---|
@@ -100,63 +106,100 @@ Sizing notes:
 - Do not hard-code an exact final sector count or assume that all cards sold at the same nominal capacity contain the same number of sectors.
 - Cards smaller than the declared minimum supported capacity must fail provisioning cleanly rather than producing undersized or overlapping partitions.
 
-#### Image and first-boot provisioning
+#### SSH-first development and first-boot provisioning
 
 Stock Raspberry Pi OS commonly expands `rootfs` to fill the card on first boot.
-DashCam Bootstrap v1 prevents that by removing exactly the standalone stock
-`resize` token from the build-time boot `cmdline.txt` and adding
-`dashcam.bootstrap=v1`.
+The approved SSH-first development sequence is:
 
-The pinned 2026-06-18 Trixie armhf Lite source uses Raspberry Pi Imager's
-`cloudinit-rpi` customization format. The image manifest must retain that exact
-format. Imager may add `ds=nocloud` and seed files while flashing; the build
-transformation must preserve all unrelated cmdline tokens and seed files.
-Storage and network policy services must be ordered after `cloud-final.service`,
-and the storage runtime must independently require terminal successful
-cloud-init completion before any mutation. An incomplete or failed cloud-init
-run is a non-destructive defer/refusal, not permission to repartition.
-Independent image readback must also prove cloud-init's module lists contain no
-`growpart` or `resizefs`; Bootstrap Stage A is the only runtime partition
-grower.
-Legacy `systemd.run`/`firstrun` detection remains a defensive compatibility
-check but is not the primary path for this pinned source.
+1. Flash a clean official Raspberry Pi OS Lite 32-bit Trixie image with
+   Raspberry Pi Imager, including the declared hostname, user, home Wi-Fi, and
+   SSH public key.
+2. Before the card's first Pi boot, remove exactly one standalone stock
+   `resize` token from FAT `cmdline.txt`. Preserve every other token and byte,
+   read the file back, prove that no standalone `resize` token remains, and
+   flush/eject the card safely.
+3. On the first normal boot, allow the Imager first-run configuration to finish
+   and obtain SSH access. Transfer only the minimal reviewed storage-
+   provisioning payload; do not clone the full repository or install large
+   dependencies into the stock approximately 2 GiB root filesystem.
+4. Arm only the SSH-development contract by adding exactly one
+   `dashcam.bootstrap=ssh-dev-v1` token to FAT `cmdline.txt`. Prove the stock
+   `resize` token remains absent and every unrelated token is preserved, flush,
+   and perform one preparatory reboot so the marker appears in `/proc/cmdline`.
+5. Immediately before Stage A, run the planner-only live `--dry-run` and
+   revalidate the
+   complete boot-device identity and stock layout. For the authorized
+   development trial, require the 31,457,280,000-byte card with CID
+   `fe34325344000000200000031a0192d1`, an MBR, the expected 512 MiB FAT32
+   `bootfs` partition 1, and the stock ext4 partition 2 with exactly 4,161,536
+   sectors. The report must say `ready=true`; deferred/refused reports exit
+   nonzero and never call an executor. Any mismatch is a latched refusal.
+6. **Stage A (first eligible normal boot after the payload is reviewed):**
+   derive the actual mounted root and backing disk; repeat the exact
+   CID/layout gate; stream-hash exactly 4 MiB at the future partition-3 start;
+   back up and hash the MBR to both ext4 and FAT; bind the prefix hash and
+   record durable intent; then use one `sfdisk --no-reread` write to extend partition 2
+   directly from the proven stock size to exactly 6 GiB (12,582,912
+   512-byte sectors) and create partition 3 in the remaining aligned space.
+   Read the raw MBR back, durably record the committed table, sync, and perform
+   exactly one controlled reboot. Do not use a custom initramfs, kernel
+   partition-table reread, or `partprobe`.
+7. **Stage B (a later boot with a different boot ID):** revalidate the exact
+   target and the table committed by Stage A; grow the mounted ext4 filesystem
+   online with `resize2fs` (never `e2fsck` on the mounted root); and
+   independently re-read its size before advancing durable state. Prove
+   partition 3 was created by that exact Stage A transaction, has no
+   `blkid`/`wipefs` signature, and has the identical journal-bound 4 MiB prefix
+   hash observed before Stage A. Any content drift refuses before recording
+   format intent. Format it once with
+   `mkfs.exfat -n DASHCAM`, capture its UUID, mount by UUID, create the sentinel
+   and directory tree, write the mount/environment configuration, and write the
+   completion marker last.
+8. Only after Stage B has completed and the distinct exFAT mount is verified,
+   copy or clone the full repository and run one repeatable, idempotent
+   installation entry point for the locked Python environment, declared OS and
+   media dependencies, configuration, and implemented systemd units. For the
+   SSH-development route, explicitly refresh APT indexes before the
+   authoritative installer dry-run, preserve and review its exact package and
+   space plan, and never refresh indexes between that plan and apply. Apply
+   only the exact missing versions without upgrades. Keep units whose
+   production entry points or lifecycle contracts are incomplete absent and
+   disabled.
 
-The official source root filesystem has insufficient free space for the full
-offline payload. The image builder must therefore verify the official
-compressed and extracted hashes, then grow partition 2 and ext4 **offline** to
-an exact 4 GiB build-time source size before installing packages. The retained
-image must also contain and independently verify an all-zero 4 MiB extent at
-the future partition-3 start. Stage A later grows partition 2 from that checked
-4 GiB source geometry to the 6 GiB runtime target.
+All later boots are no-ops when the completion marker and verified mount agree.
+Reconciliation must be idempotent across a power cut. A foreign, torn, or
+contradictory state is a latched refusal: never auto-restore, auto-format, or
+destructively retry. Provisioning services run before storage verification and
+dashcam writes but independently of networking; their failure must leave
+NetworkManager, SSH, and AP fallback available.
 
-Bootstrap v1 is a normal post-root, two-boot transaction. It must not use a
-custom initramfs, a kernel partition-table reread, or `partprobe`:
+The compressed custom Bootstrap image remains a release goal, but its builder
+and pinned-source identity work are deferred until the SSH-first implementation
+and hardware gates pass. The retained builder design targets the pinned
+2026-06-18 Trixie armhf Lite source and Raspberry Pi Imager's `cloudinit-rpi`
+customization format. It must preserve Imager-added `ds=nocloud`, unrelated
+cmdline tokens, and seed files; add its own explicit bootstrap marker; prove
+that cloud-init has no `growpart` or `resizefs`; require terminal successful
+cloud-init before mutation; and treat incomplete or failed first-run state as a
+non-destructive defer/refusal. Its current offline design grows the verified
+source root to 4 GiB for package installation and verifies an all-zero 4 MiB
+extent at the future partition-3 start before its Stage A grows root to 6 GiB.
+These release-image checks do not gate the current official-image deployment.
 
-1. **Stage A (first eligible normal boot):** derive the actual mounted root and
-   backing disk; apply the exact CID/layout authorization gate for the
-   destructive trial; back up and hash the MBR to both ext4 and FAT; record
-   durable intent; then use one `sfdisk --no-reread` write to extend partition
-   2 to 6 GiB and create partition 3 in the remaining aligned space. Read the
-   raw MBR back, durably record the committed table, sync, and perform exactly
-   one controlled reboot.
-2. **Stage B (a later boot with a different boot ID):** revalidate the exact
-   target, grow the mounted ext4 filesystem online with `resize2fs` (never
-   `e2fsck` on the mounted root), and independently re-read the ext4 size before
-   advancing durable state. Prove partition 3 was newly created by the exact
-   authorized Stage A transaction, has no `blkid`/`wipefs` signature, and has
-   the image-authored all-zero 4 MiB prefix before recording format intent.
-   Format it once with `mkfs.exfat -n DASHCAM`, and capture its UUID. Mount by
-   UUID, create the sentinel and directory tree, write the mount/environment
-   configuration, and write the completion marker last.
-3. All later boots are no-ops when that completion marker and the verified
-   mount agree. Reconciliation is idempotent across a power cut. A foreign,
-   torn, or contradictory state is a latched refusal: never auto-restore,
-   auto-format, or retry a destructive action.
+The pinned official image currently completes cloud-init with exactly one
+recoverable missing-`cc_netplan_nm_patch` warning and exit status 2, while the
+declared user, SSH key, Wi-Fi, and `cloud-final.service` are complete. The
+SSH-development schema may treat only that exact machine-readable shape as the
+terminal state `done_known_degraded`. Any additional/different warning or
+error remains non-ready. The deferred release-image schema continues to
+require clean `done`.
 
 The installer must not attempt to shrink an already expanded, mounted ext4
 root partition. If stock first boot already consumed the card, the supported
-recovery is to rebuild/reflash using Bootstrap v1 or repartition offline with
-an explicitly documented expert procedure.
+development recovery is to reflash the official Lite image and repeat the
+pre-first-boot token removal; an explicitly documented offline expert procedure
+may be supported later. The deferred custom release image is not required for
+that recovery.
 
 Provisioning safety requirements:
 
@@ -164,9 +207,11 @@ Provisioning safety requirements:
 - Never overwrite an existing `DASHCAM` volume during upgrade. Reformatting is permitted only through an explicit factory-reset workflow with a destructive confirmation.
 - Back up the partition table before changing it and retain enough diagnostic information to recover a failed first boot.
 - Test the provisioning workflow repeatedly on expendable cards of every supported capacity class.
-- The exact 31,457,280,000-byte CID trial authorization applies only to its
-  named Pi test card. General-release destructive authorization policy remains
-  unresolved and must be explicit before release testing.
+- The exact-card trial authorization applies only to the
+  31,457,280,000-byte Pi test card with CID
+  `fe34325344000000200000031a0192d1`. General-release destructive
+  authorization policy remains unresolved and must be explicit before release
+  testing.
 
 #### Linux mount behavior
 
@@ -264,11 +309,11 @@ The system must:
 6. Use bounded restart backoff to avoid a tight crash loop.
 7. Finalize the active clip on a clean shutdown.
 
-Bootstrap services run before the storage check and before any dashcam write,
-but independently of networking. Provisioning failure must not block
-NetworkManager, SSH, or AP fallback. `dashcamd` may report `STORAGE_FAULT`,
-but camera/recording writes remain blocked until the recording mount is
-verified.
+Storage-provisioning services run before the storage check and before any
+dashcam write, but independently of networking. Provisioning failure must not
+block NetworkManager, SSH, or AP fallback. `dashcamd` may report
+`STORAGE_FAULT`, but camera/recording writes remain blocked until the recording
+mount is verified.
 
 Recording states:
 
@@ -313,9 +358,66 @@ The UTC portion is for humans; the short boot ID and sequence make names unique 
 - Timestamp audio from the same pipeline clock used for video.
 - Use resampling/timestamp correction where needed to prevent USB-audio clock drift.
 - Maintain audio/video synchronization across clip boundaries.
-- If the microphone is absent or disconnected, continue recording video-only clips and set `audio_available=false` in status and metadata.
-- Attempt microphone recovery without restarting the camera when practical. It is acceptable to restore audio at the next clip boundary.
+- If the configured microphone is unavailable when the recorder starts, continue recording video-only clips and set `audio_available=false` in status and metadata.
 - Never substitute a different USB audio device merely because its ALSA card index matches.
+
+**Phase 2 status (2026-07-28):** the exact Pi passed the connected-microphone
+AAC/synchronization baseline, but a hash-closed non-mutating probe refused a
+direct release/re-request of `splitmuxsink`'s live `audio_%u` pad. The public
+API has no proven pre-switch drain/old-fragment-closure/new-mux readiness
+barrier, and asynchronous finalization leaves a context race.
+
+A subsequent hash-closed capability harness passed two unchanged logical
+A/V -> video-only -> restored-A/V runs using three complete immutable recording
+generations, one continuous camera/hardware encoder, IDR handoffs, exact
+fragment closure, and no live request-pad mutation. All restored clips remained
+below 100 ms stream-edge skew. This selected immutable complete generations
+instead of live request-pad mutation.
+
+Final hash-closed release `0.1.0.dev0-ce028ba96d40fb9d` then passed two
+controlled logical sysfs loss/restoration cycles through the real production
+recorder. Its atomic generation-EOS reservation closes the source-EOS race and
+its exact open-or-already-closed ownership proof closes the asynchronous
+fragment-observer race. The bounded three-slot progression rebuilt dead ALSA
+ingress twice and produced five IDR-first, hardware-decoded clips with audio
+truth `[true,false,true,false,true]`; A/V skews were 76.001, 71.958, and
+84.291 ms, with zero drops, pipeline restarts, or throttling. Earlier
+124.666 ms and 100.666 ms results remained refused; the strict bound was not
+weakened. Evidence:
+`docs/test-reports/2026-07-27-milestone7-hotplug-refusal.md` and
+`docs/test-reports/2026-07-28-milestone7-production-restoration-live.md`.
+
+The exact-Pi normal-default production-loss qualification passed release
+`0.1.0.dev0-2439b9fc544ffffc` with controlled deauthorization of the exact
+matched microphone. The real recorder confirmed two stable `NOT_FOUND` results,
+made an IDR-held handoff from its immutable A/V generation to a prebuilt
+immutable video-only generation, and truthfully produced ordered sidecars with
+audio `[true,false]`. Both clips were IDR-first and hardware-decoded; encoder
+drops did not increase and pipeline restarts remained zero. Runtime reported
+`UNAVAILABLE/microphone_loss_isolated`. This earlier result is logical one-way
+software-loss evidence; the later two-cycle production result above supersedes
+its restoration limitation. Logical loss isolation/restoration remains an
+implemented, evidence-backed resilience feature.
+
+Release `0.1.0.dev0-09a6dd3b374d3952` subsequently passed the remaining
+startup-without-microphone gate on the exact Pi. With the configured USB device
+physically absent before service start, the ordinary production service reached
+`RECORDING`, reported `UNAVAILABLE/not_found`, and finalized a 59.989-second
+video-only 1080p High/4.1 clip at 8.004 Mbit/s. Its sidecar truthfully reported
+`audio.available=false`; the clip started with an IDR and decoded through the
+hardware decoder. The service then stopped cleanly with zero restarts and no
+throttling. Evidence:
+`docs/test-reports/2026-07-28-milestone7-absent-startup-live.md`.
+
+By owner decision on 2026-07-28, physical microphone hot-unplug/replug,
+runtime restoration, naturally reassigned card-index, and physical wrong-device
+qualification are not current v1 acceptance gates. The configured microphone
+is expected to remain connected in normal use. Stable identity selection and
+non-substitution remain required, and the recorder must work when the
+configured microphone is either present or absent at startup. Historical
+logical loss/restoration evidence remains valid but is not a requirement to
+repeat. Evidence:
+`docs/test-reports/2026-07-27-milestone7-production-loss-live.md`.
 
 ### 5.4 GPS over UART
 
@@ -365,9 +467,14 @@ The Pi may boot with an incorrect wall clock. Therefore:
 5. Derive UTC for earlier and later samples from this anchor.
 6. Rename finalized provisional clips when their corrected UTC start time becomes known.
 7. Do not base media PTS/DTS on a wall clock that may jump.
-8. The service may set the Linux system clock once a valid GPS time is available, but the media pipeline must remain stable if the system clock steps.
-9. Reject implausible GPS dates with explicit diagnostics rather than setting the system clock blindly.
-10. Assign exactly one component to discipline the system clock. Prefer `chrony` with a GPS source or a narrowly scoped privileged time helper; do not grant the recorder broad root privileges or let multiple time services fight.
+8. Version 1 does not set the Linux system clock from GPS. The approved image
+   retains stock `systemd-timesyncd` as its sole wall-clock owner, while trusted
+   GPS anchors independently supply canonical clip UTC.
+9. Reject implausible GPS dates with explicit diagnostics; never pass them to a
+   wall-clock owner.
+10. Do not grant the recorder clock-setting privilege or run another time
+    service alongside `systemd-timesyncd`. The media pipeline must remain
+    stable if the independently owned Linux wall clock steps.
 11. Track anchor source, age, uncertainty, and disagreement. Do not repeatedly rename a clip as noisy anchors arrive; accept/reject anchors through a documented policy and make filename reconciliation idempotent.
 
 Time status uses independent fields because GPS freshness and Linux wall-clock discipline can coexist:
@@ -695,9 +802,9 @@ The web process must not turn a user-supplied clip ID into a filesystem path. Ca
 #### OS-managed services
 
 - Wi-Fi AP and DHCP/DNS.
-- Bootstrap v1 Stage A/Stage B storage services, ordered normally after root
-  is available and before storage verification/dashcam writes, never behind
-  network availability.
+- Stage A/Stage B storage services, ordered normally after root is available
+  and before storage verification/dashcam writes, never behind network
+  availability.
 - Timezone database.
 - `systemd` supervision.
 - Optional log persistence policy.
@@ -727,6 +834,41 @@ Implementation preference:
 - Use asynchronous muxer finalization where available.
 - If the target OS media plugins cannot produce a stable pipeline, use the current Raspberry Pi `rpicam`/libav or Picamera2 APIs, but preserve all architecture and acceptance requirements.
 - Do not choose an implementation solely because it works on a development laptop; validate it on the Pi Zero 2 W.
+
+Current SSH-first target finding (2026-07-26): IMX219 `libcamerasrc`
+successfully negotiates 1920×1080 NV12 at 30 fps, and Raspberry Pi's
+hardware-H.264 path produced an independently decodable High Profile Level 4.1
+8 Mb/s sample. A bounded GStreamer rerun corrected the earlier blanket
+`v4l2h264enc` rejection. Raspberry Pi's documented
+`extra-controls="controls,repeat_sequence_header=1"` plus an explicit H.264
+level cap passed IMX219 inputs at 640×360 and 1920×1080. A production-cap
+constrained-VBR variant then passed at 1920×1080/30, High/4.1, 8 Mb/s target,
+GOP 30, repeated headers, and one-second keyframes; it decoded independently
+and measured 8,221,871 bit/s without throttling or a kernel-log delta. The
+explicit level cap is mandatory because the earlier implicit level-1
+negotiation is invalid at 1080p. On this exact stack, do not request V4L2
+`video_bitrate_mode=1`: that CBR-mode control alone reproducibly causes
+`bcm2835_codec_start_streaming` error `ret -3`, while bitrate and GOP controls
+pass individually and together under the default hardware VBR mode. This
+constrained-VBR selection satisfies the rate-control requirement in section
+4.1. The installed production recorder subsequently passed a one-minute
+continuous split: a 59.988667-second High/4.1 segment closed on an IDR boundary,
+its IDR-started successor opened without camera/encoder/service restart, both
+decoded independently, systemd shutdown finalized the active fragment with
+exit 0, and the Pi remained unthrottled. The exact stack posts validated active
+`splitmuxsink-fragment-closed` after accepting EOS but omits pipeline EOS, so
+shutdown is bound to that exact active-fragment identity and rejects stale
+closure events. Milestone 6 subsequently passed truthful runtime metrics, one
+bounded camera/encoder recovery, ten consecutive clips (sequences 30–39), and
+a 7,200-second video-only endurance run. The endurance conclusion is bound to
+the retained source hash and strict zram-only/no-growth reanalysis; the
+recorder was stopped cleanly afterward. The 64-to-128-MiB GPU-memory experiment
+did not help and was reverted.
+See
+`docs/test-reports/2026-07-26-milestone5-live-validation.md` and
+`docs/test-reports/2026-07-26-gstreamer-explicit-caps.md` and
+`docs/test-reports/2026-07-26-milestone6-recorder-live.md` and
+`docs/test-reports/2026-07-27-milestone6-metrics-recovery-endurance-live.md`.
 
 ### 6.3 Timing model
 
@@ -803,7 +945,7 @@ container = "mp4"
 
 [audio]
 enabled = true
-device_match = "usb-VID_PID-or-stable-name"
+device_match = "usb:vid=08bb,pid=2902,product=USB_PnP_Sound_Device,path=platform-3f980000.usb-usb-0:1:1.0"
 sample_rate_hz = 48000
 channels = 1
 codec = "aac"
@@ -814,12 +956,18 @@ device = "/dev/serial0"
 baud = 115200
 stale_after_s = 2.0
 max_sample_hz = 10
+anchor_earliest_utc = "2024-01-01T00:00:00Z"
+anchor_latest_utc = "2100-01-01T00:00:00Z"
+anchor_uncertainty_ms = 250
+anchor_max_conflict_ms = 2000
+anchor_max_reacquire_disagreement_ms = 5000
+anchor_max_interval_s = 86400
 
 [time]
 timezone = "Asia/Jerusalem"
 filename_timezone = "UTC"
-discipline_system_clock = true
-system_clock_owner = "chrony"
+discipline_system_clock = false
+system_clock_owner = "systemd-timesyncd"
 
 [overlay]
 enabled = true
@@ -1080,10 +1228,20 @@ Pass criteria:
 
 ### D. Audio failure
 
-1. Boot without microphone; verify video-only recording.
-2. Unplug microphone while recording; verify video continues.
-3. Reconnect microphone; verify audio returns at or before the next supported restart boundary.
-4. Verify metadata accurately reports audio availability per clip.
+1. Start the recorder without the configured microphone; verify video-only recording and truthful status/metadata.
+2. Start with the configured microphone present; verify AAC and per-clip A/V metadata accurately report availability.
+
+The final image passed stable identity, native PCM capture, non-silent signal,
+the standalone 48 kHz mono AAC-LC branch, ten-clip integrated A/V
+synchronization, and two production logical loss/restoration cycles with
+truthful per-clip audio metadata. The latter used controlled sysfs
+deauthorization and reauthorization, rebuilt the ALSA ingress twice without a
+camera/pipeline restart, and passed the strict 100 ms A/V bound. The exact
+production service also passed startup with the microphone physically absent,
+truthful video-only metadata, IDR-first hardware decode, clean shutdown, zero
+restarts, and no throttling. Physical hot-unplug/replug, runtime restoration,
+reassigned-index, and physical wrong-device qualification are outside current
+v1 acceptance by owner decision; input-gain calibration also remains open.
 
 ### E. Wi-Fi and preview
 
@@ -1137,20 +1295,52 @@ Each fault must produce a visible state, bounded retry behavior, and no misleadi
 
 ### J. Partition provisioning and Windows interoperability
 
-1. Flash the supported compressed Bootstrap v1 image through its checked Imager manifest to fresh nominal 32 GB, 64 GB, and any other declared card sizes.
-2. Verify the build changed only the standalone stock `resize` cmdline token, preserved Imager first-run tokens, and defers when Imager first-run is active.
-3. Verify ordinary post-root Stage A performs one `sfdisk --no-reread` commit and one controlled reboot, then Stage B creates FAT32 boot, fixed-size ext4 root, and remainder exFAT `DASHCAM` partitions without overlap.
-4. Verify the fully installed 6 GiB root target retains at least 2 GiB free; otherwise the image must select a larger root target.
-5. Verify partition creation is idempotent and a second boot does not recreate or format the recording volume.
-6. Verify the exFAT filesystem is mounted at `/srv/dashcam` by UUID and the recorder confirms the expected filesystem, UUID/sentinel, and distinct mount.
-7. Simulate a missing/failed mount and verify the recorder does not write into the underlying rootfs directory.
-8. Record and finalize at least 10 clips, use **Prepare SD card for removal**, remove the powered-down card, and insert it into Windows 10 and Windows 11.
-9. Verify the `DASHCAM` volume appears, `.mp4` files play in a standard Windows player, `.json` files open, and protected clips are easy to locate.
-10. Verify documentation prevents accidental formatting of the unknown ext4 partition and clearly distinguishes the boot volume from `DASHCAM`.
-11. Allow Windows to create `System Volume Information` and other metadata, reinsert the card, and verify those entries are ignored and preserved by retention.
-12. Reinsert the card in the Pi and verify recording resumes without reformatting or manual repair after a clean removal.
-13. Repeat with abrupt power loss; verify dirty-volume detection, bounded `fsck.exfat`, explicit failure behavior, and no rootfs fallback.
-14. Verify a deliberately corrupted/unrepairable exFAT volume is never auto-formatted.
+1. Flash the official Raspberry Pi OS Lite 32-bit Trixie image through Imager
+   with the declared first-run settings.
+2. Before first Pi boot, verify that only the standalone stock `resize` token
+   was removed from `cmdline.txt`, that all other tokens/bytes and Imager seed
+   data were preserved, and that readback contains no standalone `resize`.
+3. At first SSH access, transfer only the reviewed minimal provisioning
+   payload, add and read back exactly one SSH-development boot marker, and
+   perform the preparatory reboot. Immediately before mutation, verify the exact authorized
+   31,457,280,000-byte card CID and complete stock layout and validate the
+   Stage A dry run reports `ready=true`.
+4. Verify Stage A grows the proven 4,161,536-sector stock partition 2 directly
+   to exactly 6 GiB (12,582,912 512-byte sectors) and creates partition 3 with
+   one `sfdisk --no-reread` commit, raw-MBR readback, durable evidence, sync,
+   and exactly one controlled reboot.
+5. On a different boot ID, verify Stage B grows ext4 online, proves the new
+   partition 3 is attributable to Stage A, has no recognized signature, and
+   retains the exact journal-bound pre-Stage-A 4 MiB prefix hash, formats it
+   exactly once as exFAT `DASHCAM`, and mounts
+   it at `/srv/dashcam` by UUID with the expected sentinel.
+6. Verify the full repository and large dependencies are installed only after
+   storage provisioning, through the repeatable idempotent installation entry
+   point, and verify the fully installed 6 GiB root retains at least 2 GiB free.
+7. Verify later boots do not recreate or format the recording volume and that
+   foreign, torn, and refused states do not trigger destructive retry.
+8. Simulate a missing/failed mount and verify the recorder does not write into
+   the underlying rootfs directory.
+9. Record and finalize at least 10 clips, use **Prepare SD card for removal**,
+   remove the powered-down card, and insert it into Windows 10 and Windows 11.
+10. Verify the `DASHCAM` volume appears, `.mp4` files play in a standard Windows
+    player, `.json` files open, and protected clips are easy to locate.
+11. Verify documentation prevents accidental formatting of the unknown ext4
+    partition and clearly distinguishes the boot volume from `DASHCAM`.
+12. Allow Windows to create `System Volume Information` and other metadata,
+    reinsert the card, and verify those entries are ignored and preserved by
+    retention.
+13. Reinsert the card in the Pi and verify recording resumes without
+    reformatting or manual repair after a clean removal.
+14. Repeat with abrupt power loss; verify dirty-volume detection, bounded
+    `fsck.exfat`, explicit failure behavior, and no rootfs fallback.
+15. Verify a deliberately corrupted/unrepairable exFAT volume is never
+    auto-formatted.
+
+Before release, repeat the applicable provisioning matrix with the deferred
+compressed Bootstrap image, checked Imager manifest, fresh cards of every
+supported capacity class, and all release-image first-run deferral and
+readback checks.
 
 ---
 
@@ -1158,7 +1348,8 @@ Each fault must produce a visible state, bounded retry behavior, and no misleadi
 
 ### Phase 0A — Local repository and test foundation
 
-This work happens in the development repository before SSH access to the Pi is available:
+This work happens in the development repository and remains useful independent
+of Pi SSH availability:
 
 - Establish packaging, lint/type/test configuration, versioned configuration/schema models, state machines, and test fixtures.
 - Implement hardware boundaries behind interfaces and use recorded fixtures/fakes for local tests; never claim a fake result as hardware validation.
@@ -1167,18 +1358,33 @@ This work happens in the development repository before SSH access to the Pi is a
 
 ### Phase 0B — Pi hardware and capability gate
 
-When the owner authorizes Pi access, run the probe and produce a report that identifies:
+The owner has authorized SSH access to the declared Pi once it is reachable and
+the exact-card Stage A/Stage B transaction within the gate above. Follow the
+SSH-first provisioning order in section 3.1, then run the probe and produce a
+report that identifies:
 
 - Camera and supported modes.
 - Installed libcamera/rpicam/Picamera2/GStreamer/FFmpeg versions.
 - Available H.264 hardware encoders and tested caps.
-- Audio devices and stable identifiers.
+- Audio devices and stable identifiers when the USB microphone is connected;
+  the final-image standalone PCM/AAC and connected-microphone integrated A/V
+  baselines, controlled logical loss/restoration, and startup-without-microphone
+  video-only behavior are evidence-backed. Physical hot-unplug/replug is not a
+  current acceptance gate.
 - UART device and GPS baud.
 - Boot-device identity, current partition table, stock auto-resize state, filesystem types, and available aligned free space.
 - exFAT driver/`exfatprogs` versions, recording-volume identity, free space, and sustained write speed.
 - CPU temperature/throttling state.
 
-Probe the Pi Zero 2 W UART mapping/stability, USB topology, 32/64-bit image memory cost, camera buffer formats, overlay paths, muxer profiles, and preview candidates. Deliver and validate the Bootstrap v1 normal-post-root partition provisioner on expendable cards before relying on `/srv/dashcam`. Do not begin target-dependent integration or a large application before validating both the storage layout and a minimal 1080p30 hardware-encoded recording on the actual Pi.
+Probe the Pi Zero 2 W UART mapping/stability, USB topology, 32-bit image memory
+cost, camera buffer formats, overlay paths, muxer profiles, and preview
+candidates. Deliver and validate the SSH-first normal-post-root partition
+provisioner before relying on `/srv/dashcam`. Do not copy the full repository,
+install the application dependency set, or begin broad target integration until
+the storage layout is complete and verified. After that gate, validate a
+minimal 1080p30 hardware-encoded recording on the actual Pi before expanding
+integration. Audio hardware validation waits for the microphone to be
+connected, without weakening the product requirement.
 
 ### Phase 1 — Reliable video-only segmenter
 
@@ -1189,12 +1395,35 @@ Probe the Pi Zero 2 W UART mapping/stability, USB topology, 32/64-bit image memo
 - Frame/drop metrics.
 - Two-hour endurance test.
 
+**Accepted on the reference Pi (2026-07-28):** all Phase 1 items above passed,
+including the bounded recovery and the strict hash-bound zram-only/no-growth
+two-hour analysis. The connected-microphone Phase 2 mux/synchronization
+baseline also passed ten consecutive clips at 4.000–64.333 ms stream-edge
+skew. The normal-default production path also passed two controlled logical
+loss/restoration cycles with truthful audio state, bounded three-slot
+recycling, sub-100 ms skew, and zero pipeline restarts. The ordinary production
+service also passed startup with the configured microphone physically absent
+and finalized truthful video-only media. Physical hot-unplug/replug and
+restoration are not current acceptance gates.
+
 ### Phase 2 — Audio muxing
 
 - USB audio selection.
 - AAC muxed into each segment.
 - A/V sync tests.
 - Microphone failure behavior.
+
+**Current acceptance state:** connected-microphone muxing/synchronization and
+startup-without-microphone video-only recording have passed. Ordinary defaults
+also completed two controlled exact-device deauthorization/reauthorization
+cycles as additional resilience evidence,
+rebuilt the failed ingress, and transitioned A/V -> video-only -> A/V twice
+without camera/pipeline restart and with truthful per-clip audio state. Direct
+live `splitmuxsink` audio-pad mutation remains refused; bounded immutable
+generations are selected. By owner decision, physical hot-unplug/replug,
+runtime restoration, naturally reassigned card-index, and physical wrong-device
+qualification are outside the current v1 acceptance scope. Stable configured-
+device identity and non-substitution remain required.
 
 ### Phase 3 — GPS, time model, and metadata
 
@@ -1203,6 +1432,51 @@ Probe the Pi Zero 2 W UART mapping/stability, USB topology, 32/64-bit image memo
 - Timezone conversion.
 - Sidecar JSON.
 - Provisional filename reconciliation.
+
+**Current acceptance state (2026-07-28):** the bounded receive-only PL011
+adapter and actual-receiver NMEA/counter validation pass. Recording also
+continues under configured GPS absence with stable monotonic clip identity.
+Hash-closed release `0.1.0.dev0-75947a15db03f4b3` accepts checksum/parse-valid
+RMC/ZDA time candidates through configured date-plausibility, continuity,
+conflict, reacquisition, interval, provenance, and uncertainty policy. The
+exact Pi accepted one GN RMC monotonic/UTC anchor followed by 199 continuity
+confirmations with zero rejection and no media restart. The accepted anchor
+currently feeds privacy-safe runtime status. Release
+`0.1.0.dev0-7fd1e73debb731b6` also retains receiver-epoch-coalesced RMC/GGA
+navigation in a bounded three-minute history and writes half-open per-clip
+windows into provisional sidecars. The exact Pi retained exactly 600 unique,
+ordered monotonic-only samples in a full clip and 431 in its shutdown successor
+with zero boundary overlap, eviction, rate-limit loss, time regression, or
+media restart. The approved image now selects stock `systemd-timesyncd` as its
+sole Linux wall-clock owner. A controlled +120-second realtime step during
+production sequence 390 left every H.264/AAC PTS and DTS strictly increasing,
+passed full hardware decode, and caused zero media or service restart. The
+recorder still uses only pipeline/monotonic media timing and does not discipline
+wall time. Hash-closed release `0.1.0.dev0-6f943f3a4edf7117` now durably
+projects provisional sidecars from a retained trusted GPS anchor, atomically
+replaces their canonical JSON, and no-replace renames the recoverable MP4/JSON
+pair under a schema-4 intent while preserving the stable clip UUID. Its bounded
+same-boot backlog reconciled two no-GPS clips after late lock with zero media
+drop/restart, and an isolated exact-exFAT case-variant target was refused before
+any source, catalog, or intent mutation. Evidence:
+`docs/test-reports/2026-07-28-milestone8-reconciliation-live.md`. Exact-Pi
+production-wheel validation then proved truthful stale/lost navigation,
+bounded reconnect, malformed/checksum/oversized input handling, implausible
+date and anchor-conflict refusal, UTC-midnight rollover, and
+`Asia/Jerusalem` DST/standard conversion. Final hash-closed release
+`0.1.0.dev0-921164f96ad53e0b` adds a bounded one-second parse-error-rate guard;
+its exact-version/idempotent installation, full local suite, one-minute
+ordinary-recorder media run, and independent hardware-H.264/AAC decode passed.
+An integrated transient production-daemon run then exercised silence,
+conflict, transport loss/reconnect, durable reconciliation on the real exFAT
+catalog, and continued camera/hardware encoding from frame 1 through 2,179
+with zero drops or restarts. Its validator now uses a kernel-held exclusive
+qualification lock so overlapping future runs refuse before live work. A
+controlled boot with the configured GPS path deliberately absent also reached
+ordinary `RECORDING` with `UART_UNAVAILABLE`/`UNSYNCED`, 2,106 encoded frames,
+zero drops/restarts, and verified exFAT storage; the normal configuration was
+then restored byte-for-byte and ordinary recording restarted.
+Milestone 8 is accepted. Burned-in overlay integration remains Phase 4 work.
 
 ### Phase 4 — Overlay
 
@@ -1230,7 +1504,10 @@ Probe the Pi Zero 2 W UART mapping/stability, USB topology, 32/64-bit image memo
 - Twelve-hour endurance test.
 - Random power-loss testing, including exFAT dirty-volume recovery.
 - Fault injection.
-- Finalize the Bootstrap v1 compressed image, Imager manifest, hashes, and tested normal-post-root first-boot process; initial partition-provisioning validation belongs to Phase 0B.
+- Convert the proven SSH-first provisioning and installation path into the
+  compressed Bootstrap release image, Imager manifest, hashes, and tested
+  normal-post-root first-boot process. This is deferred release engineering;
+  initial exact-card partition-provisioning validation belongs to Phase 0B.
 - Safe-removal/shutdown workflow.
 - Windows 10/11 card-readability validation.
 - Documentation and recovery procedures.
@@ -1350,6 +1627,10 @@ The exact language split may change, but critical media work should remain in na
 - No dependency on internet access during normal operation.
 - Never write recordings to an unverified mountpoint or fall back from `/srv/dashcam` to rootfs.
 - Treat partitioning/formatting code as destructive infrastructure: require explicit invariants, idempotency, dry-run diagnostics, and tests on expendable media.
+- Maintain one repeatable, idempotent Pi installation entry point that creates
+  the locked Python environment, installs declared OS/media dependencies,
+  applies configuration, and installs/enables the required systemd units. It
+  must not run the large installation phase before Stage B storage completion.
 - Pin or record dependency versions used in the release image.
 - Include database/config schema migration paths from version 1 onward.
 - Keep `plan.md` synchronized with verified progress. Check a task only after its stated validation/evidence exists; check a milestone only after all of its tasks and exit criteria pass.
@@ -1392,7 +1673,13 @@ The project is complete only when all of the following are true:
 - Preview operation cannot backpressure the recorder.
 - The twelve-hour endurance test passes.
 - Random power-loss tests meet the documented exFAT recovery criteria and never trigger automatic formatting or rootfs fallback.
-- A freshly flashed Bootstrap v1 card safely and idempotently provisions the FAT32/ext4/exFAT layout through its normal post-root two-boot transaction.
+- A freshly flashed supported official Lite card can safely and idempotently
+  provision the FAT32/ext4/exFAT layout through the documented SSH-first
+  post-root two-stage transaction, then install the full system through the
+  repeatable installation entry point.
+- The deferred compressed Bootstrap release image, manifest, hashes, and
+  normal-post-root two-boot provisioning flow pass the supported-card release
+  matrix without weakening the SSH-first safety contract.
 - After controlled shutdown, the `DASHCAM` partition is directly readable on validated Windows 10/11 systems and its MP4/JSON pairs can be copied and opened.
 - Hardware/software versions and measured performance are documented.
 
@@ -1402,7 +1689,12 @@ The project is complete only when all of the following are true:
 
 When implementing this project:
 
-1. Begin with Phase 0A locally. Do not access the Pi or start implementation until the owner authorizes it. After authorization and SSH availability, complete Phase 0B and commit the measured capability report before target-dependent integration.
+1. Continue Phase 0A work locally where useful. The owner has authorized SSH
+   access to the declared Pi once reachable and the narrowly gated exact-card
+   storage transaction. Follow section 3.1: transfer only the minimal
+   provisioning payload, complete and verify Stage A/Stage B, then copy or
+   clone the full repository and run the idempotent installer before broader
+   Phase 0B integration.
 2. Challenge any assumption that is not confirmed on the target Pi image.
 3. Build the smallest testable vertical slice for each phase.
 4. Do not hide a failed requirement by changing resolution, frame rate, bitrate, overlay, or codec defaults.
@@ -1411,7 +1703,11 @@ When implementing this project:
 7. Preserve evidence: a recoverable failure should degrade optional features before it stops or deletes recordings.
 8. Include exact commands for installation, service enablement, logs, diagnostics, media validation, and recovery.
 9. Report measured Pi Zero 2 W CPU, memory, temperature, dropped frames, preview latency, A/V skew, and storage throughput in the final test report.
-10. Do not let Raspberry Pi OS auto-expand rootfs across the full card. At build time remove only the standalone stock `resize` token, preserve Imager first-run tokens, and verify Bootstrap v1 defers until first-run completion.
+10. Do not let Raspberry Pi OS auto-expand rootfs across the full card. For the
+    SSH-first development flash, remove only the standalone stock `resize`
+    token before first Pi boot and preserve every other token/byte and Imager
+    seed. For the deferred release image, enforce the equivalent transformation
+    at build time and verify bootstrap defers until first-run completion.
 11. Never identify the destructive partition target from a hard-coded device path alone, and never format an existing recognized data volume during an upgrade.
 12. Fail closed when `/srv/dashcam` is not the verified exFAT data mount; do not record into its underlying rootfs directory.
 13. Treat this specification as the acceptance contract. Document any deviation explicitly with its reason, risk, and proposed remedy.

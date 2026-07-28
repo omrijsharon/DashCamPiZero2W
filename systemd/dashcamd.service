@@ -5,17 +5,33 @@ After=local-fs.target dashcam-storage-check.service
 Wants=dashcam-storage-check.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
+# A failed recorder may make at most five start attempts in five minutes.
+# When that rate limit is hit systemd leaves the unit failed; it does not take
+# a reboot or other StartLimitAction.  Operator intervention is then required.
+StartLimitAction=none
 
 [Service]
 Type=notify
 NotifyAccess=main
 User=dashcam
 Group=dashcam
-SupplementaryGroups=video render dialout audio dashcam-storage
+# ``audio`` and ``dialout`` grant only the recorder access to the explicitly
+# selected ALSA capture device and receive-only GPS UART.  The service still
+# owns both the camera and media mount; do not broaden these groups to web or
+# helper identities.
+SupplementaryGroups=audio video render dialout dashcam-storage
 WorkingDirectory=/var/lib/dashcam
-ExecStart=/opt/dashcam/venv/bin/python -m dashcam.daemon
+ExecStart=/opt/dashcam/current/venv/bin/python -m dashcam.daemon --config /etc/dashcam/config.toml --identity /etc/dashcam/storage-volume.env
 Restart=on-failure
-RestartSec=5s
+# systemd 257 increases this delay exponentially from 1s to 60s in five
+# steps.  A clean (zero-status) shutdown is never restarted, while a camera,
+# encoder, watchdog, signal, or timeout failure is recovered only at this
+# bounded rate.  RestartMode=normal keeps each failure observable between
+# attempts instead of hiding it behind a direct restart.
+RestartSec=1s
+RestartSteps=5
+RestartMaxDelaySec=60s
+RestartMode=normal
 TimeoutStartSec=45s
 TimeoutStopSec=30s
 WatchdogSec=20s
@@ -42,10 +58,12 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX
 ReadWritePaths=/var/lib/dashcam /srv/dashcam
+BindPaths=/srv/dashcam
 
-# Storage preflight is deliberately a soft process-start dependency: dashcamd
-# must start in STORAGE_FAULT so status remains observable, but it must not open
-# the camera or create media until its own fresh mount verification succeeds.
+# Storage preflight remains a soft process-start dependency so a mounted but
+# invalid or absent volume is observable as STORAGE_FAULT.  The same-path
+# private bind pins whichever filesystem was visible at process start, so a
+# later host mount removal cannot expose underlying root storage to the writer.
 
 [Install]
 WantedBy=multi-user.target

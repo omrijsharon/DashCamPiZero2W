@@ -123,7 +123,7 @@ class RestartPolicy:
     initial_backoff_s: float = 1.0
     maximum_backoff_s: float = 60.0
     multiplier: float = 2.0
-    stop_timeout_s: float = 10.0
+    stop_timeout_s: float = 20.0
 
     def __post_init__(self) -> None:
         if (

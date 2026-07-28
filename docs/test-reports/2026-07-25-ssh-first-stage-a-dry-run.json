@@ -1,0 +1,123 @@
+{
+  "actions": [
+    {
+      "kind": "backup",
+      "detail": "mirror raw MBR and sfdisk dump to ext4 and FAT"
+    },
+    {
+      "kind": "write_state",
+      "detail": "durable Stage A intent"
+    },
+    {
+      "kind": "write_state",
+      "detail": "durable table-write-started boundary"
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "/usr/sbin/sfdisk",
+        "--no-reread",
+        "--force",
+        "/dev/mmcblk0"
+      ],
+      "has_stdin": true,
+      "detail": "one full-table write"
+    },
+    {
+      "kind": "verify_raw_mbr",
+      "detail": "read raw LBA0 and compare exact target"
+    },
+    {
+      "kind": "write_state",
+      "detail": "durable committed raw-MBR identity"
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "/usr/bin/sync"
+      ],
+      "detail": "sync all durable state"
+    },
+    {
+      "kind": "reboot",
+      "argv": [
+        "/usr/bin/systemctl",
+        "reboot"
+      ],
+      "detail": "single controlled reboot"
+    }
+  ],
+  "authorization": {
+    "bootstrap_trigger": "dashcam.bootstrap=ssh-dev-v1",
+    "journal_schema_version": 2,
+    "cid": "fe34325344000000200000031a0192d1",
+    "size_bytes": 31457280000,
+    "sector_size": 512,
+    "source": {
+      "boot_start_sector": 16384,
+      "boot_size_sectors": 1048576,
+      "root_start_sector": 1064960,
+      "root_size_sectors": 4161536
+    }
+  },
+  "dry_run": true,
+  "evidence": {
+    "boot_id": "cf1614e7-35cb-42e1-9223-f2473dd80978",
+    "cloud_init_status": "done_known_degraded",
+    "disk": "/dev/mmcblk0",
+    "root_partition": "/dev/mmcblk0p2",
+    "cid": "fe34325344000000200000031a0192d1",
+    "size_bytes": 31457280000,
+    "sector_size": 512,
+    "mbr_sha256": "2487b1f9af5151759ad1ec762d077424736d38d01a68b72b8d6d4e1634545c3a",
+    "data_prefix_sha256": "8c01bea511d15baa18fdbecb8caf88af33f16811a4c7fb8da68a4ea26a22a058",
+    "partitions": [
+      {
+        "number": 1,
+        "start_sector": 16384,
+        "size_sectors": 1048576,
+        "type_code": 12,
+        "bootable": false
+      },
+      {
+        "number": 2,
+        "start_sector": 1064960,
+        "size_sectors": 4161536,
+        "type_code": 131,
+        "bootable": false
+      }
+    ]
+  },
+  "journal": {
+    "schema_version": 2,
+    "phase": "stage_a_intent",
+    "source_mbr_sha256": "2487b1f9af5151759ad1ec762d077424736d38d01a68b72b8d6d4e1634545c3a",
+    "data_prefix_sha256": "8c01bea511d15baa18fdbecb8caf88af33f16811a4c7fb8da68a4ea26a22a058",
+    "committed_mbr_sha256": null,
+    "refusal_code": null,
+    "refusal_message": null,
+    "target": {
+      "total_sectors": 61440000,
+      "sector_size": 512,
+      "root": {
+        "number": 2,
+        "start_sector": 1064960,
+        "size_sectors": 12582912,
+        "type_code": 131,
+        "bootable": false
+      },
+      "data": {
+        "number": 3,
+        "start_sector": 13647872,
+        "size_sectors": 47790080,
+        "type_code": 7,
+        "bootable": false
+      }
+    }
+  },
+  "outcome": "ready",
+  "ready": true,
+  "refusal": null,
+  "schema_version": 1,
+  "stage": "a"
+}

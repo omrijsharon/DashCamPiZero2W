@@ -253,6 +253,10 @@ def plan_post_anchor_reconciliation(
         raise MetadataReconciliationError("created_monotonic_ns must be a non-negative integer")
 
     parsed_source = parse_clip_filename(sidecar.video_file)
+    if parsed_source.boot_id != sidecar.boot_id.hex[:12]:
+        raise MetadataReconciliationError(
+            "filename boot token does not match the sidecar boot UUID"
+        )
     if not parsed_source.provisional:
         return MetadataReconciliationPlan(sidecar, None, True)
 

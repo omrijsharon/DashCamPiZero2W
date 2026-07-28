@@ -1,0 +1,40 @@
+[Unit]
+Description=Fail-closed dashcam recording-volume preflight
+Before=dashcamd.service
+After=local-fs.target dashcam-bootstrap-stage-b.service
+ConditionPathExists=/var/lib/dashcam/provisioning/layout-v1.complete.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=dashcam
+Group=dashcam
+SupplementaryGroups=dashcam-storage
+ExecStart=/opt/dashcam/current/venv/bin/python -m dashcam.storage.preflight --config /etc/dashcam/config.toml --identity /etc/dashcam/storage-volume.env
+TimeoutStartSec=20s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=no
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/etc/dashcam
+ReadWritePaths=/srv/dashcam
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

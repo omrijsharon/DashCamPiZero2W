@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import UUID
 
 import pytest
@@ -115,7 +116,13 @@ def _canonical_sidecar(
     return sidecar.to_canonical_json()
 
 
-def _inject_pending_intent(database: Path, intent: OperationIntent) -> None:
+def _inject_pending_intent(
+    database: Path,
+    intent: OperationIntent,
+    *,
+    reconciliation_sidecar: bytes | None = None,
+    reconciliation_source_sha256: str | None = None,
+) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
             """
@@ -123,8 +130,9 @@ def _inject_pending_intent(database: Path, intent: OperationIntent) -> None:
                 intent_id, clip_id, kind, created_monotonic_ns,
                 video_source, sidecar_source, video_target, sidecar_target,
                 status, last_problem, completed_monotonic_ns,
-                expected_protection_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL)
+                expected_protection_revision, reconciliation_sidecar,
+                reconciliation_source_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, ?, ?)
             """,
             (
                 str(intent.intent_id),
@@ -135,6 +143,8 @@ def _inject_pending_intent(database: Path, intent: OperationIntent) -> None:
                 intent.paths.sidecar_source,
                 intent.paths.video_target,
                 intent.paths.sidecar_target,
+                reconciliation_sidecar,
+                reconciliation_source_sha256,
             ),
         )
         connection.execute(
@@ -344,6 +354,8 @@ def test_startup_rebuilds_pending_pair_as_non_retention_eligible(
         assert recovered.lifecycle is ClipLifecycle.FINALIZING
         assert not recovered.pair_reconciled
         assert report.imported_clips == 1
+        assert not report.more_work
+        assert catalog.list_pending_intents(limit=1) == ()
         assert not any("settings.json" in issue for issue in report.issues)
         assert (
             catalog.plan_retention(
@@ -500,10 +512,45 @@ def test_event_survives_inflight_finalize_or_name_reconciliation(
         created_monotonic_ns=10,
         paths=target_paths,
     )
+    if kind is IntentKind.FINALIZE:
+        (root / registered.sidecar_path).write_bytes(
+            _canonical_sidecar(
+                clip_id=registered.clip_id,
+                pair=target_pair,
+                sequence=9,
+                start_monotonic_ns=registered.start_monotonic_ns,
+            )
+        )
+        reconciliation_sidecar = None
+        reconciliation_source_sha256 = None
+    else:
+        source_pair = ClipFilePair(
+            PurePosixPath(registered.video_path).name,
+            PurePosixPath(registered.sidecar_path).name,
+        )
+        source_payload = _canonical_sidecar(
+            clip_id=registered.clip_id,
+            pair=source_pair,
+            sequence=1,
+            start_monotonic_ns=registered.start_monotonic_ns,
+        )
+        reconciliation_sidecar = _canonical_sidecar(
+            clip_id=registered.clip_id,
+            pair=target_pair,
+            sequence=9,
+            start_monotonic_ns=registered.start_monotonic_ns,
+        )
+        reconciliation_source_sha256 = hashlib.sha256(source_payload).hexdigest()
+        (root / registered.sidecar_path).write_bytes(source_payload)
 
     with ClipCatalog(database) as catalog:
         catalog.register_clip(registered)
-    _inject_pending_intent(database, intent)
+    _inject_pending_intent(
+        database,
+        intent,
+        reconciliation_sidecar=reconciliation_sidecar,
+        reconciliation_source_sha256=reconciliation_source_sha256,
+    )
 
     with ClipCatalog(database) as catalog:
         event = catalog.trigger_event(

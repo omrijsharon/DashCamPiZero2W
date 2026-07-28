@@ -20,11 +20,13 @@ from dashcam.storage.preflight import (
     PreflightFactsError,
     PreflightPolicy,
     PreflightReason,
+    PreflightRuntimeError,
     ProbeFile,
     StorageIdentityError,
     load_storage_identity,
     policy_from_identity,
     recording_root_facts_from_mapping,
+    run_live_storage_preflight,
     run_storage_preflight,
     storage_identity_from_env,
 )
@@ -335,6 +337,73 @@ def test_storage_identity_handoff_is_closed_and_builds_exact_policy() -> None:
     assert policy.reserve_bytes == 2 * GIB
 
 
+def test_live_preflight_binds_fresh_facts_and_probe_to_identity() -> None:
+    identity = storage_identity_from_env(_identity_payload())
+    raw = _facts()
+    calls: list[tuple[str, str]] = []
+    filesystem = FakeFilesystem()
+
+    class Collector:
+        def collect(self, recording_root: str) -> Mapping[str, object]:
+            assert recording_root == "/srv/dashcam"
+            return raw
+
+    def filesystem_factory(
+        *,
+        recording_root: str,
+        expected_device_id: str,
+    ) -> FakeFilesystem:
+        calls.append((recording_root, expected_device_id))
+        return filesystem
+
+    result = run_live_storage_preflight(
+        default_config(),
+        identity_path="/fixture/storage-volume.env",
+        identity_loader=lambda path: identity,
+        facts_collector=Collector(),
+        filesystem_factory=filesystem_factory,
+    )
+
+    assert result.ready
+    assert calls == [("/srv/dashcam", "179:3")]
+    assert filesystem.calls
+
+
+def test_live_preflight_refuses_before_probe_when_mount_is_absent() -> None:
+    identity = storage_identity_from_env(_identity_payload())
+    raw = _facts()
+    mount = _nested(raw, "mount")
+    mount.update(
+        {
+            "mounted": False,
+            "source": None,
+            "filesystem": None,
+            "label": None,
+            "uuid": None,
+            "device_id": None,
+        }
+    )
+    raw["space"] = {"capacity_bytes": None, "free_bytes": None}
+    raw["sentinel"] = None
+    filesystem = FakeFilesystem()
+
+    class Collector:
+        def collect(self, recording_root: str) -> Mapping[str, object]:
+            return raw
+
+    result = run_live_storage_preflight(
+        default_config(),
+        identity_path="/fixture/storage-volume.env",
+        identity_loader=lambda path: identity,
+        facts_collector=Collector(),
+        filesystem_factory=lambda **kwargs: filesystem,
+    )
+
+    assert not result.ready
+    assert PreflightReason.UNMOUNTED in result.reasons
+    assert filesystem.calls == []
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -412,13 +481,72 @@ def test_posix_sentinel_reader_requires_canonical_regular_non_symlink_json(
         preflight_module._read_canonical_sentinel(str(tmp_path), device_id)
 
 
-def test_findmnt_parser_accepts_one_bounded_row_and_rejects_multiple(
+def test_findmnt_parser_accepts_singleton_and_exact_systemd_bind_duplicate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    findmnt_row = {
+        "target": "/srv/dashcam",
+        "source": "/dev/mmcblk0p3",
+        "fstype": "exfat",
+        "label": "DASHCAM",
+        "uuid": UUID,
+        "options": "rw,noatime",
+        "maj:min": "179:3",
+    }
+
     class Completed:
         returncode = 0
         stderr = b""
-        stdout = json.dumps(
+        stdout = json.dumps({"filesystems": [findmnt_row]}).encode()
+
+    monkeypatch.setattr(
+        "dashcam.storage.preflight.subprocess.run", lambda *args, **kwargs: Completed()
+    )
+    row = PosixFactsCollector()._find_mount("/srv/dashcam")
+    assert row is not None
+    assert row["uuid"] == UUID
+
+    Completed.stdout = json.dumps({"filesystems": [findmnt_row, findmnt_row]}).encode()
+    duplicate_row = PosixFactsCollector()._find_mount("/srv/dashcam")
+    assert duplicate_row == row
+
+
+def test_findmnt_parser_refuses_differing_duplicates_and_excessive_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    findmnt_row = {
+        "target": "/srv/dashcam",
+        "source": "/dev/mmcblk0p3",
+        "fstype": "exfat",
+        "label": "DASHCAM",
+        "uuid": UUID,
+        "options": "rw,noatime",
+        "maj:min": "179:3",
+    }
+
+    class Completed:
+        returncode = 0
+        stderr = b""
+        stdout = b""
+
+    monkeypatch.setattr(
+        "dashcam.storage.preflight.subprocess.run", lambda *args, **kwargs: Completed()
+    )
+    differing = dict(findmnt_row)
+    differing["options"] = "rw,relatime"
+    Completed.stdout = json.dumps({"filesystems": [findmnt_row, differing]}).encode()
+    with pytest.raises(PreflightRuntimeError, match="differing"):
+        PosixFactsCollector()._find_mount("/srv/dashcam")
+
+    Completed.stdout = json.dumps({"filesystems": [findmnt_row] * 3}).encode()
+    with pytest.raises(PreflightRuntimeError, match="bound"):
+        PosixFactsCollector()._find_mount("/srv/dashcam")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        json.dumps(
             {
                 "filesystems": [
                     {
@@ -429,22 +557,31 @@ def test_findmnt_parser_accepts_one_bounded_row_and_rejects_multiple(
                         "uuid": UUID,
                         "options": "rw,noatime",
                         "maj:min": "179:3",
+                        "children": [],
                     }
                 ]
             }
-        ).encode()
+        ).encode(),
+        (
+            b'{"filesystems":[{"target":"/srv/dashcam","source":"/dev/mmcblk0p3",'
+            b'"fstype":"exfat","label":"DASHCAM","uuid":"A1B2-C3D4",'
+            b'"uuid":"A1B2-C3D4","options":"rw,noatime","maj:min":"179:3"}]}'
+        ),
+    ],
+)
+def test_findmnt_parser_refuses_nested_extra_fields_and_duplicate_json_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    class Completed:
+        returncode = 0
+        stderr = b""
+        stdout = payload
 
     monkeypatch.setattr(
         "dashcam.storage.preflight.subprocess.run", lambda *args, **kwargs: Completed()
     )
-    row = PosixFactsCollector()._find_mount("/srv/dashcam")
-    assert row is not None
-    assert row["uuid"] == UUID
-
-    Completed.stdout = json.dumps(
-        {"filesystems": [{"target": "/srv/dashcam"}, {"target": "/srv/dashcam"}]}
-    ).encode()
-    with pytest.raises(Exception, match="exactly one"):
+    with pytest.raises(PreflightRuntimeError):
         PosixFactsCollector()._find_mount("/srv/dashcam")
 
 

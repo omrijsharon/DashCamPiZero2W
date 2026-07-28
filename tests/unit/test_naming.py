@@ -8,6 +8,7 @@ import pytest
 from dashcam.storage.naming import (
     ClipNameError,
     finalized_clip_pair,
+    finalized_unsynced_clip_pair,
     parse_clip_filename,
     parse_clip_id,
     provisional_clip_pair,
@@ -23,6 +24,18 @@ def test_provisional_pair_is_windows_safe_and_deterministic() -> None:
     assert (
         pair.relative_paths("pending")[0].as_posix() == "pending/boot-ba1b2c3d4-000123.partial.mp4"
     )
+    assert parse_clip_filename(pair.video_name).partial
+
+
+def test_finalized_unsynced_pair_removes_the_active_suffix() -> None:
+    pair = finalized_unsynced_clip_pair(boot_id="ba1b2c3d4", sequence=123)
+    parsed = parse_clip_filename(pair.video_name)
+
+    assert pair.video_name == "boot-ba1b2c3d4-000123.mp4"
+    assert pair.metadata_name == "boot-ba1b2c3d4-000123.json"
+    assert parsed.provisional
+    assert not parsed.partial
+    assert parsed.utc_started_at is None
 
 
 def test_final_name_is_utc_and_independent_of_local_dst() -> None:
@@ -34,6 +47,7 @@ def test_final_name_is_utc_and_independent_of_local_dst() -> None:
     assert pair.video_name == "20260701T000405.123Z_ba1b2c3d4_s000123.mp4"
     assert parsed.utc_started_at == datetime(2026, 7, 1, 0, 4, 5, 123000, tzinfo=UTC)
     assert parsed.provisional is False
+    assert parsed.partial is False
 
 
 def test_pairing_and_collision_refusal_cover_both_members() -> None:

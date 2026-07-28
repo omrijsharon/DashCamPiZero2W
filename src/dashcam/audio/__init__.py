@@ -10,6 +10,15 @@ from dashcam.audio.alsa import (
     parse_alsa_selector,
     resolve_capture_device,
 )
+from dashcam.audio.linux import (
+    AudioDiscoveryError,
+    AudioDiscoveryOutcome,
+    AudioDiscoveryStatus,
+    CapturePcmNode,
+    discover_capture_device,
+    enumerate_capture_pcm_nodes,
+    parse_udev_properties,
+)
 
 __all__ = [
     "AlsaCaptureDevice",
@@ -18,6 +27,13 @@ __all__ = [
     "AlsaMatchOutcome",
     "AlsaMatchStatus",
     "AlsaSelector",
+    "AudioDiscoveryError",
+    "AudioDiscoveryOutcome",
+    "AudioDiscoveryStatus",
+    "CapturePcmNode",
+    "discover_capture_device",
+    "enumerate_capture_pcm_nodes",
     "parse_alsa_selector",
+    "parse_udev_properties",
     "resolve_capture_device",
 ]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -16,9 +16,30 @@ from dashcam.catalog import (
     CatalogConflictError,
     ClipCatalog,
     EventSource,
+    RootedFilesystem,
 )
-from dashcam.state import MAX_DOWNLOAD_LEASE_NS, ClipLifecycle, DownloadLeaseError
-from dashcam.storage.naming import finalized_clip_pair
+from dashcam.metadata.schema import (
+    AudioSummary,
+    ClipSidecar,
+    GpsSummary,
+    TimeAnchor,
+    TimeAnchorSource,
+    VideoSummary,
+)
+from dashcam.state import (
+    MAX_DOWNLOAD_LEASE_NS,
+    ClipLifecycle,
+    DownloadLeaseError,
+    GpsTimeState,
+    SystemClockState,
+    TimestampQuality,
+)
+from dashcam.storage.intents import IntentKind, PairPaths
+from dashcam.storage.naming import (
+    finalized_clip_pair,
+    finalized_unsynced_clip_pair,
+    provisional_clip_pair,
+)
 
 
 def _clip(
@@ -49,6 +70,94 @@ def _clip(
     )
 
 
+def _unsynced_clip(
+    number: int,
+    boot_id: UUID,
+    *,
+    directory: str = "clips",
+) -> CatalogClip:
+    pair = finalized_unsynced_clip_pair(
+        boot_id=boot_id.hex[:12],
+        sequence=number,
+    )
+    return CatalogClip(
+        clip_id=UUID(int=10_000 + number),
+        lifecycle=ClipLifecycle.FINALIZED,
+        video_path=f"{directory}/{pair.video_name}",
+        sidecar_path=f"{directory}/{pair.metadata_name}",
+        start_monotonic_ns=number * 1_000,
+        end_monotonic_ns=number * 1_000 + 500,
+        retention_order=number,
+        size_bytes=100,
+        protected=directory == "protected",
+        protection_reason="fixture" if directory == "protected" else None,
+        pair_reconciled=True,
+        managed=True,
+    )
+
+
+def _finalizing_fixture() -> tuple[CatalogClip, PairPaths, bytes]:
+    clip_id = UUID(int=1)
+    started_at = datetime(2026, 7, 24, 0, 0, 1, tzinfo=UTC)
+    source = provisional_clip_pair(boot_id="abcde", sequence=1)
+    target = finalized_clip_pair(
+        utc_started_at=started_at,
+        boot_id="abcde",
+        sequence=1,
+    )
+    clip = CatalogClip(
+        clip_id=clip_id,
+        lifecycle=ClipLifecycle.FINALIZING,
+        video_path=f"pending/{source.video_name}",
+        sidecar_path=f"pending/{source.metadata_name}",
+        start_monotonic_ns=100,
+        end_monotonic_ns=1_000_000_100,
+        retention_order=1,
+        size_bytes=5,
+        protected=False,
+        protection_reason=None,
+        pair_reconciled=False,
+        managed=True,
+    )
+    paths = PairPaths(
+        clip.video_path,
+        clip.sidecar_path,
+        f"clips/{target.video_name}",
+        f"clips/{target.metadata_name}",
+    )
+    sidecar = ClipSidecar(
+        schema_version=1,
+        clip_id=clip_id,
+        boot_id=UUID("00000000-0000-0000-0000-000000000001"),
+        sequence=1,
+        video_file=target.video_name,
+        metadata_file=target.metadata_name,
+        start_utc=started_at,
+        end_utc=started_at + timedelta(seconds=1),
+        start_monotonic_ns=100,
+        end_monotonic_ns=1_000_000_100,
+        gps_time_state=GpsTimeState.UNSYNCED,
+        system_clock_state=SystemClockState.SYNCHRONIZED,
+        timestamp_quality=TimestampQuality.SYSTEM_DERIVED,
+        time_anchor=TimeAnchor(
+            TimeAnchorSource.SYSTEM_CLOCK,
+            100,
+            started_at,
+            1,
+            "catalog test",
+        ),
+        timezone="UTC",
+        start_local=started_at,
+        video=VideoSummary("h264", 1920, 1080, 30.0, 8_000_000, 8_000_000, 1, 0),
+        audio=AudioSummary(False, None, None, None, None),
+        gps=GpsSummary(False, None),
+        protected=False,
+        protection_reason=None,
+        software_version="test",
+    )
+    return clip, paths, sidecar.to_canonical_json()
+
+
 def test_migrations_are_explicit_versioned_and_reopen_cleanly(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
 
@@ -60,6 +169,55 @@ def test_migrations_are_explicit_versioned_and_reopen_cleanly(tmp_path: Path) ->
         assert reopened.schema_version == SCHEMA_VERSION
         assert reopened.get_clip(UUID(int=1)) == _clip(1)
 
+
+def test_metadata_candidates_page_all_current_boot_pairs_across_process_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    boot_id = UUID("12345678-1234-5678-9234-567812345678")
+    other_boot = UUID("87654321-4321-6789-a234-678943216789")
+    with ClipCatalog(database) as catalog:
+        for number in range(70):
+            catalog.register_clip(
+                _unsynced_clip(
+                    number,
+                    boot_id,
+                    directory="protected" if number == 69 else "clips",
+                )
+            )
+        catalog.register_clip(_unsynced_clip(70, other_boot))
+        catalog.register_clip(replace(_clip(8), retention_order=80))
+
+        first = catalog.list_metadata_reconciliation_candidates(
+            boot_id,
+            limit=64,
+        )
+        assert len(first) == 64
+        second = catalog.list_metadata_reconciliation_candidates(
+            boot_id,
+            limit=64,
+            after_order=first[-1].retention_order,
+            after_clip_id=first[-1].clip_id,
+        )
+        assert len(second) == 6
+        assert {clip.clip_id for clip in first + second} == {
+            UUID(int=10_000 + number) for number in range(70)
+        }
+
+    with ClipCatalog(database) as reopened:
+        restarted = reopened.list_metadata_reconciliation_candidates(
+            boot_id,
+            limit=64,
+        )
+        assert restarted == first
+        assert (
+            reopened.list_metadata_reconciliation_candidates(
+                other_boot,
+                limit=64,
+            )
+            == (_unsynced_clip(70, other_boot),)
+        )
+
     with sqlite3.connect(database) as connection:
         migrations = connection.execute(
             "SELECT version, name FROM schema_migrations ORDER BY version"
@@ -69,8 +227,101 @@ def test_migrations_are_explicit_versioned_and_reopen_cleanly(tmp_path: Path) ->
         (1, "create_clip_catalog"),
         (2, "add_event_protection"),
         (3, "add_protection_revisions"),
+        (4, "add_name_reconciliation_payload"),
     ]
     assert journal_mode == ("wal",)
+
+
+def test_finalizing_registration_atomically_queues_and_reconciles_pair(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "recording"
+    for directory in ("pending", "clips", "protected", "quarantine"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    clip, paths, sidecar = _finalizing_fixture()
+    (root / clip.video_path).write_bytes(b"video")
+    (root / clip.sidecar_path).write_bytes(sidecar)
+    filesystem = RootedFilesystem(root)
+
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        intent_id = catalog.register_finalizing_clip(
+            clip,
+            promotion_paths=paths,
+            monotonic_now_ns=200,
+        )
+        intent = catalog.list_pending_intents(limit=1)[0]
+        assert intent.intent_id == intent_id
+        assert intent.kind is IntentKind.FINALIZE
+        assert intent.paths.video_source == clip.video_path
+        assert intent.paths.video_target is not None
+        assert intent.paths.video_target.startswith("clips/")
+
+        result = catalog.reconcile_intent(
+            intent_id,
+            filesystem,
+            monotonic_now_ns=201,
+            max_actions=2,
+        )
+        finalized = catalog.get_clip(clip.clip_id)
+
+    assert result.complete
+    assert finalized.lifecycle is ClipLifecycle.FINALIZED
+    assert finalized.pair_reconciled
+    assert not (root / clip.video_path).exists()
+    assert not (root / clip.sidecar_path).exists()
+    assert (root / finalized.video_path).read_bytes() == b"video"
+    assert (root / finalized.sidecar_path).read_bytes() == sidecar
+
+
+def test_finalizing_registration_refuses_non_pending_or_incomplete_state(
+    tmp_path: Path,
+) -> None:
+    base, paths, _ = _finalizing_fixture()
+    with (
+        ClipCatalog(tmp_path / "catalog.sqlite3") as catalog,
+        pytest.raises(CatalogConflictError, match="finalization registration"),
+    ):
+        catalog.register_finalizing_clip(
+            replace(base, end_monotonic_ns=None),
+            promotion_paths=paths,
+            monotonic_now_ns=200,
+        )
+
+
+def test_finalizing_registration_latches_target_collision_without_mutation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "recording"
+    for directory in ("pending", "clips", "protected", "quarantine"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    clip, paths, sidecar = _finalizing_fixture()
+    (root / clip.video_path).write_bytes(b"source-video")
+    (root / clip.sidecar_path).write_bytes(sidecar)
+    assert paths.video_target is not None
+    target_video = root / paths.video_target
+    target_video.write_bytes(b"existing-video")
+
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        intent_id = catalog.register_finalizing_clip(
+            clip,
+            promotion_paths=paths,
+            monotonic_now_ns=200,
+        )
+        result = catalog.reconcile_intent(
+            intent_id,
+            RootedFilesystem(root),
+            monotonic_now_ns=201,
+            max_actions=2,
+        )
+        pending = catalog.list_pending_intents(limit=1)
+
+    assert not result.complete
+    assert result.actions_attempted == 0
+    assert result.problems == ("SOURCE_TARGET_CONFLICT",)
+    assert pending[0].intent_id == intent_id
+    assert (root / clip.video_path).read_bytes() == b"source-video"
+    assert (root / clip.sidecar_path).read_bytes() == sidecar
+    assert target_video.read_bytes() == b"existing-video"
 
 
 def test_catalog_refuses_a_newer_database_schema(tmp_path: Path) -> None:

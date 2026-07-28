@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 import threading
@@ -23,7 +24,13 @@ from dashcam.catalog.models import (
     ReconciliationBounds,
     StartupReconciliationReport,
 )
-from dashcam.metadata.reconcile import SidecarParseError, parse_sidecar_bytes
+from dashcam.metadata.reconcile import (
+    MAX_SIDECAR_BYTES,
+    MetadataReconciliationPlan,
+    SidecarParseError,
+    parse_sidecar_bytes,
+)
+from dashcam.metadata.schema import ClipSidecar
 from dashcam.state import (
     ClipLifecycle,
     DownloadLease,
@@ -45,7 +52,7 @@ from dashcam.storage.retention import (
     select_oldest_eligible,
 )
 
-SCHEMA_VERSION: Final = 3
+SCHEMA_VERSION: Final = 4
 MAX_PENDING_EVENT_WINDOWS: Final = 64
 MAX_QUERY_ROWS: Final = 10_000
 _MAX_REASON_CHARS: Final = 256
@@ -174,6 +181,20 @@ _MIGRATIONS: Final[tuple[tuple[int, str, tuple[str, ...]], ...]] = (
             """,
         ),
     ),
+    (
+        4,
+        "add_name_reconciliation_payload",
+        (
+            """
+            ALTER TABLE operation_intents
+            ADD COLUMN reconciliation_sidecar BLOB
+            """,
+            """
+            ALTER TABLE operation_intents
+            ADD COLUMN reconciliation_source_sha256 TEXT
+            """,
+        ),
+    ),
 )
 
 
@@ -219,51 +240,186 @@ class ClipCatalog:
         with self._lock:
             self._connection.close()
 
+    def next_retention_order(self) -> int:
+        """Allocate the next single-owner global ordering value."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COALESCE(MAX(retention_order), -1) + 1 FROM clips"
+            ).fetchone()
+        assert row is not None
+        value = int(row[0])
+        if not 0 <= value <= 9_223_372_036_854_775_807:
+            raise CatalogConflictError("retention ordering space is exhausted")
+        return value
+
     def register_clip(self, clip: CatalogClip, *, catalog_now_ns: int = 0) -> None:
         """Insert one new managed clip without overwriting existing durable state."""
 
         _validate_clip(clip)
         _non_negative_integer(catalog_now_ns, "catalog_now_ns")
         with self._transaction():
+            self._insert_clip_locked(clip, catalog_now_ns=catalog_now_ns)
+
+    def register_finalizing_clip(
+        self,
+        clip: CatalogClip,
+        *,
+        promotion_paths: PairPaths,
+        monotonic_now_ns: int,
+    ) -> UUID:
+        """Atomically register one durable pending-to-clips pair move.
+
+        The caller must durably create both pending members before this
+        transaction. A crash after commit is recovered from the FINALIZE intent;
+        a target collision remains a latched reconciliation problem.
+        """
+
+        _validate_clip(clip)
+        if not isinstance(promotion_paths, PairPaths):
+            raise TypeError("promotion_paths must be PairPaths")
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        source_directory = PurePosixPath(clip.video_path).parent.as_posix()
+        target_video = promotion_paths.video_target
+        target_sidecar = promotion_paths.sidecar_target
+        if (
+            clip.lifecycle is not ClipLifecycle.FINALIZING
+            or clip.end_monotonic_ns is None
+            or source_directory != "pending"
+            or clip.pair_reconciled
+            or not clip.managed
+            or clip.download_lease is not None
+            or promotion_paths.video_source != clip.video_path
+            or promotion_paths.sidecar_source != clip.sidecar_path
+            or target_video is None
+            or target_sidecar is None
+            or PurePosixPath(target_video).parent.as_posix() != "clips"
+            or PurePosixPath(target_sidecar).parent.as_posix() != "clips"
+        ):
+            raise CatalogConflictError(
+                "finalization registration requires one managed unreconciled "
+                "pending FINALIZING clip and explicit clips targets"
+            )
+        source_video_name = PurePosixPath(clip.video_path).name
+        source_sidecar_name = PurePosixPath(clip.sidecar_path).name
+        target_video_name = PurePosixPath(target_video).name
+        target_sidecar_name = PurePosixPath(target_sidecar).name
+        try:
+            ClipFilePair(source_video_name, source_sidecar_name)
+            ClipFilePair(target_video_name, target_sidecar_name)
+            source_identity = parse_clip_filename(source_video_name)
+            target_identity = parse_clip_filename(target_video_name)
+        except ClipNameError as exc:
+            raise CatalogConflictError("finalization paths are not a safe clip pair") from exc
+        if (
+            not source_identity.partial
+            or target_identity.partial
+            or source_identity.boot_id != target_identity.boot_id
+            or source_identity.sequence != target_identity.sequence
+        ):
+            raise CatalogConflictError(
+                "finalization targets must remove the partial suffix without "
+                "changing clip identity"
+            )
+        with self._transaction():
+            self._insert_clip_locked(clip, catalog_now_ns=monotonic_now_ns)
+            intent = self._insert_intent_locked(
+                clip.clip_id,
+                kind=IntentKind.FINALIZE,
+                paths=promotion_paths,
+                monotonic_now_ns=monotonic_now_ns,
+            )
+        return intent.intent_id
+
+    def register_name_reconciliation(
+        self,
+        plan: MetadataReconciliationPlan,
+        *,
+        source_sidecar: ClipSidecar,
+        monotonic_now_ns: int,
+    ) -> UUID:
+        """Persist all recovery data before replacing or renaming either member."""
+
+        if not isinstance(plan, MetadataReconciliationPlan) or plan.intent is None:
+            raise TypeError("plan must contain a name-reconciliation intent")
+        if not isinstance(source_sidecar, ClipSidecar):
+            raise TypeError("source_sidecar must be a ClipSidecar")
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        intent = plan.intent
+        if (
+            intent.kind is not IntentKind.RECONCILE_NAME
+            or intent.created_monotonic_ns != monotonic_now_ns
+            or source_sidecar.clip_id != plan.sidecar.clip_id
+            or source_sidecar.clip_id != intent.clip_id
+            or source_sidecar.video_file
+            != PurePosixPath(intent.paths.video_source).name
+            or source_sidecar.metadata_file
+            != PurePosixPath(intent.paths.sidecar_source).name
+            or plan.sidecar.video_file
+            != PurePosixPath(cast(str, intent.paths.video_target)).name
+            or plan.sidecar.metadata_file
+            != PurePosixPath(cast(str, intent.paths.sidecar_target)).name
+            or source_sidecar.start_monotonic_ns != plan.sidecar.start_monotonic_ns
+            or source_sidecar.end_monotonic_ns != plan.sidecar.end_monotonic_ns
+        ):
+            raise CatalogConflictError("name-reconciliation plan has inconsistent identity")
+        source_payload = source_sidecar.to_canonical_json()
+        target_payload = plan.sidecar.to_canonical_json()
+        if len(source_payload) > MAX_SIDECAR_BYTES or len(target_payload) > MAX_SIDECAR_BYTES:
+            raise CatalogConflictError("name-reconciliation sidecar exceeds its byte bound")
+        try:
+            source_name = parse_clip_filename(source_sidecar.video_file)
+            target_name = parse_clip_filename(plan.sidecar.video_file)
+        except ClipNameError as exc:
+            raise CatalogConflictError("name-reconciliation filenames are invalid") from exc
+        if (
+            source_name.partial
+            or not source_name.provisional
+            or target_name.provisional
+            or target_name.partial
+            or source_name.boot_id != target_name.boot_id
+            or source_name.sequence != target_name.sequence
+        ):
+            raise CatalogConflictError("name reconciliation must preserve clip identity")
+
+        with self._transaction():
+            row = self._required_clip_row(intent.clip_id)
+            if (
+                ClipLifecycle(str(row["lifecycle"])) is not ClipLifecycle.FINALIZED
+                or not bool(row["pair_reconciled"])
+                or not bool(row["managed"])
+                or row["lease_holder"] is not None
+                or str(row["video_path"]) != intent.paths.video_source
+                or str(row["sidecar_path"]) != intent.paths.sidecar_source
+                or self._pending_intent_row(intent.clip_id) is not None
+            ):
+                raise CatalogConflictError(
+                    "clip is not an idle reconciled finalized pair at the declared source"
+                )
+            source_directory = PurePosixPath(intent.paths.video_source).parent
+            if (
+                source_directory
+                != PurePosixPath(intent.paths.sidecar_source).parent
+                or source_directory
+                != PurePosixPath(cast(str, intent.paths.video_target)).parent
+                or source_directory
+                != PurePosixPath(cast(str, intent.paths.sidecar_target)).parent
+                or source_directory.as_posix() not in {"clips", "protected"}
+            ):
+                raise CatalogConflictError("name reconciliation must remain in one final directory")
+            self._insert_existing_intent_locked(
+                intent,
+                reconciliation_sidecar=target_payload,
+                reconciliation_source_sha256=hashlib.sha256(source_payload).hexdigest(),
+            )
             self._connection.execute(
                 """
-                INSERT INTO clips (
-                    clip_id, lifecycle, video_path, sidecar_path,
-                    start_monotonic_ns, end_monotonic_ns, retention_order,
-                    size_bytes, protected, protection_reason, pair_reconciled,
-                    managed, lease_holder, lease_issued_ns, lease_expires_ns,
-                    lease_boot_id, created_catalog_ns, updated_catalog_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE clips SET pair_reconciled = 0, updated_catalog_ns = ?
+                WHERE clip_id = ?
                 """,
-                (
-                    str(clip.clip_id),
-                    clip.lifecycle.value,
-                    clip.video_path,
-                    clip.sidecar_path,
-                    clip.start_monotonic_ns,
-                    clip.end_monotonic_ns,
-                    clip.retention_order,
-                    clip.size_bytes,
-                    int(clip.protected),
-                    clip.protection_reason,
-                    int(clip.pair_reconciled),
-                    int(clip.managed),
-                    None if clip.download_lease is None else clip.download_lease.holder,
-                    (
-                        None
-                        if clip.download_lease is None
-                        else clip.download_lease.issued_at_monotonic_ns
-                    ),
-                    (
-                        None
-                        if clip.download_lease is None
-                        else clip.download_lease.expires_at_monotonic_ns
-                    ),
-                    clip.lease_boot_id,
-                    catalog_now_ns,
-                    catalog_now_ns,
-                ),
+                (monotonic_now_ns, str(intent.clip_id)),
             )
+        return intent.intent_id
 
     def get_clip(self, clip_id: UUID) -> CatalogClip:
         _uuid(clip_id, "clip_id")
@@ -290,6 +446,82 @@ class ClipCatalog:
                 LIMIT ?
                 """,
                 (after_order, limit),
+            ).fetchall()
+        return tuple(_clip_from_row(row) for row in rows)
+
+    def list_metadata_reconciliation_candidates(
+        self,
+        expected_boot_id: UUID,
+        *,
+        limit: int,
+        after_order: int = -1,
+        after_clip_id: UUID | None = None,
+    ) -> tuple[CatalogClip, ...]:
+        """Return one bounded page of current-boot provisional finalized pairs."""
+
+        boot_id = _uuid(expected_boot_id, "expected_boot_id")
+        _row_limit(limit, "limit")
+        if (
+            isinstance(after_order, bool)
+            or not isinstance(after_order, int)
+            or after_order < -1
+        ):
+            raise ValueError("after_order must be an integer of at least -1")
+        cursor_id = UUID(int=0) if after_clip_id is None else _uuid(
+            after_clip_id, "after_clip_id"
+        )
+        short_boot_id = boot_id.hex[:12]
+        six_digits = "[0-9]" * 6
+        video_patterns = (
+            f"clips/boot-{short_boot_id}-{six_digits}.mp4",
+            f"protected/boot-{short_boot_id}-{six_digits}.mp4",
+        )
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT c.* FROM clips AS c
+                WHERE c.lifecycle = ?
+                  AND c.managed = 1
+                  AND c.lease_holder IS NULL
+                  AND c.sidecar_path =
+                      substr(c.video_path, 1, length(c.video_path) - 4) || '.json'
+                  AND (c.video_path GLOB ? OR c.video_path GLOB ?)
+                  AND (
+                        c.pair_reconciled = 1
+                        OR EXISTS (
+                            SELECT 1 FROM operation_intents AS active_name
+                            WHERE active_name.clip_id = c.clip_id
+                              AND active_name.status = 'PENDING'
+                              AND active_name.kind = ?
+                        )
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM operation_intents AS other_mutation
+                        WHERE other_mutation.clip_id = c.clip_id
+                          AND other_mutation.status = 'PENDING'
+                          AND other_mutation.kind <> ?
+                  )
+                  AND (
+                        c.retention_order > ?
+                        OR (
+                            c.retention_order = ?
+                            AND c.clip_id > ?
+                        )
+                  )
+                ORDER BY c.retention_order, c.clip_id
+                LIMIT ?
+                """,
+                (
+                    ClipLifecycle.FINALIZED.value,
+                    video_patterns[0],
+                    video_patterns[1],
+                    IntentKind.RECONCILE_NAME.value,
+                    IntentKind.RECONCILE_NAME.value,
+                    after_order,
+                    after_order,
+                    str(cursor_id),
+                    limit,
+                ),
             ).fetchall()
         return tuple(_clip_from_row(row) for row in rows)
 
@@ -806,6 +1038,46 @@ class ClipCatalog:
                     (";".join(problems), str(intent_id)),
                 )
                 return IntentReconciliationResult(intent, 0, False, problems)
+            if intent.kind is IntentKind.RECONCILE_NAME:
+                validation_problem = _prepare_name_reconciliation_sidecar(
+                    intent,
+                    row,
+                    filesystem,
+                )
+                if validation_problem is not None:
+                    self._connection.execute(
+                        "UPDATE operation_intents SET last_problem = ? WHERE intent_id = ?",
+                        (validation_problem, str(intent_id)),
+                    )
+                    return IntentReconciliationResult(
+                        intent,
+                        0,
+                        False,
+                        (validation_problem,),
+                    )
+            elif intent.kind is IntentKind.FINALIZE:
+                sidecar_path = (
+                    intent.paths.sidecar_source
+                    if filesystem.exists(intent.paths.sidecar_source)
+                    else intent.paths.sidecar_target
+                )
+                assert sidecar_path is not None
+                validation_problem = _validate_finalize_sidecar(
+                    intent,
+                    filesystem,
+                    sidecar_path=sidecar_path,
+                )
+                if validation_problem is not None:
+                    self._connection.execute(
+                        "UPDATE operation_intents SET last_problem = ? WHERE intent_id = ?",
+                        (validation_problem, str(intent_id)),
+                    )
+                    return IntentReconciliationResult(
+                        intent,
+                        0,
+                        False,
+                        (validation_problem,),
+                    )
             actions_attempted = 0
             for action in plan.actions[:max_actions]:
                 if action.kind is ActionKind.MOVE:
@@ -930,6 +1202,11 @@ class ClipCatalog:
                 elif outcome is not None:
                     _append_issue(issues, outcome, maximum=bounds.max_issues)
 
+        # Importing a complete pair from pending can atomically create a new
+        # FINALIZE intent after this pass's bounded intent phase has finished.
+        # Never report convergence while that durable work remains queued.
+        if self.list_pending_intents(limit=1):
+            more_work = True
         if len(issues) == bounds.max_issues:
             more_work = True
         return StartupReconciliationReport(
@@ -1023,6 +1300,47 @@ class ClipCatalog:
             (str(clip_id),),
         )
 
+    def _insert_clip_locked(self, clip: CatalogClip, *, catalog_now_ns: int) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO clips (
+                clip_id, lifecycle, video_path, sidecar_path,
+                start_monotonic_ns, end_monotonic_ns, retention_order,
+                size_bytes, protected, protection_reason, pair_reconciled,
+                managed, lease_holder, lease_issued_ns, lease_expires_ns,
+                lease_boot_id, created_catalog_ns, updated_catalog_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(clip.clip_id),
+                clip.lifecycle.value,
+                clip.video_path,
+                clip.sidecar_path,
+                clip.start_monotonic_ns,
+                clip.end_monotonic_ns,
+                clip.retention_order,
+                clip.size_bytes,
+                int(clip.protected),
+                clip.protection_reason,
+                int(clip.pair_reconciled),
+                int(clip.managed),
+                None if clip.download_lease is None else clip.download_lease.holder,
+                (
+                    None
+                    if clip.download_lease is None
+                    else clip.download_lease.issued_at_monotonic_ns
+                ),
+                (
+                    None
+                    if clip.download_lease is None
+                    else clip.download_lease.expires_at_monotonic_ns
+                ),
+                clip.lease_boot_id,
+                catalog_now_ns,
+                catalog_now_ns,
+            ),
+        )
+
     def _insert_intent_locked(
         self,
         clip_id: UUID,
@@ -1061,6 +1379,39 @@ class ClipCatalog:
             ),
         )
         return intent
+
+    def _insert_existing_intent_locked(
+        self,
+        intent: OperationIntent,
+        *,
+        reconciliation_sidecar: bytes | None = None,
+        reconciliation_source_sha256: str | None = None,
+    ) -> None:
+        if not isinstance(intent, OperationIntent):
+            raise TypeError("intent must be an OperationIntent")
+        self._connection.execute(
+            """
+            INSERT INTO operation_intents (
+                intent_id, clip_id, kind, created_monotonic_ns,
+                video_source, sidecar_source, video_target, sidecar_target,
+                status, last_problem, completed_monotonic_ns,
+                expected_protection_revision, reconciliation_sidecar,
+                reconciliation_source_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, ?, ?)
+            """,
+            (
+                str(intent.intent_id),
+                str(intent.clip_id),
+                intent.kind.value,
+                intent.created_monotonic_ns,
+                intent.paths.video_source,
+                intent.paths.sidecar_source,
+                intent.paths.video_target,
+                intent.paths.sidecar_target,
+                reconciliation_sidecar,
+                reconciliation_source_sha256,
+            ),
+        )
 
     def _prepare_protect_locked(
         self,
@@ -1550,6 +1901,100 @@ def _observe_plan(intent: OperationIntent, filesystem: CatalogFilesystem) -> Rec
             target_exists=sidecar_target,
         ),
     )
+
+
+def _validate_finalize_sidecar(
+    intent: OperationIntent,
+    filesystem: CatalogFilesystem,
+    *,
+    sidecar_path: str,
+) -> str | None:
+    """Validate the durable logical-pair identity before any FINALIZE move."""
+
+    try:
+        sidecar = parse_sidecar_bytes(
+            filesystem.read_bytes(sidecar_path, maximum_bytes=MAX_SIDECAR_BYTES)
+        )
+        assert intent.paths.video_target is not None
+        assert intent.paths.sidecar_target is not None
+        if (
+            sidecar.clip_id != intent.clip_id
+            or sidecar.video_file != PurePosixPath(intent.paths.video_target).name
+            or sidecar.metadata_file != PurePosixPath(intent.paths.sidecar_target).name
+        ):
+            return "FINALIZE_SIDECAR_IDENTITY_MISMATCH"
+    except (OSError, ValueError, SidecarParseError):
+        return "INVALID_FINALIZE_SIDECAR"
+    return None
+
+
+def _prepare_name_reconciliation_sidecar(
+    intent: OperationIntent,
+    intent_row: sqlite3.Row,
+    filesystem: CatalogFilesystem,
+) -> str | None:
+    """Recoverably install the target metadata before moving the pair names."""
+
+    raw_payload = intent_row["reconciliation_sidecar"]
+    raw_source_hash = intent_row["reconciliation_source_sha256"]
+    if (
+        not isinstance(raw_payload, bytes)
+        or not raw_payload
+        or len(raw_payload) > MAX_SIDECAR_BYTES
+        or not isinstance(raw_source_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", raw_source_hash) is None
+    ):
+        return "NAME_RECONCILIATION_RECOVERY_DATA_MISSING"
+    try:
+        target_sidecar = parse_sidecar_bytes(raw_payload)
+        video_target = cast(str, intent.paths.video_target)
+        sidecar_target = cast(str, intent.paths.sidecar_target)
+        if (
+            target_sidecar.clip_id != intent.clip_id
+            or target_sidecar.video_file != PurePosixPath(video_target).name
+            or target_sidecar.metadata_file != PurePosixPath(sidecar_target).name
+        ):
+            return "NAME_RECONCILIATION_TARGET_IDENTITY_MISMATCH"
+
+        if filesystem.exists(intent.paths.sidecar_source):
+            current_payload = filesystem.read_bytes(
+                intent.paths.sidecar_source,
+                maximum_bytes=MAX_SIDECAR_BYTES,
+            )
+            if current_payload != raw_payload:
+                if hashlib.sha256(current_payload).hexdigest() != raw_source_hash:
+                    return "NAME_RECONCILIATION_SOURCE_CHANGED"
+                current_sidecar = parse_sidecar_bytes(current_payload)
+                if (
+                    current_sidecar.clip_id != intent.clip_id
+                    or current_sidecar.video_file
+                    != PurePosixPath(intent.paths.video_source).name
+                    or current_sidecar.metadata_file
+                    != PurePosixPath(intent.paths.sidecar_source).name
+                ):
+                    return "NAME_RECONCILIATION_SOURCE_IDENTITY_MISMATCH"
+                filesystem.replace_bytes_atomic(
+                    intent.paths.sidecar_source,
+                    raw_payload,
+                    maximum_bytes=MAX_SIDECAR_BYTES,
+                )
+                if (
+                    filesystem.read_bytes(
+                        intent.paths.sidecar_source,
+                        maximum_bytes=MAX_SIDECAR_BYTES,
+                    )
+                    != raw_payload
+                ):
+                    return "NAME_RECONCILIATION_REPLACE_READBACK_MISMATCH"
+        elif filesystem.exists(sidecar_target):
+            if (
+                filesystem.read_bytes(sidecar_target, maximum_bytes=MAX_SIDECAR_BYTES)
+                != raw_payload
+            ):
+                return "NAME_RECONCILIATION_TARGET_PAYLOAD_MISMATCH"
+    except (OSError, ValueError, SidecarParseError):
+        return "INVALID_NAME_RECONCILIATION_SIDECAR"
+    return None
 
 
 def _move_paths(video_source: str, sidecar_source: str, target_directory: str) -> PairPaths:

@@ -14,13 +14,17 @@ import tomllib
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, TypeAlias, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from dashcam.audio.alsa import AlsaMatchError, parse_alsa_selector
+
 CURRENT_SCHEMA_VERSION: Final = 1
 MAX_CONFIG_BYTES: Final = 64 * 1024
 CONFIG_FILE_MODE: Final = 0o640
+SUPPORTED_GPS_BAUD_RATES: Final = frozenset({4_800, 9_600, 38_400, 57_600, 115_200})
 
 ConfigValue: TypeAlias = str | int | float | bool
 ConfigTable: TypeAlias = dict[str, "ConfigValue | ConfigTable"]
@@ -64,7 +68,10 @@ class VideoConfig:
 @dataclass(frozen=True, slots=True)
 class AudioConfig:
     enabled: bool = True
-    device_match: str = "usb-VID_PID-or-stable-name"
+    device_match: str = (
+        "usb:vid=08bb,pid=2902,product=USB_PnP_Sound_Device,"
+        "path=platform-3f980000.usb-usb-0:1:1.0"
+    )
     sample_rate_hz: int = 48_000
     channels: int = 1
     codec: str = "aac"
@@ -77,14 +84,20 @@ class GpsConfig:
     baud: int = 115_200
     stale_after_s: float = 2.0
     max_sample_hz: int = 10
+    anchor_earliest_utc: str = "2024-01-01T00:00:00Z"
+    anchor_latest_utc: str = "2100-01-01T00:00:00Z"
+    anchor_uncertainty_ms: int = 250
+    anchor_max_conflict_ms: int = 2_000
+    anchor_max_reacquire_disagreement_ms: int = 5_000
+    anchor_max_interval_s: int = 86_400
 
 
 @dataclass(frozen=True, slots=True)
 class TimeConfig:
     timezone: str = "Asia/Jerusalem"
     filename_timezone: str = "UTC"
-    discipline_system_clock: bool = True
-    system_clock_owner: str = "chrony"
+    discipline_system_clock: bool = False
+    system_clock_owner: str = "systemd-timesyncd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +306,7 @@ def _video(root: Mapping[str, object]) -> VideoConfig:
 def _audio(root: Mapping[str, object]) -> AudioConfig:
     fields = set(AudioConfig.__dataclass_fields__)
     table = _section(root, "audio", fields)
-    return AudioConfig(
+    config = AudioConfig(
         enabled=_boolean(table, "enabled", "audio"),
         device_match=_nonempty(_string(table, "device_match", "audio"), 256, "audio.device_match"),
         sample_rate_hz=_bounded_int(
@@ -311,6 +324,22 @@ def _audio(root: Mapping[str, object]) -> AudioConfig:
             "audio.bitrate_bps",
         ),
     )
+    if (
+        config.sample_rate_hz,
+        config.channels,
+        config.codec,
+        config.bitrate_bps,
+    ) != (48_000, 1, "aac", 128_000):
+        raise ConfigError(
+            "enabled audio must use the fixed production contract: "
+            "S16LE/48000/mono AAC at 128000 bit/s"
+        )
+    if config.enabled:
+        try:
+            parse_alsa_selector(config.device_match)
+        except AlsaMatchError as error:
+            raise ConfigError(f"audio.device_match is unsafe: {error}") from error
+    return config
 
 
 def _gps(root: Mapping[str, object]) -> GpsConfig:
@@ -319,16 +348,75 @@ def _gps(root: Mapping[str, object]) -> GpsConfig:
     device = _nonempty(_string(table, "device", "gps"), 256, "gps.device")
     if not device.startswith("/dev/") or ".." in Path(device).parts:
         raise ConfigError("gps.device must be an absolute path below /dev")
+    baud = _bounded_int(_integer(table, "baud", "gps"), 1_200, 921_600, "gps.baud")
+    if baud not in SUPPORTED_GPS_BAUD_RATES:
+        supported = ",".join(str(value) for value in sorted(SUPPORTED_GPS_BAUD_RATES))
+        raise ConfigError(f"gps.baud must be one of the supported rates: {supported}")
+    earliest = _canonical_utc_text(
+        _string(table, "anchor_earliest_utc", "gps"),
+        "gps.anchor_earliest_utc",
+    )
+    latest = _canonical_utc_text(
+        _string(table, "anchor_latest_utc", "gps"),
+        "gps.anchor_latest_utc",
+    )
+    if _parse_canonical_utc(latest) <= _parse_canonical_utc(earliest):
+        raise ConfigError("gps.anchor_latest_utc must be after gps.anchor_earliest_utc")
     return GpsConfig(
         device=device,
-        baud=_bounded_int(_integer(table, "baud", "gps"), 1_200, 921_600, "gps.baud"),
+        baud=baud,
         stale_after_s=_bounded_number(
             _number(table, "stale_after_s", "gps"), 0.1, 60.0, "gps.stale_after_s"
         ),
         max_sample_hz=_bounded_int(
-            _integer(table, "max_sample_hz", "gps"), 1, 100, "gps.max_sample_hz"
+            _integer(table, "max_sample_hz", "gps"), 1, 10, "gps.max_sample_hz"
+        ),
+        anchor_earliest_utc=earliest,
+        anchor_latest_utc=latest,
+        anchor_uncertainty_ms=_bounded_int(
+            _integer(table, "anchor_uncertainty_ms", "gps"),
+            1,
+            5_000,
+            "gps.anchor_uncertainty_ms",
+        ),
+        anchor_max_conflict_ms=_bounded_int(
+            _integer(table, "anchor_max_conflict_ms", "gps"),
+            0,
+            60_000,
+            "gps.anchor_max_conflict_ms",
+        ),
+        anchor_max_reacquire_disagreement_ms=_bounded_int(
+            _integer(table, "anchor_max_reacquire_disagreement_ms", "gps"),
+            0,
+            60_000,
+            "gps.anchor_max_reacquire_disagreement_ms",
+        ),
+        anchor_max_interval_s=_bounded_int(
+            _integer(table, "anchor_max_interval_s", "gps"),
+            1,
+            604_800,
+            "gps.anchor_max_interval_s",
         ),
     )
+
+
+def _canonical_utc_text(value: str, path: str) -> str:
+    if len(value) != 20 or not value.endswith("Z"):
+        raise ConfigError(f"{path} must use canonical YYYY-MM-DDTHH:MM:SSZ UTC")
+    try:
+        parsed = _parse_canonical_utc(value)
+    except ValueError as exc:
+        raise ConfigError(f"{path} must use canonical YYYY-MM-DDTHH:MM:SSZ UTC") from exc
+    if parsed.isoformat(timespec="seconds").replace("+00:00", "Z") != value:
+        raise ConfigError(f"{path} must use canonical YYYY-MM-DDTHH:MM:SSZ UTC")
+    return value
+
+
+def _parse_canonical_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError("not canonical UTC")
+    return parsed.astimezone(UTC)
 
 
 def _time(root: Mapping[str, object]) -> TimeConfig:
@@ -345,14 +433,22 @@ def _time(root: Mapping[str, object]) -> TimeConfig:
         ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ConfigError("time.timezone must resolve through installed timezone data") from exc
+    discipline_system_clock = _boolean(table, "discipline_system_clock", "time")
+    if discipline_system_clock:
+        raise ConfigError(
+            "time.discipline_system_clock is unsupported in v1; "
+            "GPS anchors do not set Linux wall time"
+        )
     return TimeConfig(
         timezone=timezone,
         filename_timezone=_choice(
             _string(table, "filename_timezone", "time"), {"UTC"}, "time.filename_timezone"
         ),
-        discipline_system_clock=_boolean(table, "discipline_system_clock", "time"),
+        discipline_system_clock=discipline_system_clock,
         system_clock_owner=_choice(
-            _string(table, "system_clock_owner", "time"), {"chrony"}, "time.system_clock_owner"
+            _string(table, "system_clock_owner", "time"),
+            {"systemd-timesyncd"},
+            "time.system_clock_owner",
         ),
     )
 

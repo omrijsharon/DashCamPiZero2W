@@ -34,10 +34,11 @@ class AlsaMatchStatus(StrEnum):
 class AlsaIdentity:
     """Stable USB/udev evidence for an ALSA card.
 
-    ``serial`` is preferred.  ``physical_path`` is an acceptable replacement
-    when a microphone exposes no serial number, because it binds selection to
-    a deliberately configured USB topology.  Vendor/product alone are never
-    unique enough for automatic selection.
+    Product text and physical topology are required alongside USB VID/PID.
+    ``serial`` is retained as additional evidence when supplied, but it is not
+    a substitute for the configured topology: the reference microphone has no
+    unique serial number.  Vendor/product IDs alone are never unique enough
+    for automatic selection.
     """
 
     vendor_id: str
@@ -45,18 +46,20 @@ class AlsaIdentity:
     serial: str | None = None
     physical_path: str | None = None
     alsa_card_id: str | None = None
+    product: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vendor_id", _normalise_hex(self.vendor_id, "vendor_id"))
         object.__setattr__(self, "product_id", _normalise_hex(self.product_id, "product_id"))
         if self.serial is not None:
             _validate_text(self.serial, "serial")
-        if self.physical_path is not None and _USB_PATH.fullmatch(self.physical_path) is None:
-            raise AlsaMatchError("physical_path must be a bounded safe USB path")
+        if self.product is None:
+            raise AlsaMatchError("identity requires a USB product name")
+        _validate_text(self.product, "product")
+        if self.physical_path is None or _USB_PATH.fullmatch(self.physical_path) is None:
+            raise AlsaMatchError("identity requires a bounded safe USB physical_path")
         if self.alsa_card_id is not None:
             _validate_text(self.alsa_card_id, "alsa_card_id")
-        if self.serial is None and self.physical_path is None:
-            raise AlsaMatchError("identity requires a USB serial or physical_path")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,18 +98,20 @@ class AlsaSelector:
     serial: str | None = None
     physical_path: str | None = None
     alsa_card_id: str | None = None
+    product: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vendor_id", _normalise_hex(self.vendor_id, "vendor_id"))
         object.__setattr__(self, "product_id", _normalise_hex(self.product_id, "product_id"))
         if self.serial is not None:
             _validate_text(self.serial, "serial")
-        if self.physical_path is not None and _USB_PATH.fullmatch(self.physical_path) is None:
-            raise AlsaMatchError("physical_path must be a bounded safe USB path")
+        if self.product is None:
+            raise AlsaMatchError("selector requires a USB product name")
+        _validate_text(self.product, "product")
+        if self.physical_path is None or _USB_PATH.fullmatch(self.physical_path) is None:
+            raise AlsaMatchError("selector requires a bounded safe USB physical_path")
         if self.alsa_card_id is not None:
             _validate_text(self.alsa_card_id, "alsa_card_id")
-        if self.serial is None and self.physical_path is None:
-            raise AlsaMatchError("selector requires a USB serial or physical_path")
 
     def matches(self, identity: AlsaIdentity) -> bool:
         """Return true only when every configured stable field agrees."""
@@ -116,8 +121,9 @@ class AlsaSelector:
         return (
             self.vendor_id == identity.vendor_id
             and self.product_id == identity.product_id
+            and self.product == identity.product
             and (self.serial is None or self.serial == identity.serial)
-            and (self.physical_path is None or self.physical_path == identity.physical_path)
+            and self.physical_path == identity.physical_path
             and (self.alsa_card_id is None or self.alsa_card_id == identity.alsa_card_id)
         )
 
@@ -144,9 +150,10 @@ def parse_alsa_selector(device_match: str) -> AlsaSelector:
     """Parse the bounded stable-selector form stored in ``audio.device_match``.
 
     The only accepted form is, for example,
-    ``usb:vid=1234,pid=abcd,serial=dashcam-mic``.  A serialless microphone
-    may instead use ``path=1-1.2``.  Numeric ALSA endpoint strings are refused
-    rather than interpreted as a fallback selector.
+    ``usb:vid=08bb,pid=2902,product=USB_PnP_Sound_Device,path=1-1.2``.
+    ``serial`` and ``card_id`` are optional additional constraints. Numeric
+    ALSA endpoint strings are refused rather than interpreted as a fallback
+    selector.
     """
 
     if not isinstance(device_match, str) or len(device_match) > 256 or not device_match.isascii():
@@ -161,7 +168,7 @@ def parse_alsa_selector(device_match: str) -> AlsaSelector:
         if not separator or not key or not value or key in fields:
             raise AlsaMatchError("device_match contains an invalid or duplicate selector field")
         fields[key] = value
-    if set(fields) - {"vid", "pid", "serial", "path", "card_id"}:
+    if set(fields) - {"vid", "pid", "product", "serial", "path", "card_id"}:
         raise AlsaMatchError("device_match contains an unknown selector field")
     try:
         return AlsaSelector(
@@ -170,9 +177,10 @@ def parse_alsa_selector(device_match: str) -> AlsaSelector:
             serial=fields.get("serial"),
             physical_path=fields.get("path"),
             alsa_card_id=fields.get("card_id"),
+            product=fields.get("product"),
         )
     except KeyError as exc:
-        raise AlsaMatchError("device_match requires vid and pid fields") from exc
+        raise AlsaMatchError("device_match requires vid, pid, product, and path fields") from exc
 
 
 def resolve_capture_device(

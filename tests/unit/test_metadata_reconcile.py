@@ -56,8 +56,8 @@ def _unsynced_sidecar(
         clip_id=CLIP_ID,
         boot_id=BOOT_ID,
         sequence=123,
-        video_file="boot-ba1b2c3d4-000123.partial.mp4",
-        metadata_file="boot-ba1b2c3d4-000123.partial.json",
+        video_file="boot-876543214321-000123.partial.mp4",
+        metadata_file="boot-876543214321-000123.partial.json",
         start_utc=None,
         end_utc=None,
         start_monotonic_ns=start_monotonic_ns,
@@ -246,7 +246,7 @@ def test_case_insensitive_collision_is_refused_for_either_target_member() -> Non
         monotonic_ns=sidecar.start_monotonic_ns,
         utc=datetime(2026, 7, 23, 18, 27, tzinfo=UTC),
     )
-    target_name = "20260723T182700.000Z_ba1b2c3d4_s000123.JSON"
+    target_name = "20260723T182700.000Z_876543214321_s000123.JSON"
 
     with pytest.raises(MetadataReconciliationError, match="collision"):
         plan_post_anchor_reconciliation(
@@ -255,6 +255,25 @@ def test_case_insensitive_collision_is_refused_for_either_target_member() -> Non
             intent_id=INTENT_ID,
             created_monotonic_ns=80_000_000_000,
             existing_names={target_name},
+        )
+
+
+def test_reconciliation_refuses_filename_boot_token_that_disagrees_with_uuid() -> None:
+    sidecar = replace(
+        _unsynced_sidecar(),
+        video_file="boot-deadbeefcafe-000123.partial.mp4",
+        metadata_file="boot-deadbeefcafe-000123.partial.json",
+    )
+
+    with pytest.raises(MetadataReconciliationError, match="boot token"):
+        plan_post_anchor_reconciliation(
+            sidecar,
+            anchor=_gps_anchor(
+                monotonic_ns=sidecar.start_monotonic_ns,
+                utc=datetime(2026, 7, 23, 18, 27, tzinfo=UTC),
+            ),
+            intent_id=INTENT_ID,
+            created_monotonic_ns=80_000_000_000,
         )
 
 

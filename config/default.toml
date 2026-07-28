@@ -14,7 +14,7 @@ container = "mp4"
 
 [audio]
 enabled = true
-device_match = "usb-VID_PID-or-stable-name"
+device_match = "usb:vid=08bb,pid=2902,product=USB_PnP_Sound_Device,path=platform-3f980000.usb-usb-0:1:1.0"
 sample_rate_hz = 48000
 channels = 1
 codec = "aac"
@@ -25,12 +25,18 @@ device = "/dev/serial0"
 baud = 115200
 stale_after_s = 2.0
 max_sample_hz = 10
+anchor_earliest_utc = "2024-01-01T00:00:00Z"
+anchor_latest_utc = "2100-01-01T00:00:00Z"
+anchor_uncertainty_ms = 250
+anchor_max_conflict_ms = 2000
+anchor_max_reacquire_disagreement_ms = 5000
+anchor_max_interval_s = 86400
 
 [time]
 timezone = "Asia/Jerusalem"
 filename_timezone = "UTC"
-discipline_system_clock = true
-system_clock_owner = "chrony"
+discipline_system_clock = false
+system_clock_owner = "systemd-timesyncd"
 
 [overlay]
 enabled = true

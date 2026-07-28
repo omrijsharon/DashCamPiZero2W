@@ -32,6 +32,7 @@ MAX_PROBE_BYTES: Final = 4 * 1024
 MAX_SENTINEL_BYTES: Final = 4 * 1024
 MAX_IDENTITY_BYTES: Final = 8 * 1024
 MAX_FINDMNT_BYTES: Final = 16 * 1024
+MAX_FINDMNT_ROWS: Final = 2
 MAX_FACT_INTEGER: Final = 9_223_372_036_854_775_807
 COMMAND_TIMEOUT_SECONDS: Final = 3.0
 PROBE_NAME: Final = ".dashcam-preflight-v1.tmp"
@@ -46,6 +47,9 @@ _DEVICE_ID_RE: Final = re.compile(r"\d{1,10}:\d{1,10}")
 _FINGERPRINT_RE: Final = re.compile(r"[0-9a-f]{64}")
 _MOUNT_OPTION_RE: Final = re.compile(r"[A-Za-z0-9._=:+-]{1,128}")
 _IDENTITY_KEY_RE: Final = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
+_FINDMNT_ROW_KEYS: Final = frozenset(
+    {"target", "source", "fstype", "label", "uuid", "options", "maj:min"}
+)
 
 _ROOT_KEYS: Final = frozenset({"mount", "space", "sentinel"})
 _MOUNT_KEYS: Final = frozenset(
@@ -274,6 +278,25 @@ class PreflightFilesystem(Protocol):
 
     def unlink(self, recording_root: str, relative_name: str) -> None:
         """Remove exactly the probe file created by this invocation."""
+
+
+class RecordingFactsCollector(Protocol):
+    """Collect one fresh bounded observation of the recording root."""
+
+    def collect(self, recording_root: str) -> Mapping[str, object]:
+        """Return structured facts suitable for the strict parser."""
+
+
+class PreflightFilesystemFactory(Protocol):
+    """Construct the one-shot probe after mount identity is parsed."""
+
+    def __call__(
+        self,
+        *,
+        recording_root: str,
+        expected_device_id: str,
+    ) -> PreflightFilesystem:
+        """Return a probe bound to the freshly observed device."""
 
 
 class _StatVfsResult(Protocol):
@@ -849,18 +872,26 @@ class PosixFactsCollector:
         if result.returncode != 0:
             raise PreflightRuntimeError("findmnt returned an observation error")
         try:
-            raw = json.loads(result.stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raw = json.loads(
+                result.stdout.decode("utf-8"),
+                object_pairs_hook=_unique_json_object,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise PreflightRuntimeError("findmnt returned malformed JSON") from error
         if not isinstance(raw, Mapping) or set(raw) != {"filesystems"}:
             raise PreflightRuntimeError("findmnt JSON root differs from its contract")
         filesystems = raw["filesystems"]
-        if not isinstance(filesystems, list) or len(filesystems) != 1:
-            raise PreflightRuntimeError("findmnt must return exactly one mount")
-        row = filesystems[0]
-        if not isinstance(row, Mapping) or any(not isinstance(key, str) for key in row):
-            raise PreflightRuntimeError("findmnt mount row is malformed")
-        return cast(Mapping[str, object], row)
+        if (
+            not isinstance(filesystems, list)
+            or not filesystems
+            or len(filesystems) > MAX_FINDMNT_ROWS
+        ):
+            raise PreflightRuntimeError("findmnt mount row count is outside its bound")
+        rows = tuple(_parse_findmnt_row(row, target=target) for row in filesystems)
+        first = rows[0]
+        if any(row != first for row in rows[1:]):
+            raise PreflightRuntimeError("findmnt returned differing mount rows")
+        return first
 
 
 class PosixProbeFile:
@@ -1096,7 +1127,13 @@ def _checked_product(left: int, right: int) -> int:
 
 def _required_findmnt_string(row: Mapping[str, object], key: str) -> str:
     value = row.get(key)
-    if not isinstance(value, str) or not value or len(value) > MAX_FACT_STRING_CHARS:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_FACT_STRING_CHARS
+        or not value.isascii()
+        or not value.isprintable()
+    ):
         raise PreflightRuntimeError(f"findmnt {key} is missing or excessive")
     return value
 
@@ -1105,9 +1142,74 @@ def _optional_findmnt_string(row: Mapping[str, object], key: str) -> str | None:
     value = row.get(key)
     if value is None:
         return None
-    if not isinstance(value, str) or not value or len(value) > MAX_FACT_STRING_CHARS:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_FACT_STRING_CHARS
+        or not value.isascii()
+        or not value.isprintable()
+    ):
         raise PreflightRuntimeError(f"findmnt {key} is malformed")
     return value
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    table: dict[str, object] = {}
+    for key, value in pairs:
+        if key in table:
+            raise ValueError("duplicate JSON object key")
+        table[key] = value
+    return table
+
+
+def _parse_findmnt_row(value: object, *, target: str) -> dict[str, object]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise PreflightRuntimeError("findmnt mount row is malformed")
+    row = dict(cast(Mapping[str, object], value))
+    if set(row) != _FINDMNT_ROW_KEYS:
+        raise PreflightRuntimeError("findmnt mount row schema differs from its contract")
+
+    parsed_target = _required_findmnt_string(row, "target")
+    source = _required_findmnt_string(row, "source")
+    filesystem = _optional_findmnt_string(row, "fstype")
+    label = _optional_findmnt_string(row, "label")
+    uuid = _optional_findmnt_string(row, "uuid")
+    options = _required_findmnt_string(row, "options")
+    device_id = _required_findmnt_string(row, "maj:min")
+
+    if parsed_target != target:
+        raise PreflightRuntimeError("findmnt returned a different target")
+    if (
+        _DEVICE_RE.fullmatch(source) is None
+        or "//" in source
+        or any(part in {"", ".", ".."} for part in source.split("/")[1:])
+    ):
+        raise PreflightRuntimeError("findmnt source is malformed")
+    for key, optional_token in (
+        ("fstype", filesystem),
+        ("label", label),
+        ("uuid", uuid),
+    ):
+        if optional_token is not None and _TOKEN_RE.fullmatch(optional_token) is None:
+            raise PreflightRuntimeError(f"findmnt {key} is malformed")
+    option_values = options.split(",")
+    if (
+        len(option_values) > MAX_MOUNT_OPTIONS
+        or any(_MOUNT_OPTION_RE.fullmatch(option) is None for option in option_values)
+    ):
+        raise PreflightRuntimeError("findmnt options are malformed or excessive")
+    if _DEVICE_ID_RE.fullmatch(device_id) is None:
+        raise PreflightRuntimeError("findmnt maj:min is malformed")
+
+    return {
+        "target": parsed_target,
+        "source": source,
+        "fstype": filesystem,
+        "label": label,
+        "uuid": uuid,
+        "options": options,
+        "maj:min": device_id,
+    }
 
 
 def _read_limited(descriptor: int, limit: int) -> bytes:
@@ -1165,6 +1267,32 @@ def _emit_status(status: Mapping[str, object]) -> None:
     print(payload, flush=True)
 
 
+def run_live_storage_preflight(
+    config: DashcamConfig,
+    *,
+    identity_path: str = IDENTITY_PATH,
+    identity_loader: Callable[[str], StorageIdentity] = load_storage_identity,
+    facts_collector: RecordingFactsCollector | None = None,
+    filesystem_factory: PreflightFilesystemFactory = PosixPreflightFilesystem,
+) -> PreflightResult:
+    """Run the exact production observation and write-probe sequence once."""
+
+    if not isinstance(config, DashcamConfig):
+        raise TypeError("config must be a DashcamConfig")
+    if not isinstance(identity_path, str) or not identity_path.startswith("/"):
+        raise ValueError("identity_path must be an absolute POSIX path")
+    identity = identity_loader(identity_path)
+    policy = policy_from_identity(config, identity)
+    collector = facts_collector or PosixFactsCollector()
+    raw_facts = collector.collect(policy.recording_root)
+    parsed = recording_root_facts_from_mapping(raw_facts)
+    filesystem = filesystem_factory(
+        recording_root=policy.recording_root,
+        expected_device_id=parsed.mount.device_id or "0:0",
+    )
+    return run_storage_preflight(raw_facts, policy=policy, filesystem=filesystem)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the production fail-closed preflight and emit bounded status JSON."""
 
@@ -1174,15 +1302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         config = load_config(arguments.config)
-        identity = load_storage_identity(arguments.identity)
-        policy = policy_from_identity(config, identity)
-        raw_facts = PosixFactsCollector().collect(policy.recording_root)
-        parsed = recording_root_facts_from_mapping(raw_facts)
-        filesystem = PosixPreflightFilesystem(
-            recording_root=policy.recording_root,
-            expected_device_id=parsed.mount.device_id or "0:0",
-        )
-        result = run_storage_preflight(raw_facts, policy=policy, filesystem=filesystem)
+        result = run_live_storage_preflight(config, identity_path=arguments.identity)
         _emit_status(_redacted_status(result))
         return 0 if result.ready else 2
     except (

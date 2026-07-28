@@ -17,6 +17,7 @@ class ClipNameError(ValueError):
 _MAX_COMPONENT_LENGTH = 255
 _BOOT_ID_RE = re.compile(r"[a-z0-9]{5,16}")
 _PROVISIONAL_RE = re.compile(r"boot-([a-z0-9]{5,16})-(\d{6})\.partial\.(mp4|json)")
+_FINAL_UNSYNCED_RE = re.compile(r"boot-([a-z0-9]{5,16})-(\d{6})\.(mp4|json)")
 _FINAL_RE = re.compile(r"(\d{8}T\d{6}\.\d{3}Z)_([a-z0-9]{5,16})_s(\d{6})\.(mp4|json)")
 _SAFE_COMPONENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 _RESERVED_DEVICE_NAMES = frozenset(
@@ -59,6 +60,7 @@ class ParsedClipName:
     utc_started_at: datetime | None
     extension: str
     provisional: bool
+    partial: bool
 
 
 def validate_filename_component(name: str) -> str:
@@ -99,6 +101,15 @@ def provisional_clip_pair(
     return _new_pair(stem, existing_names)
 
 
+def finalized_unsynced_clip_pair(
+    *, boot_id: str, sequence: int, existing_names: Set[str] = frozenset()
+) -> ClipFilePair:
+    """Return a closed clip pair whose civil timestamp is not known yet."""
+
+    stem = f"boot-{_validated_boot_id(boot_id)}-{_sequence(sequence):06d}"
+    return _new_pair(stem, existing_names)
+
+
 def finalized_clip_pair(
     *,
     utc_started_at: datetime,
@@ -129,6 +140,18 @@ def parse_clip_filename(name: str) -> ParsedClipName:
             utc_started_at=None,
             extension=extension,
             provisional=True,
+            partial=True,
+        )
+    final_unsynced_match = _FINAL_UNSYNCED_RE.fullmatch(name)
+    if final_unsynced_match is not None:
+        boot_id, sequence_text, extension = final_unsynced_match.groups()
+        return ParsedClipName(
+            boot_id=boot_id,
+            sequence=int(sequence_text),
+            utc_started_at=None,
+            extension=extension,
+            provisional=True,
+            partial=False,
         )
     final_match = _FINAL_RE.fullmatch(name)
     if final_match is None:
@@ -144,6 +167,7 @@ def parse_clip_filename(name: str) -> ParsedClipName:
         utc_started_at=utc_started_at,
         extension=extension,
         provisional=False,
+        partial=False,
     )
 
 

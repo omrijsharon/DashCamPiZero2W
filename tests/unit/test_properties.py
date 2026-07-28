@@ -14,6 +14,7 @@ from dashcam.state import ClipLifecycle, ClipRecord, StateTransitionError
 from dashcam.storage.intents import PairPaths
 from dashcam.storage.naming import (
     finalized_clip_pair,
+    finalized_unsynced_clip_pair,
     parse_clip_filename,
     provisional_clip_pair,
     validate_filename_component,
@@ -39,7 +40,22 @@ def test_provisional_names_round_trip_for_the_complete_input_domain(
     assert parsed_video.boot_id == parsed_sidecar.boot_id == boot_id
     assert parsed_video.sequence == parsed_sidecar.sequence == sequence
     assert parsed_video.provisional and parsed_sidecar.provisional
+    assert parsed_video.partial and parsed_sidecar.partial
     assert validate_filename_component(pair.video_name) == pair.video_name
+
+
+@given(boot_id=_BOOT_IDS, sequence=_SEQUENCES)
+def test_finalized_unsynced_names_round_trip_without_partial_suffix(
+    boot_id: str, sequence: int
+) -> None:
+    pair = finalized_unsynced_clip_pair(boot_id=boot_id, sequence=sequence)
+
+    parsed_video = parse_clip_filename(pair.video_name)
+    parsed_sidecar = parse_clip_filename(pair.metadata_name)
+    assert parsed_video.boot_id == parsed_sidecar.boot_id == boot_id
+    assert parsed_video.sequence == parsed_sidecar.sequence == sequence
+    assert parsed_video.provisional and parsed_sidecar.provisional
+    assert not parsed_video.partial and not parsed_sidecar.partial
 
 
 @given(started_at=_UTC_DATETIMES, boot_id=_BOOT_IDS, sequence=_SEQUENCES)

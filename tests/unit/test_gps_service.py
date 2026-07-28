@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TypeAlias
 
 import pytest
 
+from dashcam.gps.anchors import NmeaAnchorTracker
+from dashcam.gps.clock import AnchorPolicy, AnchorSource, AnchorStatus
 from dashcam.gps.nmea import MAX_NMEA_LINE_BYTES
 from dashcam.gps.service import (
     GpsService,
@@ -14,7 +17,8 @@ from dashcam.gps.service import (
     GpsServiceLimits,
     GpsTransport,
 )
-from dashcam.state import GpsState
+from dashcam.gps.telemetry import GpsTelemetryCollector
+from dashcam.state import GpsState, GpsTimeState
 
 _SECOND = 1_000_000_000
 
@@ -135,6 +139,115 @@ def _limits(**changes: float | int) -> GpsServiceLimits:
     return GpsServiceLimits(**values)  # type: ignore[arg-type]
 
 
+def _anchor_tracker(*, stale_after_ns: int = 2 * _SECOND) -> NmeaAnchorTracker:
+    return NmeaAnchorTracker(
+        policy=AnchorPolicy(
+            earliest_utc=datetime(2020, 1, 1, tzinfo=UTC),
+            latest_utc=datetime(2030, 1, 1, tzinfo=UTC),
+            gps_stale_after_ns=stale_after_ns,
+        ),
+        uncertainty_ns=250_000_000,
+    )
+
+
+def test_valid_rmc_anchor_is_accepted_then_confirmed_with_stable_provenance() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        transport = ScriptedTransport(
+            [_VALID_RMC, TimedRead(_SECOND, _LATER_RMC)],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(stale_after_s=2.0),
+            monotonic_ns=clock,
+            anchor_tracker=_anchor_tracker(),
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.gps_time_state is GpsTimeState.GPS_TIME_VALID
+        assert snapshot.time_anchor is not None
+        assert snapshot.time_anchor.source is AnchorSource.GPS_RMC_VALID
+        assert snapshot.time_anchor.utc == datetime(
+            2026, 7, 23, 12, 35, 19, 250_000, tzinfo=UTC
+        )
+        assert snapshot.time_anchor.uncertainty_ns == 250_000_000
+        assert snapshot.last_anchor_status is AnchorStatus.CONFIRMED
+        assert snapshot.last_anchor_error is None
+        assert snapshot.last_anchor_disagreement_ns == 0
+        assert snapshot.counters.anchor_attempts == 2
+        assert snapshot.counters.anchor_acceptances == 1
+        assert snapshot.counters.anchor_confirmations == 1
+        assert snapshot.counters.anchor_rejections == 0
+
+    asyncio.run(scenario())
+
+
+def test_invalid_rmc_is_counted_as_anchor_rejection_but_bad_checksum_is_not_attempted() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        transport = ScriptedTransport(
+            [_BAD_CHECKSUM, _INVALID_FIX],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(),
+            monotonic_ns=clock,
+            anchor_tracker=_anchor_tracker(),
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.gps_time_state is GpsTimeState.UNSYNCED
+        assert snapshot.time_anchor is None
+        assert snapshot.last_anchor_status is None
+        assert snapshot.last_anchor_error == "NMEA:RMC_NOT_ACTIVE_VALID"
+        assert snapshot.counters.checksum_failures == 1
+        assert snapshot.counters.anchor_attempts == 1
+        assert snapshot.counters.anchor_rejections == 1
+
+    asyncio.run(scenario())
+
+
+def test_transport_loss_preserves_anchor_but_marks_gps_time_stale() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        transport = ScriptedTransport(
+            [_VALID_RMC, OSError("UART lost")],
+            clock=clock,
+            stop=stop,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(),
+            monotonic_ns=clock,
+            reconnect_waiter=ScriptedWaiter(stop_after=1),
+            anchor_tracker=_anchor_tracker(),
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.gps_time_state is GpsTimeState.GPS_TIME_STALE
+        assert snapshot.time_anchor is not None
+        assert snapshot.navigation is None
+        assert snapshot.counters.anchor_acceptances == 1
+        assert snapshot.counters.disconnects == 1
+
+    asyncio.run(scenario())
+
+
 def test_no_gps_boot_retries_with_bounded_exponential_backoff() -> None:
     async def scenario() -> None:
         stop = asyncio.Event()
@@ -166,6 +279,12 @@ def test_no_gps_boot_retries_with_bounded_exponential_backoff() -> None:
         assert len(snapshot.last_error_detail or "") <= 160
 
     asyncio.run(scenario())
+
+
+def test_transport_outer_deadline_has_small_bounded_scheduler_margin() -> None:
+    assert _limits(read_timeout_s=0.01).transport_read_deadline_s == pytest.approx(0.02)
+    assert _limits(read_timeout_s=0.25).transport_read_deadline_s == pytest.approx(0.3125)
+    assert _limits(read_timeout_s=30.0).transport_read_deadline_s == pytest.approx(30.25)
 
 
 def test_transport_read_deadline_is_enforced_even_if_adapter_hangs() -> None:
@@ -240,6 +359,157 @@ def test_partial_malformed_unsupported_and_oversized_lines_are_bounded() -> None
     asyncio.run(scenario())
 
 
+def test_consecutive_parse_error_limit_forces_bounded_reconnect() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        malformed = ScriptedTransport(
+            [_BAD_CHECKSUM * 8],
+            clock=clock,
+            stop=stop,
+        )
+        recovered = ScriptedTransport(
+            [_VALID_RMC],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        waiter = ScriptedWaiter()
+        service = GpsService(
+            transport_factory=ScriptedFactory([malformed, recovered]),
+            limits=_limits(
+                read_size_bytes=4096,
+                max_consecutive_parse_errors=4,
+            ),
+            monotonic_ns=clock,
+            reconnect_waiter=waiter,
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.state is GpsState.NAVIGATION_VALID
+        assert snapshot.navigation is not None
+        assert snapshot.counters.lines_received == 5
+        assert snapshot.counters.parse_errors == 4
+        assert snapshot.counters.transport_errors == 1
+        assert snapshot.counters.connections == 2
+        assert snapshot.counters.reconnects == 1
+        assert snapshot.counters.disconnects == 1
+        assert malformed.close_calls == 1
+        assert recovered.close_calls == 1
+        assert waiter.delays == [0.1]
+
+    asyncio.run(scenario())
+
+
+def test_valid_supported_sentence_resets_consecutive_parse_error_limit() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        transport = ScriptedTransport(
+            [_BAD_CHECKSUM * 3 + _VALID_RMC + _BAD_CHECKSUM * 3],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(
+                read_size_bytes=4096,
+                max_consecutive_parse_errors=4,
+            ),
+            monotonic_ns=clock,
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.state is GpsState.NAVIGATION_VALID
+        assert snapshot.navigation is not None
+        assert snapshot.counters.lines_received == 7
+        assert snapshot.counters.parse_errors == 6
+        assert snapshot.counters.transport_errors == 0
+        assert snapshot.counters.connections == 1
+
+    asyncio.run(scenario())
+
+
+def test_parse_error_rate_limit_trips_even_when_valid_sentences_reset_streak() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        malformed = ScriptedTransport(
+            [(_BAD_CHECKSUM + _VALID_RMC) * 5],
+            clock=clock,
+            stop=stop,
+        )
+        recovered = ScriptedTransport(
+            [_VALID_RMC],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([malformed, recovered]),
+            limits=_limits(
+                read_size_bytes=4096,
+                max_consecutive_parse_errors=8,
+                max_parse_errors_per_second=4,
+            ),
+            monotonic_ns=clock,
+            reconnect_waiter=ScriptedWaiter(),
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.state is GpsState.NAVIGATION_VALID
+        assert snapshot.counters.lines_received == 10
+        assert snapshot.counters.parse_errors == 5
+        assert snapshot.counters.valid_sentences == 5
+        assert snapshot.counters.transport_errors == 1
+        assert snapshot.counters.disconnects == 1
+        assert snapshot.counters.reconnects == 1
+
+    asyncio.run(scenario())
+
+
+def test_parse_error_rate_window_resets_after_one_second() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        transport = ScriptedTransport(
+            [
+                _BAD_CHECKSUM * 3 + _VALID_RMC,
+                TimedRead(_SECOND, _BAD_CHECKSUM * 3 + _VALID_RMC),
+            ],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(
+                read_size_bytes=4096,
+                max_consecutive_parse_errors=4,
+                max_parse_errors_per_second=4,
+            ),
+            monotonic_ns=clock,
+        )
+
+        await service.run(stop)
+
+        snapshot = service.snapshot
+        assert snapshot.state is GpsState.NAVIGATION_VALID
+        assert snapshot.counters.lines_received == 8
+        assert snapshot.counters.parse_errors == 6
+        assert snapshot.counters.valid_sentences == 2
+        assert snapshot.counters.transport_errors == 0
+
+    asyncio.run(scenario())
+
+
 def test_late_valid_fix_replaces_receiving_invalid_state() -> None:
     async def scenario() -> None:
         stop = asyncio.Event()
@@ -259,6 +529,11 @@ def test_late_valid_fix_replaces_receiving_invalid_state() -> None:
             transport_factory=ScriptedFactory([transport]),
             limits=_limits(stale_after_s=5.0),
             monotonic_ns=clock,
+            telemetry_collector=GpsTelemetryCollector(
+                max_sample_hz=10,
+                stale_after_ns=5 * _SECOND,
+                history_capacity=20,
+            ),
         )
 
         await service.run(stop)
@@ -270,6 +545,13 @@ def test_late_valid_fix_replaces_receiving_invalid_state() -> None:
         assert snapshot.counters.read_timeouts == 2
         assert snapshot.counters.valid_sentences == 2
         assert snapshot.counters.valid_fixes == 1
+        assert snapshot.telemetry_counters.sentences_considered == 2
+        assert snapshot.telemetry_counters.invalid_navigation == 1
+        assert snapshot.telemetry_counters.samples_emitted == 1
+        telemetry = service.telemetry_window(0, 3 * _SECOND, max_samples=20)
+        assert telemetry.complete
+        assert len(telemetry.samples) == 1
+        assert telemetry.samples[0].latitude_deg == pytest.approx(48.1173)
 
     asyncio.run(scenario())
 
@@ -415,6 +697,10 @@ def test_transport_cannot_exceed_read_bound_or_grow_internal_buffer() -> None:
         {"stale_after_s": 0.0},
         {"reconnect_min_s": 2.0, "reconnect_max_s": 1.0},
         {"max_line_bytes": MAX_NMEA_LINE_BYTES + 1},
+        {"max_consecutive_parse_errors": 0},
+        {"max_consecutive_parse_errors": 4097},
+        {"max_parse_errors_per_second": 0},
+        {"max_parse_errors_per_second": 10_001},
     ],
 )
 def test_service_limits_reject_unbounded_or_invalid_values(

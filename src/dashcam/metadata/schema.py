@@ -27,7 +27,10 @@ MAX_SOFTWARE_VERSION_LENGTH: Final = 128
 MAX_PROTECTION_REASON_LENGTH: Final = 128
 MAX_UNCERTAINTY_NS: Final = 86_400_000_000_000
 MAX_MONOTONIC_NS: Final = 9_223_372_036_854_775_807
-MAX_DURATION_ROUNDING_ERROR_NS: Final = 1_000
+# Canonical v1 JSON serializes civil timestamps to milliseconds. Independently
+# truncating the two endpoints can change their observed duration by less than
+# one millisecond even though the in-memory projection is microsecond precise.
+MAX_DURATION_ROUNDING_ERROR_NS: Final = 1_000_000
 
 
 class MetadataValidationError(ValueError):
@@ -456,7 +459,7 @@ class ClipSidecar:
     def _validate_sample_window(self) -> None:
         previous_monotonic_ns = self.start_monotonic_ns
         for sample in self.gps.samples:
-            if not self.start_monotonic_ns <= sample.monotonic_ns <= self.end_monotonic_ns:
+            if not self.start_monotonic_ns <= sample.monotonic_ns < self.end_monotonic_ns:
                 raise MetadataValidationError("GPS sample falls outside the clip interval")
             if sample.monotonic_ns < previous_monotonic_ns:
                 raise MetadataValidationError("GPS samples must be ordered by monotonic time")

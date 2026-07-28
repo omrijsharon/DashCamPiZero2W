@@ -2,22 +2,50 @@
 
 ## Validation and authorization status
 
-This is not a supported Pi installation procedure yet. Milestone 4 is complete,
-including the camera/media, GPS, and USB-audio capability decisions. Every
-physical target still requires a separate destructive gate. On 2026-07-24 the
-owner authorized complete erase, reflash, repartition, and format of only the
-31,457,280,000-byte card with CID
-`fe34325344000000200000031a0192d1`.
+The active development route is the reviewed SSH-first installation on the
+exact authorized 31,457,280,000-byte card with CID
+`fe34325344000000200000031a0192d1`. Its storage layout is already complete:
+6 GiB ext4 root plus the exFAT `DASHCAM` volume at `/srv/dashcam`. Do not
+repartition, reformat, or reflash it without a new exact destructive preflight
+and owner authorization.
 
-The first CID-bound v1 image trial booted but failed safe without partition or
-filesystem mutation: the 32-bit Zero 2 W loaded stock `initramfs7`, while v1
-had customized the unused generic `initramfs`. The post-root service refused
-the missing early-state evidence. V1 is retired and must not be reflashed.
-A corrected armv7-targeted v2 regular image is now built and independently
-re-read. Before the next physical write, shut the Pi down, move the card
-offline, resolve the target again, and recheck all available identity
-evidence. Evidence:
-`docs/test-reports/2026-07-24-authorized-exact-card-image.json`.
+Application changes use `deploy/ssh-dev-app`: build one hash-closed bundle
+outside the working tree, refresh APT indexes immediately before the
+authoritative dry-run, preserve the saved plan, and never refresh between plan
+and apply. Apply is exact-version/no-upgrade and must be replayed through a new
+dry-run to prove idempotency. The current installed release is
+`0.1.0.dev0-921164f96ad53e0b`. Milestones 6, 7, and 8 are accepted; current
+Milestone 8 evidence covers bounded UART/NMEA supervision, configured GPS
+absence, trusted UTC-anchor status, and native-cadence monotonic GPS samples in
+canonical per-clip sidecars. It also covers durable, idempotent UTC/filename
+reconciliation after late lock, stable clip UUIDs, fail-closed
+case-insensitive collision handling on the exact exFAT volume, truthful
+stale/lost navigation, and the bounded GPS/time fault matrix. The approved
+image retains stock
+`systemd-timesyncd` as its sole Linux wall-clock owner; a controlled two-minute
+wall-clock step did not alter production media PTS/DTS. See the dated
+Milestone 6/7 reports and
+`docs/test-reports/2026-07-28-milestone8-gps-uart-live.md`,
+`docs/test-reports/2026-07-28-milestone8-gps-anchor-live.md`, and
+`docs/test-reports/2026-07-28-milestone8-gps-sidecar-live.md`, and
+`docs/test-reports/2026-07-28-milestone8-clock-step-live.md`, and
+`docs/test-reports/2026-07-28-milestone8-reconciliation-live.md`. Milestone 8
+is accepted. The current release's bounded parse-error-rate guard prevents a
+malformed high-rate UART stream from monopolizing the recorder while retaining
+the measured M10 sentence mix. The final integrated fault run used the real
+camera, hardware encoder, exFAT catalog/reconciliation path, and a PTY-backed
+GPS source; it reached 2,179 encoded frames with zero drops/restarts and removed
+all transient artifacts. The validation harness is now serialized by a
+nonblocking kernel lock.
+
+The v1-v4 custom images are retired historical evidence and must not be
+reflashed. The future compressed bootstrap image remains release engineering,
+not a prerequisite for SSH-first implementation.
+
+The generic workflow later in this draft is not a supported Pi installation
+path and must not be copied to another card. The completed exact-card
+authorization is not transferable: every physical target still requires a
+separate destructive gate.
 
 ## Tested Phase 0B image
 
@@ -28,7 +56,13 @@ evidence. Evidence:
 - Python: 3.13.5
 - Camera: IMX219 through libcamera 0.7.1 and rpicam-apps 1.12.0
 - GStreamer: 1.26.2 with libcamera, base, good, bad, and X/Pango plugins
-- Selected encoder: V4L2 hardware H.264 `/dev/video11`
+- Recorder Python bindings: `python3-gi`, the GStreamer GIR packages, and
+  `python3-gst-1.0`. The last package is required for Python-visible GStreamer
+  value overrides such as fractional caps and is installed at exact version
+  `1.26.0-1` in release `0.1.0.dev0-011a148e085da278`.
+- Selected Milestone 6 encoder backend: dynamically discovered
+  `v4l2h264enc`; explicit level caps and default constrained-VBR mode are
+  required, while `video_bitrate_mode=1` is prohibited on this exact stack
 - Selected UART: `/dev/serial0` -> `/dev/ttyAMA0`; Bluetooth disabled
 
 The exact boot-file snapshots and measurements are recorded in

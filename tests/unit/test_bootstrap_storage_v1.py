@@ -27,6 +27,7 @@ from dashcam.provisioning.bootstrap import (
     Refusal,
     RefusalCode,
     _identity_mapping,
+    _parse_dumpe2fs_header,
     _sentinel_mapping,
     compute_geometry,
     execute_stage_a,
@@ -108,7 +109,7 @@ def _target_evidence(
     target_mbr = _mbr(parts)
     journal = replace(journal, committed_mbr_sha256=hashlib.sha256(target_mbr).hexdigest())
     observed_signatures = (
-        ("exfat",) if filesystem == "exfat" and not signatures else signatures
+        ("exfat", "dos") if filesystem == "exfat" and not signatures else signatures
     )
     evidence = replace(
         _source_evidence(disk),
@@ -120,9 +121,7 @@ def _target_evidence(
         data_uuid=uuid,
         data_signatures=observed_signatures,
         data_zero_prefix_bytes=(
-            DATA_ZERO_PREFIX_BYTES
-            if filesystem is None and not observed_signatures
-            else 0
+            DATA_ZERO_PREFIX_BYTES if filesystem is None and not observed_signatures else 0
         ),
         data_partuuid="4f2c9ea0-03",
     )
@@ -208,11 +207,7 @@ def test_cloud_init_terminal_success_allows_stage_a_planning() -> None:
 
 def test_stage_a_has_one_table_write_and_no_reread_commands() -> None:
     plan = plan_stage_a(_source_evidence("/dev/sda"), None)
-    writes = [
-        action
-        for action in plan.actions
-        if action.argv[:1] == ("/usr/sbin/sfdisk",)
-    ]
+    writes = [action for action in plan.actions if action.argv[:1] == ("/usr/sbin/sfdisk",)]
     assert len(writes) == 1
     assert writes[0].argv == (
         "/usr/sbin/sfdisk",
@@ -338,6 +333,77 @@ def test_exact_intended_exfat_is_reconciled_without_reformat() -> None:
     assert not plan.mutating_commands
 
 
+@pytest.mark.parametrize(
+    "signatures",
+    (
+        ("exfat",),
+        ("dos",),
+        ("exfat", "ext4"),
+        ("exfat", "dos", "ext4"),
+        ("exfat", "dos", "dos"),
+    ),
+)
+def test_format_intent_rejects_any_non_exact_wipefs_signature_shape(
+    signatures: tuple[str, ...],
+) -> None:
+    evidence, journal = _target_evidence(
+        phase=Phase.FORMAT_INTENT,
+        filesystem="exfat",
+        label="DASHCAM",
+        uuid="7EED-3EA7",
+        signatures=signatures,
+    )
+
+    plan = plan_stage_b(evidence, journal)
+
+    assert plan.journal is not None
+    assert plan.journal.phase is Phase.REFUSED
+    assert plan.journal.refusal_code == RefusalCode.FOREIGN_FILESYSTEM
+    assert not plan.mutating_commands
+
+
+def test_live_exfat_signature_pair_reconciles_only_after_format_intent() -> None:
+    evidence, journal = _target_evidence(
+        phase=Phase.FORMAT_INTENT,
+        filesystem="exfat",
+        label="DASHCAM",
+        uuid="7EED-3EA7",
+        signatures=("exfat", "dos"),
+    )
+
+    reconciled = plan_stage_b(evidence, journal)
+
+    assert reconciled.journal is not None
+    assert reconciled.journal.phase is Phase.DATA_FORMATTED
+    assert reconciled.journal.data_uuid == "7EED-3EA7"
+    assert not reconciled.mutating_commands
+
+    pre_format = replace(journal, phase=Phase.ROOT_RESIZED)
+    refused = plan_stage_b(evidence, pre_format)
+    assert refused.journal is not None
+    assert refused.journal.phase is Phase.REFUSED
+    assert refused.journal.refusal_code == RefusalCode.FORMAT_NOT_BLANK
+    assert not refused.mutating_commands
+
+
+def test_data_formatted_rejects_an_extra_foreign_signature() -> None:
+    evidence, journal = _target_evidence(
+        phase=Phase.DATA_FORMATTED,
+        filesystem="exfat",
+        label="DASHCAM",
+        uuid="7EED-3EA7",
+        signatures=("exfat", "dos", "ext4"),
+    )
+    journal = replace(journal, data_uuid="7EED-3EA7")
+
+    refused = plan_stage_b(evidence, journal)
+
+    assert refused.journal is not None
+    assert refused.journal.phase is Phase.REFUSED
+    assert refused.journal.refusal_code == RefusalCode.FOREIGN_FILESYSTEM
+    assert not refused.mutating_commands
+
+
 def test_latched_refusal_never_retries_even_when_evidence_later_looks_blank() -> None:
     evidence, journal = _target_evidence(phase=Phase.ROOT_RESIZED, signatures=("ext4",))
     refused = plan_stage_b(evidence, journal)
@@ -461,9 +527,7 @@ def test_journal_round_trip_uses_closed_durable_schema() -> None:
 
 def test_checked_exact_card_contract_loads_and_rejects_drift() -> None:
     root = Path(__file__).resolve().parents[2]
-    contract_path = (
-        root / "deploy" / "bootstrap" / "storage" / "authorized-exact-card-v1.json"
-    )
+    contract_path = root / "deploy" / "bootstrap" / "storage" / "authorized-exact-card-v1.json"
     payload = contract_path.read_text()
     authorization, policy = load_bootstrap_contract(payload)
     assert authorization == EXACT_CARD_AUTHORIZATION
@@ -513,9 +577,7 @@ class _FakeRuntime:
     def set_owner(self, path: str, uid: int, gid: int, mode: int) -> None:
         self.ownerships.append((path, uid, gid, mode))
 
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
         self.commands.append((argv, stdin))
         if argv[0] == "/usr/sbin/sfdisk" and argv[1] == "--dump":
             return "label: dos\n"
@@ -529,12 +591,17 @@ class _FakeRuntime:
             return json.dumps(
                 {
                     "signatures": [
-                        {"offset": "0x3", "type": "exfat", "label": "DASHCAM"}
+                        {"offset": "0x3", "type": "exfat", "label": "DASHCAM"},
+                        {"offset": "0x1fe", "type": "dos"},
                     ]
                 }
             )
-        if argv[:5] == ("/usr/bin/lsblk", "-b", "-n", "-o", "FSSIZE"):
-            return f"{self.target_root_bytes}\n"
+        if argv[:2] == ("/usr/sbin/dumpe2fs", "-h"):
+            return (
+                "Filesystem magic number:  0xEF53\n"
+                f"Block count:              {self.target_root_bytes // 4096}\n"
+                "Block size:               4096\n"
+            )
         if argv[:4] == ("/usr/bin/findmnt", "-J", "-o", "SOURCE,FSTYPE,UUID,TARGET"):
             target = argv[4]
             if target == "/boot/firmware":
@@ -595,9 +662,7 @@ def test_executor_persists_write_started_before_one_sfdisk_and_commits_readback(
 
 
 class _FailingRebootRuntime(_FakeRuntime):
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
         result = super().run(argv, stdin=stdin, timeout=timeout)
         if argv == ("/usr/bin/systemctl", "reboot"):
             raise RuntimeError("injected reboot orchestration failure")
@@ -605,12 +670,9 @@ class _FailingRebootRuntime(_FakeRuntime):
 
 
 class _ChangedBootMountRuntime(_FakeRuntime):
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
         if (
-            argv[:4]
-            == ("/usr/bin/findmnt", "-J", "-o", "SOURCE,FSTYPE,UUID,TARGET")
+            argv[:4] == ("/usr/bin/findmnt", "-J", "-o", "SOURCE,FSTYPE,UUID,TARGET")
             and argv[4] == "/boot/firmware"
         ):
             return json.dumps(
@@ -667,28 +729,25 @@ def test_stage_b_executor_completes_bounded_sequence_with_completion_write_last(
 
     commands = [command for command, _stdin in runtime.commands]
     assert ("/usr/sbin/resize2fs", evidence.root_partition) in commands
+    assert ("/usr/sbin/dumpe2fs", "-h", evidence.root_partition) in commands
+    assert all("FSSIZE" not in command for command in commands)
     assert (
         "/usr/sbin/mkfs.exfat",
         "-n",
         "DASHCAM",
         journal.data_partition,
     ) in commands
-    assert commands.count(
-        ("/usr/sbin/mkfs.exfat", "-n", "DASHCAM", journal.data_partition)
-    ) == 1
+    assert commands.count(("/usr/sbin/mkfs.exfat", "-n", "DASHCAM", journal.data_partition)) == 1
     assert ("/usr/bin/mount", "/srv/dashcam") in commands
     for required in ("pending", "clips", "protected", "quarantine"):
         assert f"/srv/dashcam/{required}" in runtime.directories
     env_index, env_payload = next(
-        (index, payload)
-        for index, (path, payload) in enumerate(runtime.writes)
-        if path == ENV_PATH
+        (index, payload) for index, (path, payload) in enumerate(runtime.writes) if path == ENV_PATH
     )
     configured_index = next(
         index
         for index, (path, payload) in enumerate(runtime.writes)
-        if path == STATE_PATH
-        and journal_from_json(payload.decode()).phase is Phase.CONFIGURED
+        if path == STATE_PATH and journal_from_json(payload.decode()).phase is Phase.CONFIGURED
     )
     assert env_index < configured_index < len(runtime.writes) - 1
     assert runtime.ownerships == [(ENV_PATH, 0, 992, 0o640)]
@@ -708,20 +767,20 @@ def test_stage_b_executor_completes_bounded_sequence_with_completion_write_last(
 
 
 class _FailingMkfsRuntime(_FakeRuntime):
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
         if argv[:1] == ("/usr/sbin/mkfs.exfat",):
             raise RuntimeError("injected mkfs failure")
         return super().run(argv, stdin=stdin, timeout=timeout)
 
 
 class _BadResizeObservationRuntime(_FakeRuntime):
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
-        if argv[:5] == ("/usr/bin/lsblk", "-b", "-n", "-o", "FSSIZE"):
-            return f"{self.target_root_bytes - 4096}\n"
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
+        if argv[:2] == ("/usr/sbin/dumpe2fs", "-h"):
+            return (
+                "Filesystem magic number:  0xEF53\n"
+                f"Block count:              {self.target_root_bytes // 4096 - 1}\n"
+                "Block size:               4096\n"
+            )
         return super().run(argv, stdin=stdin, timeout=timeout)
 
 
@@ -751,6 +810,42 @@ def test_resize_exit_zero_without_exact_size_never_advances_root_resized() -> No
     ]
     assert states[-1].phase is Phase.REFUSED
     assert all(state.phase is not Phase.ROOT_RESIZED for state in states)
+
+
+def test_ext4_total_geometry_does_not_use_lsblk_usable_bytes() -> None:
+    expected = 6 * 1024**3
+    usable_bytes_reported_by_lsblk = 6_304_432_128
+
+    observed = _parse_dumpe2fs_header(
+        "Filesystem volume name:   <none>\n"
+        "Filesystem magic number:  0xEF53\n"
+        "Block count:              1572864\n"
+        "Block size:               4096\n"
+    )
+
+    assert usable_bytes_reported_by_lsblk != expected
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "header",
+    (
+        "Filesystem magic number:  0xEF53\nBlock count: 1572864\n",
+        "Filesystem magic number:  0x1234\nBlock count: 1572864\nBlock size: 4096\n",
+        "Filesystem magic number:  0xEF53\nBlock count: nope\nBlock size: 4096\n",
+        (
+            "Filesystem magic number:  0xEF53\n"
+            "Block count: 1572864\n"
+            "Block size: 4096\n"
+            "Block size: 4096\n"
+        ),
+    ),
+)
+def test_ext4_total_geometry_rejects_ambiguous_or_malformed_headers(
+    header: str,
+) -> None:
+    with pytest.raises(BootstrapError, match="dumpe2fs"):
+        _parse_dumpe2fs_header(header)
 
 
 def test_foreign_fstab_owner_is_latched_without_mount_or_overwrite() -> None:

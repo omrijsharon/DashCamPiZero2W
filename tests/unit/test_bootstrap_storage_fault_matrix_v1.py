@@ -110,7 +110,7 @@ def _target_snapshot(
         data_filesystem="exfat" if formatted else None,
         data_label="DASHCAM" if formatted else None,
         data_uuid=DATA_UUID if formatted else None,
-        data_signatures=("exfat",) if formatted else (),
+        data_signatures=("exfat", "dos") if formatted else (),
         data_zero_prefix_bytes=0 if formatted else DATA_ZERO_PREFIX_BYTES,
         data_partuuid="4f2c9ea0-03",
         mounted_source=journal.data_partition if mounted else None,
@@ -402,7 +402,7 @@ def _change_format_label(evidence: Evidence) -> Evidence:
         data_filesystem="exfat",
         data_label="FOREIGN",
         data_uuid=DATA_UUID,
-        data_signatures=("exfat",),
+        data_signatures=("exfat", "dos"),
         data_zero_prefix_bytes=0,
     )
 
@@ -530,9 +530,7 @@ class _CompletionRuntime:
     def set_owner(self, path: str, uid: int, gid: int, mode: int) -> None:
         raise AssertionError((path, uid, gid, mode))
 
-    def run(
-        self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30
-    ) -> str:
+    def run(self, argv: tuple[str, ...], *, stdin: str | None = None, timeout: int = 30) -> str:
         raise AssertionError((argv, stdin, timeout))
 
     def sync(self) -> None:

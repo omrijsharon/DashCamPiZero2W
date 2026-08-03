@@ -10,22 +10,24 @@ from dashcam.overlay.formatting import (
     format_utc_offset,
 )
 from dashcam.overlay.native_nv12 import (
-    NATIVE_OVERLAY_FACTORY,
+    DmabufMemoryGeometry,
+    GstDmabufOverlayRenderer,
+    NativeDmabufFrame,
     NativeNv12OverlayCore,
     NativeOverlayContractError,
     NativeOverlaySnapshot,
-    Nv12FrameLayout,
     render_luma_bitmap,
     validate_native_overlay_text,
 )
 
 __all__ = [
-    "NATIVE_OVERLAY_FACTORY",
     "OVERLAY_1080P_LAYOUT",
+    "DmabufMemoryGeometry",
+    "GstDmabufOverlayRenderer",
+    "NativeDmabufFrame",
     "NativeNv12OverlayCore",
     "NativeOverlayContractError",
     "NativeOverlaySnapshot",
-    "Nv12FrameLayout",
     "OverlayFrame",
     "OverlayLayout",
     "OverlayOptions",

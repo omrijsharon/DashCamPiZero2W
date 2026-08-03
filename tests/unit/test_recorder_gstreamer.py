@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -399,9 +399,21 @@ class FakeDriver:
             "frames_rendered": 30,
             "frames_passthrough": 0,
             "bytes_written": 30 * 73_728,
-            "buffer_size_mismatches": 0,
-            "short_writes": 0,
+            "contract_mismatches": 0,
             "transform_failures": 0,
+            "mappings_cached": 4,
+            "mappings_created": 4,
+            "mappings_closed": 0,
+            "mapping_limit_rejections": 0,
+            "sync_starts": 30,
+            "sync_ends": 30,
+            "sync_failures": 0,
+            "render_latency_samples": 30,
+            "render_latency_last_ns": 1_000_000,
+            "render_latency_max_ns": 2_000_000,
+            "render_latency_total_ns": 30_000_000,
+            "render_latency_bucket_bounds_ns": (1_000_000, 2_000_000),
+            "render_latency_bucket_counts": (20, 10, 0),
             "last_error": None,
         }
     )
@@ -552,13 +564,14 @@ class FakeDriver:
 def test_graph_is_exact_and_omits_unsafe_encoder_assignments() -> None:
     assert PIPELINE_DESCRIPTION.startswith("libcamerasrc name=camera !")
     assert (
-        "video/x-raw,width=(int)1920,height=(int)1080,format=(string)NV12,framerate=(fraction)30/1"
+        'capsfilter name=overlay_input caps="video/x-raw,width=(int)1920,'
+        'height=(int)1080,format=(string)NV12,framerate=(fraction)30/1"'
     ) in PIPELINE_DESCRIPTION
-    assert PIPELINE_DESCRIPTION.count("dashcamnv12overlay name=burned_overlay") == 1
-    assert PIPELINE_DESCRIPTION.index("framerate=(fraction)30/1") < (
-        PIPELINE_DESCRIPTION.index("dashcamnv12overlay name=burned_overlay")
-    ) < PIPELINE_DESCRIPTION.index("v4l2h264enc name=encoder")
-    assert "dashcamnv12overlay name=burned_overlay" in PIPELINE_DESCRIPTION
+    assert PIPELINE_DESCRIPTION.count("capsfilter name=overlay_input") == 1
+    assert PIPELINE_DESCRIPTION.index("capsfilter name=overlay_input") < (
+        PIPELINE_DESCRIPTION.index("v4l2h264enc name=encoder")
+    )
+    assert "dashcamnv12overlay" not in PIPELINE_DESCRIPTION
     assert "textoverlay" not in PIPELINE_DESCRIPTION
     assert (
         'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
@@ -627,8 +640,8 @@ def test_matched_audio_graph_is_exact_clocked_bounded_generation_ingress() -> No
         "tee name=video_tee allow-not-linked=true "
     )
     assert description.endswith("tee name=audio_tee allow-not-linked=true")
-    assert description.count("dashcamnv12overlay name=burned_overlay") == 1
-    assert description.index("dashcamnv12overlay name=burned_overlay") < description.index(
+    assert description.count("capsfilter name=overlay_input") == 1
+    assert description.index("capsfilter name=overlay_input") < description.index(
         "v4l2h264enc name=encoder"
     )
     assert description.count("name=video_continuity_queue") == 1
@@ -639,7 +652,7 @@ def test_matched_audio_graph_is_exact_clocked_bounded_generation_ingress() -> No
         "sync=false async=false enable-last-sample=false qos=false"
     ) in description
     assert "alsasrc" not in description
-    assert "capsfilter" not in description
+    assert description.count("capsfilter") == 1
     assert (
         "alsasrc name=audio_source device=hw:1,0,0 provide-clock=false "
         "slave-method=resample use-driver-timestamps=false do-timestamp=true ! "
@@ -2203,7 +2216,13 @@ class FakeElement:
     def set_overlay_text(self, text: str | None) -> None:
         self.overlay_texts.append(text)
 
+    def set_text(self, text: str | None) -> None:
+        self.overlay_texts.append(text)
+
     def overlay_snapshot(self) -> dict[str, object]:
+        return dict(self.overlay_snapshot_value)
+
+    def snapshot(self) -> dict[str, object]:
         return dict(self.overlay_snapshot_value)
 
 
@@ -2377,14 +2396,11 @@ def test_pygobject_driver_sets_output_properties_outside_parse_launch() -> None:
     assert config.location_pattern not in PIPELINE_DESCRIPTION
 
 
-def test_pygobject_driver_updates_and_inspects_named_native_overlay() -> None:
+def test_pygobject_driver_updates_and_inspects_pipeline_owned_native_overlay() -> None:
     overlay = FakeElement()
-    pipeline = FakeGstPipeline(
-        FakeElement(),
-        FakeBus([]),
-        elements={"burned_overlay": overlay},
-    )
+    pipeline = FakeGstPipeline(FakeElement(), FakeBus([]))
     driver = PyGObjectGStreamerDriver(FakeGst(pipeline))
+    driver._overlay_renderers[id(pipeline)] = cast(Any, overlay)
 
     driver.set_overlay_text(pipeline, "TIME UNSYNCED\nGPS INVALID")
     driver.set_overlay_text(pipeline, None)
@@ -2393,8 +2409,35 @@ def test_pygobject_driver_updates_and_inspects_named_native_overlay() -> None:
     assert driver.overlay_snapshot(pipeline) == overlay.overlay_snapshot_value
 
     missing = FakeGstPipeline(FakeElement(), FakeBus([]))
-    with pytest.raises(GStreamerDriverError, match="no burned overlay"):
+    with pytest.raises(GStreamerDriverError, match="no native overlay probe"):
         driver.set_overlay_text(missing, "REC")
+
+
+def test_overlay_close_delay_cannot_prevent_pipeline_null_transition() -> None:
+    class DelayedRenderer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self, _timeout_s: float) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("callback shutdown timed out")
+
+    pipeline = object()
+    renderer = DelayedRenderer()
+    states: list[tuple[object, str, float]] = []
+    driver = PyGObjectGStreamerDriver(object())
+    driver._overlay_renderers[id(pipeline)] = cast(Any, renderer)
+    driver._set_and_verify_state = (  # type: ignore[method-assign]
+        lambda target, state, timeout: states.append((target, state, timeout))
+    )
+
+    with pytest.raises(GStreamerDriverError, match="pre-NULL bound"):
+        driver.set_null(pipeline, 1.0)
+
+    assert states == [(pipeline, "NULL", 1.0)]
+    assert renderer.close_calls == 2
+    assert id(pipeline) not in driver._overlay_renderers
 
 
 @pytest.mark.parametrize("source_name", sorted(AUDIO_BRANCH_ELEMENT_NAMES))

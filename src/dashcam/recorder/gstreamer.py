@@ -30,9 +30,9 @@ from dashcam.audio.linux import AudioDiscoveryOutcome, AudioDiscoveryStatus
 from dashcam.config import AudioConfig
 from dashcam.overlay.formatting import OVERLAY_1080P_LAYOUT
 from dashcam.overlay.native_nv12 import (
-    NATIVE_OVERLAY_FACTORY,
+    GstDmabufOverlayRenderer,
     NativeOverlayContractError,
-    register_native_nv12_overlay,
+    validate_native_overlay_dependencies,
     validate_native_overlay_text,
 )
 from dashcam.recorder.pipeline import (
@@ -50,9 +50,8 @@ from dashcam.storage.naming import ClipNameError, parse_clip_filename, provision
 # production choice on this image.
 PIPELINE_DESCRIPTION = (
     "libcamerasrc name=camera ! "
-    "video/x-raw,width=(int)1920,height=(int)1080,format=(string)NV12,"
-    "framerate=(fraction)30/1 ! "
-    f"{NATIVE_OVERLAY_FACTORY} name=burned_overlay ! "
+    'capsfilter name=overlay_input caps="video/x-raw,width=(int)1920,'
+    "height=(int)1080,format=(string)NV12,framerate=(fraction)30/1\" ! "
     "v4l2h264enc name=encoder "
     'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
     'h264_i_frame_period=30" ! '
@@ -1805,9 +1804,21 @@ class GStreamerBackend:
                 "frames_rendered": 0,
                 "frames_passthrough": 0,
                 "bytes_written": 0,
-                "buffer_size_mismatches": 0,
-                "short_writes": 0,
+                "contract_mismatches": 0,
                 "transform_failures": 0,
+                "mappings_cached": 0,
+                "mappings_created": 0,
+                "mappings_closed": 0,
+                "mapping_limit_rejections": 0,
+                "sync_starts": 0,
+                "sync_ends": 0,
+                "sync_failures": 0,
+                "render_latency_samples": 0,
+                "render_latency_last_ns": None,
+                "render_latency_max_ns": 0,
+                "render_latency_total_ns": 0,
+                "render_latency_bucket_bounds_ns": (),
+                "render_latency_bucket_counts": (),
                 "last_error": None,
             }
         observed = observe(pipeline)
@@ -2842,15 +2853,14 @@ class PyGObjectGStreamerDriver:
         self,
         gst: object,
         gstvideo: object | None = None,
-        gstbase: object | None = None,
-        gobject: object | None = None,
+        gstallocators: object | None = None,
     ) -> None:
         self._gst = gst
         self._gstvideo = gstvideo
-        self._gstbase = gstbase
-        self._gobject = gobject
+        self._gstallocators = gstallocators
         self._metrics: dict[int, tuple[PipelineCounters, int]] = {}
         self._generation_pipelines: dict[int, _GenerationPipeline] = {}
+        self._overlay_renderers: dict[int, GstDmabufOverlayRenderer] = {}
 
     @classmethod
     def load(cls) -> PyGObjectGStreamerDriver:
@@ -2861,15 +2871,14 @@ class PyGObjectGStreamerDriver:
                 _dynamic_attribute(gi, "require_version"),
             )
             require_version("Gst", "1.0")
-            require_version("GstBase", "1.0")
+            require_version("GstAllocators", "1.0")
             require_version("GstVideo", "1.0")
             gst = importlib.import_module("gi.repository.Gst")
-            gstbase = importlib.import_module("gi.repository.GstBase")
+            gstallocators = importlib.import_module("gi.repository.GstAllocators")
             gstvideo = importlib.import_module("gi.repository.GstVideo")
-            gobject = importlib.import_module("gi.repository.GObject")
             init = cast(Callable[[object | None], None], _dynamic_attribute(gst, "init"))
             init(None)
-            register_native_nv12_overlay(gst, gstbase, gstvideo, gobject)
+            validate_native_overlay_dependencies(gst, gstallocators, gstvideo)
         except NativeOverlayContractError as error:
             raise GStreamerDriverError(
                 f"native NV12 overlay is unavailable: {_bounded_detail(error)}"
@@ -2878,7 +2887,7 @@ class PyGObjectGStreamerDriver:
             raise GStreamerDriverError(
                 f"PyGObject GStreamer 1.0 is unavailable: {_bounded_detail(error)}"
             ) from error
-        return cls(gst, gstvideo, gstbase, gobject)
+        return cls(gst, gstvideo, gstallocators)
 
     def _gst_member(self, name: str) -> object:
         try:
@@ -3938,6 +3947,7 @@ class PyGObjectGStreamerDriver:
             if output is not None:
                 self._method(output, "set_property")("location", location_pattern)
                 self._method(output, "set_property")("start-index", start_index)
+                self._attach_overlay_renderer(pipeline)
                 return pipeline
             video_tee = self._method(pipeline, "get_by_name")("video_tee")
             audio_tee = self._method(pipeline, "get_by_name")("audio_tee")
@@ -4013,6 +4023,7 @@ class PyGObjectGStreamerDriver:
             self._set_generation_open(first, True)
             if not self._method(first.bin, "set_locked_state")(False):
                 raise GStreamerDriverError("initial generation could not unlock")
+            self._attach_overlay_renderer(pipeline)
             self._generation_pipelines[id(pipeline)] = context
             return pipeline
         except Exception as error:
@@ -4022,15 +4033,42 @@ class PyGObjectGStreamerDriver:
                 f"could not construct the selected pipeline: {_bounded_detail(error)}"
             ) from error
 
+    def _attach_overlay_renderer(self, pipeline: object) -> None:
+        """Attach exactly one renderer after the named exact-caps filter."""
+
+        if id(pipeline) in self._overlay_renderers:
+            raise GStreamerDriverError("pipeline already owns a native overlay probe")
+        if self._gstvideo is None or self._gstallocators is None:
+            # Dependency-less construction is retained only for pure unit fakes;
+            # :meth:`load` always supplies and validates both target bindings.
+            return
+        capsfilter = self._method(pipeline, "get_by_name")("overlay_input")
+        if capsfilter is None:
+            raise GStreamerDriverError("selected pipeline has no exact overlay capsfilter")
+        renderer = GstDmabufOverlayRenderer(
+            self._gst,
+            self._gstallocators,
+            self._gstvideo,
+        )
+        try:
+            renderer.attach(capsfilter)
+        except Exception as error:
+            with suppress(Exception):
+                renderer.close()
+            raise GStreamerDriverError(
+                f"could not attach native overlay probe: {_bounded_detail(error)}"
+            ) from error
+        self._overlay_renderers[id(pipeline)] = renderer
+
     def set_overlay_text(self, pipeline: object, text: str | None) -> None:
-        """Apply one validated live text update to the named common overlay."""
+        """Apply one validated live text update to the pipeline-owned probe."""
 
         try:
             _validate_overlay_text(text)
-            overlay = self._method(pipeline, "get_by_name")("burned_overlay")
-            if overlay is None:
-                raise GStreamerDriverError("selected pipeline has no burned overlay")
-            self._method(overlay, "set_overlay_text")(text)
+            renderer = self._overlay_renderers.get(id(pipeline))
+            if renderer is None:
+                raise GStreamerDriverError("selected pipeline has no native overlay probe")
+            renderer.set_text(text)
         except Exception as error:
             if isinstance(error, GStreamerDriverError | ValueError):
                 raise
@@ -4039,21 +4077,21 @@ class PyGObjectGStreamerDriver:
             ) from error
 
     def overlay_snapshot(self, pipeline: object) -> dict[str, object]:
-        """Read coordinate-free native-transform accounting."""
+        """Read coordinate-free native-DMABUF accounting."""
 
         try:
-            overlay = self._method(pipeline, "get_by_name")("burned_overlay")
-            if overlay is None:
-                raise GStreamerDriverError("selected pipeline has no burned overlay")
-            snapshot = self._method(overlay, "overlay_snapshot")()
+            renderer = self._overlay_renderers.get(id(pipeline))
+            if renderer is None:
+                raise GStreamerDriverError("selected pipeline has no native overlay probe")
+            snapshot = renderer.snapshot()
             if not isinstance(snapshot, dict):
                 raise GStreamerDriverError("native overlay returned an invalid snapshot")
-            return cast(dict[str, object], snapshot)
+            return snapshot
         except Exception as error:
             if isinstance(error, GStreamerDriverError):
                 raise
             raise GStreamerDriverError(
-                f"could not inspect the burned overlay: {_bounded_detail(error)}"
+                f"could not inspect the native overlay: {_bounded_detail(error)}"
             ) from error
 
     @staticmethod
@@ -4550,7 +4588,30 @@ class PyGObjectGStreamerDriver:
             self._publish_stable_topology(context, measured)
 
     def set_null(self, pipeline: object, timeout_s: float) -> None:
-        self._set_and_verify_state(pipeline, "NULL", timeout_s)
+        renderer = self._overlay_renderers.get(id(pipeline))
+        renderer_cleanup_error: Exception | None = None
+        if renderer is not None:
+            try:
+                renderer.close(min(timeout_s, 2.0))
+            except Exception as error:
+                # The probe has already been removed, but one callback may be
+                # completing during the narrow post-EOS interval.  Camera
+                # ownership must still be forced to NULL before reporting it.
+                renderer_cleanup_error = error
+        try:
+            self._set_and_verify_state(pipeline, "NULL", timeout_s)
+        except Exception as error:
+            if renderer_cleanup_error is not None:
+                raise GStreamerDriverError(
+                    "GStreamer NULL transition failed after native overlay "
+                    f"cleanup delay: {_bounded_detail(error)}"
+                ) from renderer_cleanup_error
+            raise
+        if renderer is not None and renderer_cleanup_error is not None:
+            try:
+                renderer.close(min(timeout_s, 2.0))
+            except Exception as error:
+                renderer_cleanup_error = error
         context = self._generation_pipelines.get(id(pipeline))
         if context is not None:
             dispatch_deadline = time.monotonic() + min(timeout_s, 2.0)
@@ -4696,7 +4757,13 @@ class PyGObjectGStreamerDriver:
                 raise GStreamerDriverError("generation cleanup remains incomplete")
             context.cleanup_complete = True
             self._generation_pipelines.pop(id(pipeline), None)
+        self._overlay_renderers.pop(id(pipeline), None)
         self._metrics.pop(id(pipeline), None)
+        if renderer_cleanup_error is not None:
+            raise GStreamerDriverError(
+                "native overlay probe cleanup exceeded its pre-NULL bound: "
+                f"{_bounded_detail(renderer_cleanup_error)}"
+            ) from renderer_cleanup_error
 
     def _encoder(self, pipeline: object) -> object:
         encoder = self._method(pipeline, "get_by_name")("encoder")

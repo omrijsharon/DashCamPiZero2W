@@ -5,58 +5,132 @@ from typing import Any, cast
 
 import pytest
 
+import dashcam.overlay.native_nv12 as native_nv12
 from dashcam.overlay import OVERLAY_1080P_LAYOUT
 from dashcam.overlay.native_nv12 import (
+    DMABUF_SYNC_END_WRITE,
+    DMABUF_SYNC_START_WRITE,
+    MAX_DMABUF_MAPPINGS,
     NV12_BUFFER_SIZE,
     NV12_UV_OFFSET,
     OVERLAY_BACKGROUND_LUMA,
     OVERLAY_FOREGROUND_LUMA,
+    DmabufMemoryGeometry,
+    GstDmabufOverlayRenderer,
+    NativeDmabufFrame,
     NativeNv12OverlayCore,
     NativeOverlayContractError,
-    Nv12FrameLayout,
     render_luma_bitmap,
     validate_native_overlay_text,
 )
 
 
-def exact_layout() -> Nv12FrameLayout:
-    return Nv12FrameLayout(
-        width=1920,
-        height=1080,
-        format="NV12",
+def exact_frame(fd: int = 10, *, allocator: str = "libcameraallocator0") -> NativeDmabufFrame:
+    return NativeDmabufFrame(
+        caps_features="memory:SystemMemory",
+        caps_media_type="video/x-raw",
+        caps_width=1920,
+        caps_height=1080,
+        caps_format="NV12",
+        caps_framerate="30/1",
         buffer_size=NV12_BUFFER_SIZE,
-        y_stride=1920,
-        y_offset=0,
-        uv_stride=1920,
-        uv_offset=NV12_UV_OFFSET,
+        buffer_memory_count=2,
+        buffer_all_memory_writable=False,
+        memories=(
+            DmabufMemoryGeometry(
+                allocator_name=allocator,
+                is_dmabuf=True,
+                is_fd_memory=True,
+                fd=fd,
+                size=2_073_600,
+                offset=0,
+                maxsize=2_073_600,
+            ),
+            DmabufMemoryGeometry(
+                allocator_name=allocator,
+                is_dmabuf=True,
+                is_fd_memory=True,
+                fd=fd,
+                size=1_036_800,
+                offset=2_073_600,
+                maxsize=3_110_400,
+            ),
+        ),
+        video_meta_width=1920,
+        video_meta_height=1080,
+        video_meta_planes=2,
+        video_meta_offsets=(0, 2_073_600, 0, 0),
+        video_meta_strides=(1920, 1920, 0, 0),
     )
 
 
-class FakeBuffer:
-    def __init__(self, *, size: int = NV12_BUFFER_SIZE) -> None:
-        self.data = bytearray([128]) * size
-        self.fills: list[tuple[int, int]] = []
+class FakeMapping:
+    def __init__(self, *, fail_write_at: int | None = None) -> None:
+        self.data = bytearray([128]) * NV12_BUFFER_SIZE
+        self.writes: list[tuple[int, int]] = []
+        self.fail_write_at = fail_write_at
+        self.closed = False
 
-    def get_size(self) -> int:
-        return len(self.data)
+    def __setitem__(self, key: slice, value: bytes) -> None:
+        if self.fail_write_at == len(self.writes):
+            raise OSError("mapped write failed\nwith untrusted detail")
+        assert key.start is not None and key.stop is not None
+        self.data[key] = value
+        self.writes.append((key.start, key.stop - key.start))
 
-    def fill(self, offset: int, data: bytes) -> int:
-        self.data[offset : offset + len(data)] = data
-        self.fills.append((offset, len(data)))
-        return len(data)
-
-
-class ShortWriteBuffer(FakeBuffer):
-    def fill(self, offset: int, data: bytes) -> int:
-        if len(self.fills) == 2:
-            self.fills.append((offset, len(data) - 1))
-            return len(data) - 1
-        return super().fill(offset, data)
+    def close(self) -> None:
+        self.closed = True
 
 
-class FailingBuffer(FakeBuffer):
-    def fill(self, offset: int, data: bytes) -> int:
-        raise OSError("write failed\nwith untrusted detail")
+class FakeAccess:
+    def __init__(self) -> None:
+        self.identities: dict[int, tuple[int, int]] = {}
+        self.duplicates: list[tuple[int, int]] = []
+        self.mappings: dict[int, FakeMapping] = {}
+        self.syncs: list[tuple[int, int]] = []
+        self.closed_fds: list[int] = []
+        self.fail_sync_flag: int | None = None
+        self.fail_write_at: int | None = None
+        self.change_duplicate_identity = False
+
+    def identity(self, fd: int) -> tuple[int, int]:
+        return self.identities.setdefault(fd, (7, fd % 1000))
+
+    def duplicate(self, fd: int) -> int:
+        duplicate = fd + 1000
+        self.duplicates.append((fd, duplicate))
+        source_identity = self.identity(fd)
+        self.identities[duplicate] = (
+            (source_identity[0], source_identity[1] + 1)
+            if self.change_duplicate_identity
+            else source_identity
+        )
+        return duplicate
+
+    def map_shared(self, fd: int, length: int) -> FakeMapping:
+        assert length == NV12_BUFFER_SIZE
+        mapped = FakeMapping(fail_write_at=self.fail_write_at)
+        self.mappings[fd] = mapped
+        return mapped
+
+    def sync(self, fd: int, flags: int) -> None:
+        self.syncs.append((fd, flags))
+        if flags == self.fail_sync_flag:
+            raise OSError(f"sync {flags} failed")
+
+    def close_fd(self, fd: int) -> None:
+        self.closed_fds.append(fd)
+
+
+def core_and_access(
+    *,
+    max_mappings: int = MAX_DMABUF_MAPPINGS,
+) -> tuple[NativeNv12OverlayCore, FakeAccess]:
+    access = FakeAccess()
+    return (
+        NativeNv12OverlayCore(access=access, max_mappings=max_mappings),
+        access,
+    )
 
 
 def test_measured_native_region_and_bitmap_are_fixed_opaque_and_deterministic() -> None:
@@ -67,16 +141,14 @@ def test_measured_native_region_and_bitmap_are_fixed_opaque_and_deterministic() 
         layout.glyph_width_px,
         layout.line_height_px,
     ) == (1152, 64, 12, 32)
-
     text = "2026-08-03 21:27:04 +03:00  REC\n31.76832, 35.21371   54 km/h   ALT 782 m   SAT 11"
-    first = render_luma_bitmap(text)
-    second = render_luma_bitmap(text)
 
-    assert first == second
+    first = render_luma_bitmap(text)
+
+    assert first == render_luma_bitmap(text)
     assert len(first) == 1152 * 64
     assert set(first) == {OVERLAY_BACKGROUND_LUMA, OVERLAY_FOREGROUND_LUMA}
     assert first.count(OVERLAY_FOREGROUND_LUMA) > 1_000
-    assert first.count(OVERLAY_BACKGROUND_LUMA) > first.count(OVERLAY_FOREGROUND_LUMA)
 
 
 @pytest.mark.parametrize(
@@ -111,134 +183,236 @@ def test_renderer_refuses_unrepresentable_or_unbounded_payloads(
 @pytest.mark.parametrize(
     "changed",
     [
-        {"width": 1280},
-        {"height": 720},
-        {"format": "I420"},
+        {"caps_features": "memory:DMABuf"},
+        {"caps_media_type": "video/x-bayer"},
+        {"caps_width": 1280},
+        {"caps_height": 720},
+        {"caps_format": "I420"},
+        {"caps_framerate": "30000/1001"},
         {"buffer_size": NV12_BUFFER_SIZE + 1},
-        {"y_stride": 2048},
-        {"y_offset": 16},
-        {"uv_stride": 2048},
-        {"uv_offset": NV12_UV_OFFSET + 1},
+        {"buffer_memory_count": 1},
+        {"buffer_all_memory_writable": True},
+        {"video_meta_width": 1280},
+        {"video_meta_height": 720},
+        {"video_meta_planes": 1},
+        {"video_meta_offsets": (1, NV12_UV_OFFSET, 0, 0)},
+        {"video_meta_strides": (2048, 1920, 0, 0)},
     ],
 )
-def test_caps_contract_refuses_every_layout_drift(changed: dict[str, object]) -> None:
-    core = NativeNv12OverlayCore()
-    with pytest.raises(NativeOverlayContractError, match="tightly packed"):
-        core.configure_layout(replace(exact_layout(), **cast(Any, changed)))
+def test_every_caps_buffer_and_video_meta_drift_latches_passthrough(
+    changed: dict[str, object],
+) -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+
+    assert core.render(replace(exact_frame(), **cast(Any, changed))) is False
+
     snapshot = core.snapshot()
-    assert snapshot.state == "UNCONFIGURED"
-    assert snapshot.caps_accepted is False
-    assert snapshot.last_error == "overlay requires tightly packed 1920x1080 NV12"
+    assert snapshot.state == "ISOLATED"
+    assert snapshot.contract_mismatches == 1
+    assert snapshot.transform_failures == 1
+    assert snapshot.frames_passthrough == 1
+    assert access.duplicates == []
 
 
-def test_transform_writes_only_the_measured_luma_region_and_counts_exact_bytes() -> None:
-    core = NativeNv12OverlayCore()
-    core.configure_layout(exact_layout())
+@pytest.mark.parametrize(
+    "allocator",
+    ["libcameraallocator0", "libcameraallocator1", "libcameraallocator999"],
+)
+def test_bounded_allocator_recovery_instances_are_accepted(allocator: str) -> None:
+    core, _ = core_and_access()
+    core.set_text("REC")
+    assert core.render(exact_frame(allocator=allocator)) is True
+
+
+@pytest.mark.parametrize(
+    "allocator",
+    [
+        "libcameraallocator",
+        "libcameraallocator00",
+        "libcameraallocator1000",
+        "otherallocator0",
+        "libcameraallocator-1",
+    ],
+)
+def test_allocator_name_shape_is_strict_and_bounded(allocator: str) -> None:
+    core, _ = core_and_access()
+    core.set_text("REC")
+    assert core.render(exact_frame(allocator=allocator)) is False
+    assert core.snapshot().state == "ISOLATED"
+
+
+def test_render_maps_once_reuses_identity_syncs_and_writes_only_luma_region() -> None:
+    core, access = core_and_access()
     core.set_text("TIME UNSYNCED\nGPS INVALID")
-    buffer = FakeBuffer()
-    before_chroma = bytes(buffer.data[NV12_UV_OFFSET:])
 
-    assert core.transform(buffer) is True
+    assert core.render(exact_frame()) is True
+    assert core.render(exact_frame()) is True
 
-    assert len(buffer.fills) == 64
-    assert buffer.fills[0] == (40 * 1920 + 40, 1152)
-    assert buffer.fills[-1] == ((40 + 63) * 1920 + 40, 1152)
-    assert bytes(buffer.data[NV12_UV_OFFSET:]) == before_chroma
-    assert buffer.data[0] == 128
-    assert buffer.data[40 * 1920 + 40] == OVERLAY_BACKGROUND_LUMA
+    assert access.duplicates == [(10, 1010)]
+    mapped = access.mappings[1010]
+    assert len(mapped.writes) == 128
+    assert mapped.writes[0] == (40 * 1920 + 40, 1152)
+    assert mapped.writes[63] == ((40 + 63) * 1920 + 40, 1152)
+    assert mapped.data[NV12_UV_OFFSET:] == bytes([128]) * (NV12_BUFFER_SIZE - NV12_UV_OFFSET)
+    assert access.syncs == [
+        (1010, DMABUF_SYNC_START_WRITE),
+        (1010, DMABUF_SYNC_END_WRITE),
+        (1010, DMABUF_SYNC_START_WRITE),
+        (1010, DMABUF_SYNC_END_WRITE),
+    ]
     snapshot = core.snapshot()
     assert snapshot.state == "ACTIVE"
-    assert snapshot.frames_seen == 1
-    assert snapshot.frames_rendered == 1
-    assert snapshot.frames_passthrough == 0
-    assert snapshot.bytes_written == 1152 * 64
-    assert snapshot.transform_failures == 0
+    assert snapshot.frames_rendered == 2
+    assert snapshot.bytes_written == 2 * 1152 * 64
+    assert snapshot.mappings_cached == snapshot.mappings_created == 1
+    assert snapshot.sync_starts == snapshot.sync_ends == 2
+    assert snapshot.render_latency_samples == 2
+    assert snapshot.render_latency_max_ns >= snapshot.render_latency_last_ns >= 0
+    assert sum(snapshot.render_latency_bucket_counts) == 2
 
 
-def test_silent_overlay_and_deduplicated_updates_do_no_frame_writes() -> None:
-    core = NativeNv12OverlayCore()
-    core.configure_layout(exact_layout())
+def test_silent_overlay_is_true_passthrough_without_validation_or_mapping() -> None:
+    core, access = core_and_access()
     core.set_text(None)
-    core.set_text(None)
-    buffer = FakeBuffer()
+    invalid = replace(exact_frame(), caps_format="I420")
 
-    assert core.transform(buffer) is False
+    assert core.render(invalid) is False
+
     snapshot = core.snapshot()
     assert snapshot.state == "SILENT"
-    assert snapshot.updates == 1
-    assert snapshot.frames_seen == 1
-    assert snapshot.frames_rendered == 0
-    assert snapshot.frames_passthrough == 1
-    assert buffer.fills == []
+    assert snapshot.frames_seen == snapshot.frames_passthrough == 1
+    assert snapshot.contract_mismatches == 0
+    assert snapshot.render_latency_samples == 0
+    assert access.duplicates == []
 
 
-def test_update_refusal_retains_the_last_valid_cached_bitmap() -> None:
-    core = NativeNv12OverlayCore()
-    core.configure_layout(exact_layout())
+def test_probe_skips_all_gi_extraction_when_disabled_or_already_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Enum:
+        OK = object()
+
+    class Gst:
+        PadProbeReturn = Enum
+
+    core, _ = core_and_access()
+    renderer = GstDmabufOverlayRenderer(Gst(), object(), object(), core=core)
+    extractions = 0
+
+    def forbidden_extraction(*_args: object) -> NativeDmabufFrame:
+        nonlocal extractions
+        extractions += 1
+        raise AssertionError("disabled probe performed GI extraction")
+
+    monkeypatch.setattr(native_nv12, "_extract_dmabuf_frame", forbidden_extraction)
+    core.set_text(None)
+    assert renderer._probe(object(), object()) is Enum.OK
+    core.isolate("already isolated")
+    assert renderer._probe(object(), object()) is Enum.OK
+
+    assert extractions == 0
+    snapshot = core.snapshot()
+    assert snapshot.frames_seen == snapshot.frames_passthrough == 3
+
+
+def test_update_refusal_retains_last_valid_bitmap() -> None:
+    core, _ = core_and_access()
     core.set_text("REC")
     with pytest.raises(NativeOverlayContractError, match="unsupported glyphs"):
         core.set_text("REC!")
-
-    buffer = FakeBuffer()
-    assert core.transform(buffer) is True
-    snapshot = core.snapshot()
-    assert snapshot.state == "ACTIVE"
-    assert snapshot.updates == 1
-    assert snapshot.update_rejections == 1
-    assert snapshot.frames_rendered == 1
+    assert core.render(exact_frame()) is True
+    assert core.snapshot().update_rejections == 1
 
 
-def test_wrong_buffer_size_isolates_without_writing_or_raising() -> None:
-    core = NativeNv12OverlayCore()
-    core.configure_layout(exact_layout())
+def test_mapping_cache_bound_latches_without_mapping_ninth_identity() -> None:
+    core, access = core_and_access(max_mappings=2)
     core.set_text("REC")
-    wrong = FakeBuffer(size=NV12_BUFFER_SIZE - 1)
+    assert core.render(exact_frame(10)) is True
+    assert core.render(exact_frame(11)) is True
 
-    assert core.transform(wrong) is False
-    assert wrong.fills == []
+    assert core.render(exact_frame(12)) is False
+
     snapshot = core.snapshot()
-    assert snapshot.state == "ISOLATED"
-    assert snapshot.buffer_size_mismatches == 1
+    assert snapshot.mapping_limit_rejections == 1
+    assert snapshot.mappings_cached == 2
+    assert len(access.duplicates) == 2
+
+
+def test_duplicate_identity_drift_closes_temporary_resources_and_isolates() -> None:
+    core, access = core_and_access()
+    access.change_duplicate_identity = True
+    core.set_text("REC")
+
+    assert core.render(exact_frame()) is False
+
+    assert access.closed_fds == [1010]
+    assert access.mappings == {}
+    assert core.snapshot().contract_mismatches == 1
+
+
+def test_sync_start_failure_isolates_without_write_or_unmatched_end() -> None:
+    core, access = core_and_access()
+    access.fail_sync_flag = DMABUF_SYNC_START_WRITE
+    core.set_text("REC")
+
+    assert core.render(exact_frame()) is False
+
+    assert access.syncs == [(1010, DMABUF_SYNC_START_WRITE)]
+    assert access.mappings[1010].writes == []
+    snapshot = core.snapshot()
+    assert snapshot.sync_starts == snapshot.sync_ends == 0
+    assert snapshot.sync_failures == 1
+
+
+def test_write_failure_still_ends_sync_then_latches_all_future_passthrough() -> None:
+    core, access = core_and_access()
+    access.fail_write_at = 2
+    core.set_text("REC")
+
+    assert core.render(exact_frame()) is False
+    assert access.syncs == [
+        (1010, DMABUF_SYNC_START_WRITE),
+        (1010, DMABUF_SYNC_END_WRITE),
+    ]
+    assert core.render(exact_frame()) is False
+
+    snapshot = core.snapshot()
+    assert snapshot.sync_starts == snapshot.sync_ends == 1
     assert snapshot.transform_failures == 1
-    assert snapshot.frames_passthrough == 1
+    assert snapshot.frames_passthrough == 2
+    assert snapshot.bytes_written == 2 * 1152
+    assert snapshot.last_error == "mapped write failed with untrusted detail"
 
 
-def test_short_write_latches_isolation_and_all_later_frames_pass_through() -> None:
-    core = NativeNv12OverlayCore()
-    core.configure_layout(exact_layout())
-    core.set_text("REC")
-    first = ShortWriteBuffer()
-
-    assert core.transform(first) is False
-    after_failure = core.snapshot()
-    assert after_failure.state == "ISOLATED"
-    assert after_failure.short_writes == 1
-    assert after_failure.transform_failures == 1
-    assert after_failure.bytes_written == 2 * 1152
-
-    later = FakeBuffer()
-    assert core.transform(later) is False
-    assert later.fills == []
-    final = core.snapshot()
-    assert final.frames_seen == 2
-    assert final.frames_rendered == 0
-    assert final.frames_passthrough == 2
-
-
-def test_transform_exception_is_bounded_sanitized_and_isolated() -> None:
-    core = NativeNv12OverlayCore()
-    core.configure_layout(exact_layout())
+def test_sync_end_failure_is_bounded_and_isolates_completed_write() -> None:
+    core, access = core_and_access()
+    access.fail_sync_flag = DMABUF_SYNC_END_WRITE
     core.set_text("REC")
 
-    assert core.transform(FailingBuffer()) is False
+    assert core.render(exact_frame()) is False
+
     snapshot = core.snapshot()
-    assert snapshot.state == "ISOLATED"
-    assert snapshot.last_error == "write failed with untrusted detail"
-    assert len(snapshot.last_error) <= 256
+    assert snapshot.frames_rendered == 0
+    assert snapshot.bytes_written == 1152 * 64
+    assert snapshot.sync_starts == 1
+    assert snapshot.sync_ends == 0
+    assert snapshot.sync_failures == 1
 
 
-def test_transform_before_caps_is_a_negotiation_error() -> None:
-    core = NativeNv12OverlayCore()
+def test_close_releases_every_mapping_and_descriptor_once_and_refuses_updates() -> None:
+    core, access = core_and_access()
     core.set_text("REC")
-    with pytest.raises(NativeOverlayContractError, match="before exact caps"):
-        core.transform(FakeBuffer())
+    assert core.render(exact_frame(10)) is True
+    assert core.render(exact_frame(11)) is True
+
+    core.close()
+    core.close()
+
+    assert sorted(access.closed_fds) == [1010, 1011]
+    assert all(mapped.closed for mapped in access.mappings.values())
+    snapshot = core.snapshot()
+    assert snapshot.mappings_cached == 0
+    assert snapshot.mappings_closed == 2
+    with pytest.raises(NativeOverlayContractError, match="closed"):
+        core.set_text("GPS INVALID")

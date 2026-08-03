@@ -703,6 +703,25 @@ class GStreamerRecorderRuntime:
         backend = self._backend
         restoration = getattr(backend, "audio_restoration_snapshot", None)
         restoration_snapshot = restoration if isinstance(restoration, dict) else None
+        overlay_renderer: dict[str, object] | None = None
+        overlay_snapshot_error: str | None = None
+        inspect_overlay = getattr(backend, "overlay_snapshot", None)
+        if callable(inspect_overlay):
+            try:
+                observed_overlay = inspect_overlay()
+                if isinstance(observed_overlay, dict):
+                    overlay_renderer = observed_overlay
+                else:
+                    overlay_snapshot_error = "overlay renderer returned an invalid snapshot"
+            except BaseException as error:
+                overlay_snapshot_error = _bounded_exception_detail(error)
+        renderer_faulted = (
+            overlay_snapshot_error is not None
+            or (
+                overlay_renderer is not None
+                and overlay_renderer.get("state") == "ISOLATED"
+            )
+        )
         return {
             "video": None
             if profile is None
@@ -795,13 +814,22 @@ class GStreamerRecorderRuntime:
                     "DISABLED"
                     if config is not None and not config.overlay.enabled
                     else "FAULTED"
-                    if self._overlay_task_error is not None
+                    if self._overlay_task_error is not None or renderer_faulted
                     else "ACTIVE"
                     if self._overlay_task is not None
                     else "INACTIVE"
                 ),
                 "updates": self._overlay_updates,
-                "last_error": self._overlay_task_error,
+                "last_error": (
+                    self._overlay_task_error
+                    or overlay_snapshot_error
+                    or (
+                        None
+                        if overlay_renderer is None
+                        else cast(str | None, overlay_renderer.get("last_error"))
+                    )
+                ),
+                "renderer": overlay_renderer,
             },
             "gps": self._gps_runtime_snapshot(),
             "metadata_reconciliation": {

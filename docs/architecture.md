@@ -34,7 +34,7 @@ Phone-preview transport remains open.
 | H.264 encoder and caps | Select dynamically discovered `v4l2h264enc` for Milestone 6 with an explicit level cap, High/4.1, 8 Mbit/s target, GOP 30, repeated headers, and the default hardware VBR mode; never request `video_bitrate_mode=1` on this stack | Control matrix plus installed continuous recorder/rollover evidence in `docs/test-reports/2026-07-26-gstreamer-explicit-caps.md` and `docs/test-reports/2026-07-26-milestone6-recorder-live.md` |
 | MP4 muxer/finalization profile | Select asynchronous `splitmuxsink` with `mp4mux` in explicit `dash-or-mss` fragmented mode at 1-second intervals; ordinary target is a 60-second IDR boundary | The installed service promoted a 59.988667-second IDR-started production pair, finalized its active 24.528667-second shutdown fragment, refused a collision, and reconciled an interrupted pair operation; evidence: `docs/test-reports/2026-07-26-milestone6-finalization-live.md` |
 | UART | Select PL011 `/dev/ttyAMA0` through `/dev/serial0`; disable Bluetooth and remove the serial console | Boot-file hashes, reboot, device-link and GPIO-function verification |
-| Burned-in overlay | Keep GStreamer NV12 `textoverlay` as the first measured candidate | 1080p30 negotiation succeeded; added about 45 percentage points of one-core CPU and about 9 MiB RSS in a short run |
+| Burned-in overlay | Reject stock `textoverlay` and `gdkpixbufoverlay`; develop the measured in-process native-NV12 fixed-luma-region `GstBaseTransform` candidate | Installed `textoverlay` delivered about 10.4 fps and stock fixed-region composition about 18.3 fps. An isolated native transform matched the 30.006 fps no-overlay baseline while writing every frame, but production GPS/audio/dynamic/rollover qualification remains open; evidence: `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md` |
 | Preview camera path | Select a secondary 640x360 NV12 stream from the same `libcamerasrc`; request 30 fps and drop to 15 fps only after a bounded leaky queue | Dual-stream test retained the 1080p30 recording caps and one camera owner |
 | USB audio device identifier and AAC path | Select USB `08bb:2902` plus product/physical path; shared-pipeline-clock 48 kHz mono S16LE through `alsasrc`/bounded queue/`audioresample`/`voaacenc` 128 kbit/s/`aacparse`; production defaults retain bounded three-slot immutable-generation loss isolation and restoration | Ten integrated A/V clips passed IDR, independent decode, exact-zero boundaries, and 4.000–64.333 ms stream-edge skew. The final two-cycle logical loss/restoration run passed audio truth `[true,false,true,false,true]`, IDR-first hardware decode, 71.958–84.291 ms A/V skew, unchanged drops, and zero restart. Release `0.1.0.dev0-09a6dd3b374d3952` then passed ordinary startup without the microphone and finalized truthful video-only media. Physical hot-unplug/replug is not a current acceptance requirement. Evidence: `docs/test-reports/2026-07-27-milestone7-audio-live.md`, `docs/test-reports/2026-07-28-milestone7-production-restoration-live.md`, `docs/test-reports/2026-07-28-milestone7-absent-startup-live.md` |
 | GPS baud, NMEA reliability, UTC anchoring, clip telemetry, and wall-clock ownership | Select receive-only 115200-baud NMEA from the FlyFishRC M10 Mini on PL011; accept only checksum/parse-valid RMC/ZDA UTC through configured plausibility/continuity policy; coalesce RMC/GGA by receiver epoch into a bounded 10 Hz, three-minute monotonic history and half-open per-clip windows; retain stock `systemd-timesyncd` as the sole Linux wall-clock owner while all media timing remains pipeline/monotonic; reconcile provisional sidecars/names through a schema-4 durable intent and bounded same-boot UUID backlog | The production UART, no-GPS, anchor, sidecar, clock-step, late-lock reconciliation, and exact-exFAT collision gates passed. Release `0.1.0.dev0-7fd1e73debb731b6` retained exactly 600 unique samples in a full clip and 431 in its shutdown successor. Release `0.1.0.dev0-6f943f3a4edf7117` reconciled two no-GPS clips from one later trusted anchor while preserving UUIDs, truthful empty historical navigation, full hardware/AAC decode, and zero drops/restarts. A controlled +120-second wall-clock step left all sequence-390 video/audio PTS and DTS strictly increasing. Evidence: `docs/test-reports/2026-07-28-milestone8-gps-uart-live.md`, `docs/test-reports/2026-07-28-milestone8-no-gps-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-anchor-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-sidecar-live.md`, `docs/test-reports/2026-07-28-milestone8-clock-step-live.md`, and `docs/test-reports/2026-07-28-milestone8-reconciliation-live.md` |
@@ -233,10 +233,17 @@ Phone-preview transport remains open.
 
 ### ADR-P0B-005: Burned-in telemetry overlay
 
-- Decision for Milestone 9 implementation: insert one named GStreamer
-  `textoverlay` in the common 1920x1080 NV12 path after the raw caps and before
-  `v4l2h264enc`. Video-only, legacy A/V, and immutable audio-generation graphs
-  therefore share exactly one camera, overlay, and hardware encoder.
+- Rejected decision: stock GStreamer `textoverlay` in the common 1920x1080
+  NV12 path negotiated correctly but delivered only about 10.4 fps on the
+  exact Pi. Stock `gdkpixbufoverlay` with a pre-rendered small RGBA region
+  delivered about 18.3 fps. Neither may be used for the production profile.
+- Current candidate: register one recorder-owned native-NV12
+  `GstBaseTransform` after the raw caps and before `v4l2h264enc`, and copy a
+  cached opaque fixed luma region into each writable buffer. The isolated
+  capability probe delivered 30.006 fps, matching a same-session no-overlay
+  arm, with no RGB conversion, short write, decode failure, or throttling.
+  Video-only, legacy A/V, and immutable audio-generation graphs must still
+  share exactly one camera, overlay transform, and hardware encoder.
 - Decision: configure the initial overlay while the graph is still stopped so
   the first encoded buffer is never briefly unmarked. Later updates are one
   fixed two-line printable-ASCII payload, deduplicated at 2 Hz with no queue or
@@ -248,13 +255,35 @@ Phone-preview transport remains open.
   only when both the service state and sentence say they are valid; stale
   values collapse to `GPS LOST`, and absent/untrusted time collapses to
   `TIME UNSYNCED`.
-- Dependency gate: the exact Pi currently lacks the `textoverlay` factory.
-  `gstreamer1.0-x` is therefore a declared exact-version installation
-  dependency, and the hash-closed installer must discover `textoverlay` before
-  accepting a staged release.
-- Evidence state: local graph, bounds, stale-data, failure-isolation, installer,
-  lint, and type checks pass. Exact-Pi negotiation, rendering, dynamic stress,
-  shared-snapshot media proof, and performance comparison remain unchecked.
+- Dependency history: release `0.1.0.dev0-e727ddccd94659ff` installed exact
+  `gstreamer1.0-x=1.26.2-1+rpt3+deb13u1` to obtain `textoverlay`; that renderer
+  is now rejected. Corrected images and application manifests no longer
+  declare it or smoke-test its factory. The package remains intentionally
+  installed as a harmless legacy extra on the development Pi because the
+  fail-closed installer performs exact additions but no removals; removing it
+  would require a separate authorized pinned transaction.
+- Evidence state: the rejected production candidate, stock fixed-region
+  alternative, native-transform capability arm, and matched no-overlay arm are
+  recorded in
+  `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
+  Dynamic production rendering, shared-snapshot proof, integrated audio/GPS,
+  clip-boundary stress, and the longer resource comparison remain unchecked.
+- Comparative acceptance is fixed before the integrated run: paired arms use
+  one warm-up plus at least ten one-minute clips and at least 1 Hz samples.
+  Each clip must deliver at least 29.9 fps; drops/restarts may not increase;
+  mean process CPU delta is capped at 35 percentage points with overlay p95 at
+  100%; mean RSS delta is capped at 16 MiB with 32 MiB maximum within-arm
+  growth; non-zram swap remains absent and within-arm zram growth is capped at
+  4 MiB; throttle/undervoltage remain zero and temperature stays at or below
+  80 C. Product specification Section C1 is authoritative.
+- The native element begins in true GStreamer passthrough and returns to
+  passthrough when overlay text is disabled or a write fault latches
+  isolation. Enabled operation may still require `GstBaseTransform` to make a
+  non-writable upstream buffer writable; the exact-Pi comparison must measure
+  this cost and record the observed per-buffer video metadata/memory layout.
+  A write failure can leave one partially modified frame before isolation;
+  version 1 preserves recording continuity, reports the bounded failure, and
+  passes all later frames through.
 
 ## Implemented hardware-independent boundaries
 
@@ -297,9 +326,10 @@ interfaces:
   leases, retention eligibility, durable pair-operation intents, event windows,
   and bounded startup reconciliation against an injected recording filesystem.
 - Overlay formatting consumes one coherent telemetry snapshot and emits bounded
-  text/layout data. The first target candidate is now wired as one common
-  pre-encoder `textoverlay`; initial state is bound before PLAYING and later
-  changed text is updated through a queue-free optional worker.
+  text/layout data. The first pre-encoder `textoverlay` source slice bound
+  initial state before PLAYING and used a queue-free optional worker, but its
+  exact-Pi production release is rejected and disabled. Native-NV12
+  fixed-region production integration is pending.
 - The unprivileged web policy layer owns sessions, CSRF, reauthentication, input
   bounds, and secret redaction. It talks only through a closed, bounded
   Unix-socket protocol; recorder-approved downloads carry leases and are released

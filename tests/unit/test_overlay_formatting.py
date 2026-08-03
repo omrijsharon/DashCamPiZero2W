@@ -163,4 +163,4 @@ def test_1080p_layout_is_strict_and_all_generated_default_values_fit() -> None:
 
 def test_layout_bounds_refuse_unrenderable_text_region() -> None:
     with pytest.raises(OverlayFormatError, match="character bound"):
-        OverlayLayout(region_width_px=1535)
+        OverlayLayout(region_width_px=1151)

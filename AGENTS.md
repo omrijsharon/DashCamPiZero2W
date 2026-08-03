@@ -46,7 +46,19 @@
   never refresh between the saved plan and apply. Apply is exact-version,
   no-upgrade, bounded, and must be repeated through a new dry-run to prove
   idempotency.
-- The current M8-qualified exact-Pi deployment runs hash-closed release
+- The current installed exact-Pi release is the rejected Milestone 9
+  `textoverlay` candidate `0.1.0.dev0-e727ddccd94659ff`. Its exact-version and
+  idempotent deployment passed, but its production run delivered only about
+  10.4 fps at the unchanged 1080p30 hardware-H.264 profile. Stock
+  `gdkpixbufoverlay` reached only about 18.3 fps. Do not start that release
+  again. `dashcamd.service` is deliberately disabled and inactive so a reboot
+  cannot start it; storage check and network fallback remain enabled. An
+  isolated recorder-owned native-NV12 fixed-luma-region `GstBaseTransform`
+  capability probe matched the 30.006 fps no-overlay baseline while writing
+  every frame, but production integration and the full Milestone 9 matrix
+  remain open. Evidence:
+  `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
+- The last M8-qualified exact-Pi deployment ran hash-closed release
   `0.1.0.dev0-921164f96ad53e0b`; its manifest, final `SHA256SUMS`, and wheel
   SHA-256 values are respectively
   `2421ce2595815814c6de91c0ae55f8c5ca4a9f5dc05871caafcad34be81264f6`,
@@ -60,8 +72,10 @@
   enabled, completed successfully, and reached `READY`.
   `dashcam-network-fallback.service` is installed and enabled but inactive and
   has never been started by systemd.
-  `dashcamd.service` is installed and enabled; its final Milestone 8
-  ordinary-recorder run ended cleanly with status 0 and it is inactive.
+  At the accepted Milestone 8 handoff `dashcamd.service` was installed and
+  enabled; its final ordinary-recorder run ended cleanly with status 0 and it
+  was inactive. The newer Milestone 9 safety state above supersedes that
+  historical service state.
   A later bounded no-GPS reboot/restore validation left the Pi on boot ID
   `0c5464fe-25a1-4a76-973f-e73d38287e06`; the exact managed config hash was
   restored, its temporary backup paths are absent, and the recorder was again
@@ -200,19 +214,13 @@
   transient fault-harness runs used synthetic anchors and must not be cited as
   physical-receiver UTC/filename evidence; sequences 398/399 remain the accepted
   late-lock reconciliation authority.
-- On 2026-08-03 the Milestone 9 local overlay slice added one named, initially
-  preconfigured GStreamer `textoverlay` in the common NV12 path before
-  `v4l2h264enc`, plus a deduplicated queue-free 2 Hz updater using the same GPS
-  anchor policy and IANA projection model as metadata reconciliation.
-  `gstreamer1.0-x` is now a declared package and the installer smoke requires
-  the `textoverlay` factory. Keep all Milestone 9 Pi boxes unchecked until the
-  exact target passes negotiation, dynamic rendering, shared-snapshot, and
-  performance gates. The Pi is on boot ID
-  `91dc363d-3e76-47d3-9c10-56f897c99e9d`; `dashcamd` was stopped cleanly after
-  reporting `STORAGE_FAULT` because `/srv/dashcam` had zero free bytes.
-  `clips` held about 22.77 GB, `pending` about 1.05 GB, `quarantine` about
-  649 MB, and `protected` was empty. Do not delete any recording/evidence
-  without the owner's explicit authorization.
+- Historical Milestone 9 predeployment state: the first local slice used
+  `textoverlay`, and the full exFAT volume initially blocked deployment. The
+  owner subsequently authorized the exact archived media/catalog reset and
+  obsolete-root cleanup recorded in the current Milestone 9 report. That
+  authorization was one transaction, not a general permission to delete later
+  recording/evidence. The current rejected-release and disabled-service state
+  is authoritative at the top of this file.
 - The earlier exact-Pi configured-GPS-absence simulation also passed on
   release `d72`: a temporary config used
   `/dev/dashcam-gps-deliberately-absent` while the physical module stayed

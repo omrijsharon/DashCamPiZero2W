@@ -742,6 +742,7 @@ def test_overlay_uses_one_gps_anchor_model_and_hides_stale_navigation() -> None:
             "state": "ACTIVE",
             "updates": 2,
             "last_error": None,
+            "renderer": None,
         }
         await runtime.stop()
 
@@ -780,6 +781,7 @@ def test_overlay_unsynced_disabled_and_failure_paths_do_not_restart_video() -> N
             "state": "DISABLED",
             "updates": 0,
             "last_error": None,
+            "renderer": None,
         }
         await disabled.stop()
 
@@ -1047,9 +1049,13 @@ def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> No
             )
         )
         while (
-            cast(dict[str, object], runtime.runtime_snapshot()["metadata_reconciliation"])[
-                "completed"
-            ]
+            cast(
+                int,
+                cast(
+                    dict[str, object],
+                    runtime.runtime_snapshot()["metadata_reconciliation"],
+                )["completed"],
+            )
             == 0
         ):
             await asyncio.sleep(0)
@@ -1130,9 +1136,13 @@ def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog() -> None:
             ),
         )
         while (
-            cast(dict[str, object], runtime.runtime_snapshot()["metadata_reconciliation"])[
-                "completed"
-            ]
+            cast(
+                int,
+                cast(
+                    dict[str, object],
+                    runtime.runtime_snapshot()["metadata_reconciliation"],
+                )["completed"],
+            )
             < 1
         ):
             await asyncio.sleep(0)
@@ -1148,9 +1158,13 @@ def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog() -> None:
             )
         )
         while (
-            cast(dict[str, object], runtime.runtime_snapshot()["metadata_reconciliation"])[
-                "completed"
-            ]
+            cast(
+                int,
+                cast(
+                    dict[str, object],
+                    runtime.runtime_snapshot()["metadata_reconciliation"],
+                )["completed"],
+            )
             < 2
         ):
             await asyncio.sleep(0)

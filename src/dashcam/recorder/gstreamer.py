@@ -28,6 +28,13 @@ from typing import Any, Final, Protocol, SupportsInt, cast
 from dashcam.audio.alsa import AlsaCaptureDevice, AlsaIdentity
 from dashcam.audio.linux import AudioDiscoveryOutcome, AudioDiscoveryStatus
 from dashcam.config import AudioConfig
+from dashcam.overlay.formatting import OVERLAY_1080P_LAYOUT
+from dashcam.overlay.native_nv12 import (
+    NATIVE_OVERLAY_FACTORY,
+    NativeOverlayContractError,
+    register_native_nv12_overlay,
+    validate_native_overlay_text,
+)
 from dashcam.recorder.pipeline import (
     PipelineContractError,
     ProfileValidationError,
@@ -45,9 +52,7 @@ PIPELINE_DESCRIPTION = (
     "libcamerasrc name=camera ! "
     "video/x-raw,width=(int)1920,height=(int)1080,format=(string)NV12,"
     "framerate=(fraction)30/1 ! "
-    "textoverlay name=burned_overlay text=\"\" silent=true "
-    "valignment=top halignment=left xpad=40 ypad=40 "
-    'font-desc="Monospace 20" shaded-background=true ! '
+    f"{NATIVE_OVERLAY_FACTORY} name=burned_overlay ! "
     "v4l2h264enc name=encoder "
     'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
     'h264_i_frame_period=30" ! '
@@ -1431,6 +1436,9 @@ class GStreamerDriver(Protocol):
     def set_overlay_text(self, pipeline: object, text: str | None) -> None:
         """Update or silence the bounded burned-in overlay."""
 
+    def overlay_snapshot(self, pipeline: object) -> dict[str, object]:
+        """Return bounded transform counters without frame or telemetry data."""
+
     def effective_caps(self, pipeline: object) -> EffectiveCaps:
         """Read the negotiated encoder sink/source caps."""
 
@@ -1555,6 +1563,7 @@ def _validate_overlay_text(text: str | None) -> None:
         )
     ):
         raise ValueError("overlay text exceeds the fixed two-line ASCII bounds")
+    validate_native_overlay_text(text, OVERLAY_1080P_LAYOUT)
 
 
 def _device_path_is_dynamic_video_node(value: str) -> bool:
@@ -1778,6 +1787,33 @@ class GStreamerBackend:
 
     def audio_counters(self) -> AudioCounters:
         return self._counters.audio_snapshot()
+
+    def overlay_snapshot(self) -> dict[str, object]:
+        """Expose bounded native-renderer evidence without retaining frame data."""
+
+        pipeline = self._pipeline
+        driver = self._driver
+        observe = getattr(driver, "overlay_snapshot", None)
+        if pipeline is None or not callable(observe):
+            return {
+                "state": "INACTIVE" if pipeline is None else "UNAVAILABLE",
+                "caps_accepted": False,
+                "enabled": False,
+                "updates": 0,
+                "update_rejections": 0,
+                "frames_seen": 0,
+                "frames_rendered": 0,
+                "frames_passthrough": 0,
+                "bytes_written": 0,
+                "buffer_size_mismatches": 0,
+                "short_writes": 0,
+                "transform_failures": 0,
+                "last_error": None,
+            }
+        observed = observe(pipeline)
+        if not isinstance(observed, dict):
+            raise GStreamerDriverError("native overlay returned an invalid snapshot")
+        return observed
 
     async def next_finalized_fragment(self) -> FinalizedFragment:
         """Wait for one validated closure event; callers should impose their own timeout."""
@@ -2802,9 +2838,17 @@ class _ForcedIdrGate:
 class PyGObjectGStreamerDriver:
     """Late-bound adapter for the target's PyGObject GStreamer API."""
 
-    def __init__(self, gst: object, gstvideo: object | None = None) -> None:
+    def __init__(
+        self,
+        gst: object,
+        gstvideo: object | None = None,
+        gstbase: object | None = None,
+        gobject: object | None = None,
+    ) -> None:
         self._gst = gst
         self._gstvideo = gstvideo
+        self._gstbase = gstbase
+        self._gobject = gobject
         self._metrics: dict[int, tuple[PipelineCounters, int]] = {}
         self._generation_pipelines: dict[int, _GenerationPipeline] = {}
 
@@ -2817,16 +2861,24 @@ class PyGObjectGStreamerDriver:
                 _dynamic_attribute(gi, "require_version"),
             )
             require_version("Gst", "1.0")
+            require_version("GstBase", "1.0")
             require_version("GstVideo", "1.0")
             gst = importlib.import_module("gi.repository.Gst")
+            gstbase = importlib.import_module("gi.repository.GstBase")
             gstvideo = importlib.import_module("gi.repository.GstVideo")
+            gobject = importlib.import_module("gi.repository.GObject")
             init = cast(Callable[[object | None], None], _dynamic_attribute(gst, "init"))
             init(None)
-        except (ImportError, AttributeError, ValueError) as error:
+            register_native_nv12_overlay(gst, gstbase, gstvideo, gobject)
+        except NativeOverlayContractError as error:
+            raise GStreamerDriverError(
+                f"native NV12 overlay is unavailable: {_bounded_detail(error)}"
+            ) from error
+        except (ImportError, AttributeError, TypeError, ValueError) as error:
             raise GStreamerDriverError(
                 f"PyGObject GStreamer 1.0 is unavailable: {_bounded_detail(error)}"
             ) from error
-        return cls(gst, gstvideo)
+        return cls(gst, gstvideo, gstbase, gobject)
 
     def _gst_member(self, name: str) -> object:
         try:
@@ -3978,17 +4030,30 @@ class PyGObjectGStreamerDriver:
             overlay = self._method(pipeline, "get_by_name")("burned_overlay")
             if overlay is None:
                 raise GStreamerDriverError("selected pipeline has no burned overlay")
-            if text is None:
-                self._method(overlay, "set_property")("silent", True)
-                self._method(overlay, "set_property")("text", "")
-                return
-            self._method(overlay, "set_property")("text", text)
-            self._method(overlay, "set_property")("silent", False)
+            self._method(overlay, "set_overlay_text")(text)
         except Exception as error:
             if isinstance(error, GStreamerDriverError | ValueError):
                 raise
             raise GStreamerDriverError(
                 f"could not update the burned overlay: {_bounded_detail(error)}"
+            ) from error
+
+    def overlay_snapshot(self, pipeline: object) -> dict[str, object]:
+        """Read coordinate-free native-transform accounting."""
+
+        try:
+            overlay = self._method(pipeline, "get_by_name")("burned_overlay")
+            if overlay is None:
+                raise GStreamerDriverError("selected pipeline has no burned overlay")
+            snapshot = self._method(overlay, "overlay_snapshot")()
+            if not isinstance(snapshot, dict):
+                raise GStreamerDriverError("native overlay returned an invalid snapshot")
+            return cast(dict[str, object], snapshot)
+        except Exception as error:
+            if isinstance(error, GStreamerDriverError):
+                raise
+            raise GStreamerDriverError(
+                f"could not inspect the burned overlay: {_bounded_detail(error)}"
             ) from error
 
     @staticmethod

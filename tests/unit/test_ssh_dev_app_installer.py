@@ -225,6 +225,7 @@ def test_canonical_packages_include_sorted_pygobject_gstreamer_runtime() -> None
         "python3-gst-1.0",
         "python3-gi",
     } <= set(packages)
+    assert "gstreamer1.0-x" not in packages
 
 
 def test_builder_pins_exact_uv_lock_tzdata_wheel_identity() -> None:
@@ -927,6 +928,11 @@ def test_release_uses_system_site_packages_and_smokes_application_and_gstreamer_
     assert timeout == installer.GSTREAMER_SMOKE_TIMEOUT_SECONDS
     assert output_limit == installer.GSTREAMER_SMOKE_MAX_OUTPUT_BYTES
     assert "gi.require_version('Gst','1.0')" in installer.GSTREAMER_IMPORT_SMOKE
+    assert "gi.require_version('GstBase','1.0')" in installer.GSTREAMER_IMPORT_SMOKE
+    assert "gi.require_version('GstVideo','1.0')" in installer.GSTREAMER_IMPORT_SMOKE
+    assert "register_native_nv12_overlay(Gst,GstBase,GstVideo,GObject)" in (
+        installer.GSTREAMER_IMPORT_SMOKE
+    )
     for module in (
         "dashcam.daemon",
         "dashcam.recorder.runtime",
@@ -947,15 +953,23 @@ def test_release_uses_system_site_packages_and_smokes_application_and_gstreamer_
     for factory in (
         "queue",
         "libcamerasrc",
-        "textoverlay",
+        "dashcamnv12overlay",
         "v4l2h264enc",
         "alsasrc",
         "audioconvert",
         "audioresample",
         "voaacenc",
         "aacparse",
+        "videotestsrc",
+        "fakesink",
     ):
         assert repr(factory) in installer.GSTREAMER_IMPORT_SMOKE
+    assert "overlay.set_overlay_text('TIME UNSYNCED\\nGPS INVALID')" in (
+        installer.GSTREAMER_IMPORT_SMOKE
+    )
+    assert "overlay.overlay_snapshot()" in installer.GSTREAMER_IMPORT_SMOKE
+    assert "final['frames_rendered']==1" in installer.GSTREAMER_IMPORT_SMOKE
+    assert "textoverlay" not in installer.GSTREAMER_IMPORT_SMOKE
     assert (release / "installed.json").is_file()
 
 

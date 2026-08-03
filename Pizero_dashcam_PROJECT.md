@@ -1226,6 +1226,38 @@ Pass criteria:
 9. Feed bad-checksum and malformed NMEA; verify rejection without service failure.
 10. Feed an implausible date; verify it is rejected and logged.
 
+### C1. Overlay performance
+
+Before the Milestone 9 exit decision, run paired no-overlay and overlay arms on
+the same Pi/image, power source, storage, camera profile, GPS/audio setup, and
+ambient conditions. Each arm must include a warm-up clip followed by at least
+10 consecutive one-minute clips, with resource samples at least once per
+second. Run the arms close enough together that the comparison is not
+dominated by environment drift, and record their order.
+
+For version 1, “no statistically meaningful recording regression” means all
+of the following prespecified gates pass:
+
+- every measured clip delivers at least 29.9 frames/s at 1920x1080 with the
+  selected hardware H.264 encoder;
+- overlay-versus-baseline dropped-frame and pipeline/service-restart increases
+  are exactly zero;
+- every ordinary boundary remains no larger than one 30-fps frame period
+  after normalized-timestamp comparison;
+- mean recorder-process CPU increases by no more than 35 percentage points of
+  one core, overlay-arm 95th-percentile recorder CPU is no more than 100%,
+  mean RSS increases by no more than 16 MiB, and RSS growth within either arm
+  is no more than 32 MiB;
+- no non-zram swap is configured or used; zram may retain preexisting pages,
+  but used zram may grow by no more than 4 MiB between the first post-warm-up
+  and final sample in either arm; temperature remains at or below 80 C, and
+  no throttle or undervoltage flag appears.
+
+These comparative bounds are in addition to, not substitutes for, decoded
+media, first-frame burn-in, telemetry truth, A/V skew, and resource-margin
+checks. If a candidate misses any gate, stop and report it; do not change the
+default video profile to obtain a pass.
+
 ### D. Audio failure
 
 1. Start the recorder without the configured microphone; verify video-only recording and truthful status/metadata.
@@ -1477,6 +1509,14 @@ ordinary `RECORDING` with `UART_UNAVAILABLE`/`UNSYNCED`, 2,106 encoded frames,
 zero drops/restarts, and verified exFAT storage; the normal configuration was
 then restored byte-for-byte and ordinary recording restarted.
 Milestone 8 is accepted. Burned-in overlay integration remains Phase 4 work.
+On 2026-08-03 the installed stock `textoverlay` production candidate was
+rejected after delivering only about 10.4 fps at the unchanged 1080p30
+hardware-H.264 profile; stock `gdkpixbufoverlay` reached only about 18.3 fps.
+An isolated native-NV12 fixed-luma-region transform then matched a no-overlay
+30.006 fps arm. That capability result selects the next implementation
+direction but does not close Phase 4 until dynamic GPS/audio/sidecar,
+clip-boundary, and resource gates pass. Evidence:
+`docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
 
 ### Phase 4 — Overlay
 

@@ -388,6 +388,23 @@ class FakeDriver:
     restore_error: Exception | None = None
     overlay_texts: list[str | None] = field(default_factory=list)
     overlay_error: Exception | None = None
+    overlay_renderer_snapshot: dict[str, object] = field(
+        default_factory=lambda: {
+            "state": "ACTIVE",
+            "caps_accepted": True,
+            "enabled": True,
+            "updates": 1,
+            "update_rejections": 0,
+            "frames_seen": 30,
+            "frames_rendered": 30,
+            "frames_passthrough": 0,
+            "bytes_written": 30 * 73_728,
+            "buffer_size_mismatches": 0,
+            "short_writes": 0,
+            "transform_failures": 0,
+            "last_error": None,
+        }
+    )
     topology_snapshot: dict[str, object] = field(
         default_factory=lambda: {
             "topology_observation": "stable",
@@ -442,6 +459,10 @@ class FakeDriver:
         if self.overlay_error is not None:
             raise self.overlay_error
         self.overlay_texts.append(text)
+
+    def overlay_snapshot(self, pipeline: object) -> dict[str, object]:
+        assert pipeline is self.pipeline
+        return dict(self.overlay_renderer_snapshot)
 
     def effective_caps(self, pipeline: object) -> EffectiveCaps:
         assert pipeline is self.pipeline
@@ -533,15 +554,12 @@ def test_graph_is_exact_and_omits_unsafe_encoder_assignments() -> None:
     assert (
         "video/x-raw,width=(int)1920,height=(int)1080,format=(string)NV12,framerate=(fraction)30/1"
     ) in PIPELINE_DESCRIPTION
-    assert PIPELINE_DESCRIPTION.count("textoverlay name=burned_overlay") == 1
+    assert PIPELINE_DESCRIPTION.count("dashcamnv12overlay name=burned_overlay") == 1
     assert PIPELINE_DESCRIPTION.index("framerate=(fraction)30/1") < (
-        PIPELINE_DESCRIPTION.index("textoverlay name=burned_overlay")
+        PIPELINE_DESCRIPTION.index("dashcamnv12overlay name=burned_overlay")
     ) < PIPELINE_DESCRIPTION.index("v4l2h264enc name=encoder")
-    assert (
-        "textoverlay name=burned_overlay text=\"\" silent=true "
-        "valignment=top halignment=left xpad=40 ypad=40 "
-        'font-desc="Monospace 20" shaded-background=true'
-    ) in PIPELINE_DESCRIPTION
+    assert "dashcamnv12overlay name=burned_overlay" in PIPELINE_DESCRIPTION
+    assert "textoverlay" not in PIPELINE_DESCRIPTION
     assert (
         'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
         'h264_i_frame_period=30"'
@@ -609,8 +627,8 @@ def test_matched_audio_graph_is_exact_clocked_bounded_generation_ingress() -> No
         "tee name=video_tee allow-not-linked=true "
     )
     assert description.endswith("tee name=audio_tee allow-not-linked=true")
-    assert description.count("textoverlay name=burned_overlay") == 1
-    assert description.index("textoverlay name=burned_overlay") < description.index(
+    assert description.count("dashcamnv12overlay name=burned_overlay") == 1
+    assert description.index("dashcamnv12overlay name=burned_overlay") < description.index(
         "v4l2h264enc name=encoder"
     )
     assert description.count("name=video_continuity_queue") == 1
@@ -974,6 +992,7 @@ def test_backend_overlay_updates_are_bounded_serial_and_deduplicated() -> None:
             "TIME UNSYNCED\nGPS INVALID",
             None,
         ]
+        assert backend.overlay_snapshot() == driver.overlay_renderer_snapshot
 
         driver.messages.append(BusMessage(BusMessageKind.EOS))
         await backend.stop()
@@ -2163,9 +2182,29 @@ def cast_limits_factory(
 @dataclass
 class FakeElement:
     properties: list[tuple[str, object]] = field(default_factory=list)
+    overlay_texts: list[str | None] = field(default_factory=list)
+    overlay_snapshot_value: dict[str, object] = field(
+        default_factory=lambda: {
+            "state": "ACTIVE",
+            "caps_accepted": True,
+            "enabled": True,
+            "updates": 1,
+            "frames_seen": 1,
+            "frames_rendered": 1,
+            "frames_passthrough": 0,
+            "bytes_written": 73_728,
+            "last_error": None,
+        }
+    )
 
     def set_property(self, name: str, value: object) -> None:
         self.properties.append((name, value))
+
+    def set_overlay_text(self, text: str | None) -> None:
+        self.overlay_texts.append(text)
+
+    def overlay_snapshot(self) -> dict[str, object]:
+        return dict(self.overlay_snapshot_value)
 
 
 class _SyncFactoryIdentity:
@@ -2338,7 +2377,7 @@ def test_pygobject_driver_sets_output_properties_outside_parse_launch() -> None:
     assert config.location_pattern not in PIPELINE_DESCRIPTION
 
 
-def test_pygobject_driver_updates_and_silences_named_burned_overlay() -> None:
+def test_pygobject_driver_updates_and_inspects_named_native_overlay() -> None:
     overlay = FakeElement()
     pipeline = FakeGstPipeline(
         FakeElement(),
@@ -2350,12 +2389,8 @@ def test_pygobject_driver_updates_and_silences_named_burned_overlay() -> None:
     driver.set_overlay_text(pipeline, "TIME UNSYNCED\nGPS INVALID")
     driver.set_overlay_text(pipeline, None)
 
-    assert overlay.properties == [
-        ("text", "TIME UNSYNCED\nGPS INVALID"),
-        ("silent", False),
-        ("silent", True),
-        ("text", ""),
-    ]
+    assert overlay.overlay_texts == ["TIME UNSYNCED\nGPS INVALID", None]
+    assert driver.overlay_snapshot(pipeline) == overlay.overlay_snapshot_value
 
     missing = FakeGstPipeline(FakeElement(), FakeBus([]))
     with pytest.raises(GStreamerDriverError, match="no burned overlay"):

@@ -28,9 +28,9 @@ class OverlayLayout:
     frame_height_px: int = 1080
     origin_x_px: int = 40
     origin_y_px: int = 40
-    region_width_px: int = 1536
+    region_width_px: int = 1152
     region_height_px: int = 64
-    glyph_width_px: int = 16
+    glyph_width_px: int = 12
     line_height_px: int = 32
     max_line_chars: int = _MAX_LINE_CHARS
 

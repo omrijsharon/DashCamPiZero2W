@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import replace
 from typing import Any, cast
 
@@ -20,6 +21,7 @@ from dashcam.overlay.native_nv12 import (
     NativeDmabufFrame,
     NativeNv12OverlayCore,
     NativeOverlayContractError,
+    SystemDmabufAccess,
     render_luma_bitmap,
     validate_native_overlay_text,
 )
@@ -68,6 +70,7 @@ class FakeMapping:
     def __init__(self, *, fail_write_at: int | None = None) -> None:
         self.data = bytearray([128]) * NV12_BUFFER_SIZE
         self.writes: list[tuple[int, int]] = []
+        self.write_values: list[bytes] = []
         self.fail_write_at = fail_write_at
         self.closed = False
 
@@ -77,6 +80,7 @@ class FakeMapping:
         assert key.start is not None and key.stop is not None
         self.data[key] = value
         self.writes.append((key.start, key.stop - key.start))
+        self.write_values.append(value)
 
     def close(self) -> None:
         self.closed = True
@@ -131,6 +135,45 @@ def core_and_access(
         NativeNv12OverlayCore(access=access, max_mappings=max_mappings),
         access,
     )
+
+
+def test_system_access_caches_fcntl_and_prepacked_sync_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFcntl:
+        F_DUPFD_CLOEXEC = 1030
+
+        def __init__(self) -> None:
+            self.duplicates: list[tuple[int, int, int]] = []
+            self.syncs: list[tuple[int, int, bytes]] = []
+
+        def fcntl(self, fd: int, command: int, argument: int) -> int:
+            self.duplicates.append((fd, command, argument))
+            return fd + 1000
+
+        def ioctl(self, fd: int, request: int, argument: bytes) -> None:
+            self.syncs.append((fd, request, argument))
+
+    fake = FakeFcntl()
+    imports: list[str] = []
+
+    def import_module(name: str) -> object:
+        imports.append(name)
+        return fake
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    access = SystemDmabufAccess()
+
+    assert access.duplicate(10) == 1010
+    access.sync(1010, DMABUF_SYNC_START_WRITE)
+    access.sync(1010, DMABUF_SYNC_END_WRITE)
+
+    assert imports == ["fcntl"]
+    assert fake.duplicates == [(10, 1030, 0)]
+    assert [len(argument) for _, _, argument in fake.syncs] == [8, 8]
+    with pytest.raises(NativeOverlayContractError, match="sync flag"):
+        access.sync(1010, 3)
+    assert imports == ["fcntl"]
 
 
 def test_measured_native_region_and_bitmap_are_fixed_opaque_and_deterministic() -> None:
@@ -261,6 +304,14 @@ def test_render_maps_once_reuses_identity_syncs_and_writes_only_luma_region() ->
         (1010, DMABUF_SYNC_START_WRITE),
         (1010, DMABUF_SYNC_END_WRITE),
     ]
+    assert all(
+        first is second
+        for first, second in zip(
+            mapped.write_values[:64],
+            mapped.write_values[64:],
+            strict=True,
+        )
+    )
     snapshot = core.snapshot()
     assert snapshot.state == "ACTIVE"
     assert snapshot.frames_rendered == 2
@@ -317,6 +368,37 @@ def test_probe_skips_all_gi_extraction_when_disabled_or_already_isolated(
     assert extractions == 0
     snapshot = core.snapshot()
     assert snapshot.frames_seen == snapshot.frames_passthrough == 3
+
+
+def test_probe_still_validates_every_extracted_frame_before_dmabuf_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Enum:
+        OK = object()
+
+    class Gst:
+        PadProbeReturn = Enum
+
+    class Info:
+        def get_buffer(self) -> object:
+            return object()
+
+    core, access = core_and_access()
+    core.set_text("REC")
+    renderer = GstDmabufOverlayRenderer(Gst(), object(), object(), core=core)
+    monkeypatch.setattr(
+        native_nv12,
+        "_extract_dmabuf_frame",
+        lambda *_args: replace(exact_frame(), caps_format="I420"),
+    )
+
+    assert renderer._probe(object(), Info()) is Enum.OK
+
+    snapshot = core.snapshot()
+    assert snapshot.state == "ISOLATED"
+    assert snapshot.contract_mismatches == 1
+    assert snapshot.frames_passthrough == 1
+    assert access.duplicates == []
 
 
 def test_update_refusal_retains_last_valid_bitmap() -> None:

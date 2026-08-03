@@ -14,6 +14,7 @@ import os
 import re
 import struct
 import time
+from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from threading import Condition, Lock
@@ -35,6 +36,10 @@ SYSTEM_MEMORY_FEATURE: Final = "memory:SystemMemory"
 DMABUF_IOCTL_SYNC: Final = 0x40086200
 DMABUF_SYNC_START_WRITE: Final = 2
 DMABUF_SYNC_END_WRITE: Final = 6
+_DMABUF_SYNC_ARGUMENTS: Final = {
+    DMABUF_SYNC_START_WRITE: struct.pack("Q", DMABUF_SYNC_START_WRITE),
+    DMABUF_SYNC_END_WRITE: struct.pack("Q", DMABUF_SYNC_END_WRITE),
+}
 MAX_DMABUF_MAPPINGS: Final = 8
 MAX_ALLOCATOR_INSTANCE: Final = 999
 _ALLOCATOR_NAME: Final = re.compile(r"libcameraallocator(?:0|[1-9][0-9]{0,2})\Z")
@@ -62,6 +67,12 @@ class WritableMapping(Protocol):
     def __setitem__(self, key: slice, value: bytes) -> None: ...
 
     def close(self) -> None: ...
+
+
+class _FcntlModule(Protocol):
+    def fcntl(self, fd: int, command: int, argument: int) -> SupportsInt: ...
+
+    def ioctl(self, fd: int, request: int, argument: bytes) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,12 +368,22 @@ def render_luma_bitmap(
 class SystemDmabufAccess:
     """Production implementation of the narrow DMABUF syscall contract."""
 
+    def __init__(self) -> None:
+        self._fcntl_module: _FcntlModule | None = None
+
+    def _fcntl(self) -> _FcntlModule:
+        module = self._fcntl_module
+        if module is None:
+            module = cast(_FcntlModule, importlib.import_module("fcntl"))
+            self._fcntl_module = module
+        return module
+
     def identity(self, fd: int) -> tuple[int, int]:
         observed = os.fstat(fd)
         return int(observed.st_dev), int(observed.st_ino)
 
     def duplicate(self, fd: int) -> int:
-        fcntl = importlib.import_module("fcntl")
+        fcntl = self._fcntl()
         duplicate_cloexec = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
         if isinstance(duplicate_cloexec, int):
             return int(fcntl.fcntl(fd, duplicate_cloexec, 0))
@@ -387,8 +408,13 @@ class SystemDmabufAccess:
         )
 
     def sync(self, fd: int, flags: int) -> None:
-        fcntl = importlib.import_module("fcntl")
-        fcntl.ioctl(fd, DMABUF_IOCTL_SYNC, struct.pack("Q", flags))
+        try:
+            argument = _DMABUF_SYNC_ARGUMENTS[flags]
+        except KeyError as error:
+            raise NativeOverlayContractError(
+                "native overlay DMABUF sync flag is invalid"
+            ) from error
+        self._fcntl().ioctl(fd, DMABUF_IOCTL_SYNC, argument)
 
     def close_fd(self, fd: int) -> None:
         os.close(fd)
@@ -425,7 +451,18 @@ class NativeNv12OverlayCore:
         self._caps_accepted = False
         self._isolated = False
         self._text: str | object | None = _UNSET
-        self._bitmap: bytes | None = None
+        self._bitmap_rows: tuple[bytes, ...] | None = None
+        # Both row bytes and mmap slice objects are immutable across frames.
+        # Building them at 2 Hz avoids 128 transient objects per 30 Hz write.
+        self._destination_slices = tuple(
+            slice(
+                (layout.origin_y_px + row) * NV12_Y_STRIDE + layout.origin_x_px,
+                (layout.origin_y_px + row) * NV12_Y_STRIDE
+                + layout.origin_x_px
+                + layout.region_width_px,
+            )
+            for row in range(layout.region_height_px)
+        )
         self._mappings: dict[tuple[int, int], tuple[int, WritableMapping]] = {}
         self._updates = 0
         self._update_rejections = 0
@@ -452,17 +489,16 @@ class NativeNv12OverlayCore:
 
     def _record_latency(self, started_ns: int) -> None:
         elapsed_ns = max(time.monotonic_ns() - started_ns, 0)
-        bucket = len(_LATENCY_BUCKET_BOUNDS_NS)
-        for index, bound in enumerate(_LATENCY_BUCKET_BOUNDS_NS):
-            if elapsed_ns <= bound:
-                bucket = index
-                break
         with self._lock:
-            self._render_latency_samples += 1
-            self._render_latency_last_ns = elapsed_ns
-            self._render_latency_max_ns = max(self._render_latency_max_ns, elapsed_ns)
-            self._render_latency_total_ns += elapsed_ns
-            self._render_latency_bucket_counts[bucket] += 1
+            self._record_latency_locked(elapsed_ns)
+
+    def _record_latency_locked(self, elapsed_ns: int) -> None:
+        bucket = bisect_left(_LATENCY_BUCKET_BOUNDS_NS, elapsed_ns)
+        self._render_latency_samples += 1
+        self._render_latency_last_ns = elapsed_ns
+        self._render_latency_max_ns = max(self._render_latency_max_ns, elapsed_ns)
+        self._render_latency_total_ns += elapsed_ns
+        self._render_latency_bucket_counts[bucket] += 1
 
     def set_text(self, text: str | None) -> None:
         """Pre-render changed text while retaining the last valid bitmap on refusal."""
@@ -470,6 +506,18 @@ class NativeNv12OverlayCore:
         try:
             validate_native_overlay_text(text, self._layout)
             rendered = None if text is None else render_luma_bitmap(text, self._layout)
+            rendered_rows = (
+                None
+                if rendered is None
+                else tuple(
+                    rendered[start : start + self._layout.region_width_px]
+                    for start in range(
+                        0,
+                        len(rendered),
+                        self._layout.region_width_px,
+                    )
+                )
+            )
         except (NativeOverlayContractError, ValueError) as error:
             with self._lock:
                 self._update_rejections += 1
@@ -481,7 +529,7 @@ class NativeNv12OverlayCore:
             if text == self._text:
                 return
             self._text = text
-            self._bitmap = rendered
+            self._bitmap_rows = rendered_rows
             self._updates += 1
             if not self._isolated:
                 self._last_error = None
@@ -493,7 +541,7 @@ class NativeNv12OverlayCore:
             return (
                 not self._closed
                 and not self._isolated
-                and self._bitmap is not None
+                and self._bitmap_rows is not None
             )
 
     def note_passthrough_frame(self) -> None:
@@ -563,9 +611,9 @@ class NativeNv12OverlayCore:
         with self._lock:
             self._frames_seen += 1
             isolated = self._isolated
-            bitmap = self._bitmap
+            bitmap_rows = self._bitmap_rows
             closed = self._closed
-        if isolated or bitmap is None or closed:
+        if isolated or bitmap_rows is None or closed:
             with self._lock:
                 self._frames_passthrough += 1
             return False
@@ -593,52 +641,50 @@ class NativeNv12OverlayCore:
             return False
 
         started = False
+        ended = False
         written = 0
+        render_error: BaseException | None = None
+        end_error: BaseException | None = None
         try:
             self._access.sync(duplicate, DMABUF_SYNC_START_WRITE)
             started = True
-            with self._lock:
-                self._sync_starts += 1
-                self._caps_accepted = True
-            width = self._layout.region_width_px
-            for row in range(self._layout.region_height_px):
-                source_start = row * width
-                destination = (
-                    (self._layout.origin_y_px + row) * NV12_Y_STRIDE
-                    + self._layout.origin_x_px
-                )
-                mapped[destination : destination + width] = bitmap[
-                    source_start : source_start + width
-                ]
-                written += width
+            for destination, bitmap_row in zip(
+                self._destination_slices,
+                bitmap_rows,
+                strict=True,
+            ):
+                mapped[destination] = bitmap_row
+                written += len(bitmap_row)
         except Exception as error:
-            if not started:
-                self._latch_failure(error, sync_failure=True)
-            else:
-                self._latch_failure(error)
+            render_error = error
         finally:
             if started:
                 try:
                     self._access.sync(duplicate, DMABUF_SYNC_END_WRITE)
-                    with self._lock:
-                        self._sync_ends += 1
+                    ended = True
                 except Exception as error:
-                    with self._lock:
-                        already_isolated = self._isolated
-                    if already_isolated:
-                        with self._lock:
-                            self._sync_failures += 1
-                            self._last_error = _bounded_error(error)
-                    else:
-                        self._latch_failure(error, sync_failure=True)
+                    end_error = error
 
+        elapsed_ns = max(time.monotonic_ns() - started_ns, 0)
         with self._lock:
+            self._sync_starts += int(started)
+            self._sync_ends += int(ended)
             self._bytes_written += written
-            failed = self._isolated
-            if not failed:
+            self._record_latency_locked(elapsed_ns)
+            failure = end_error or render_error
+            if failure is None:
+                if self._isolated:
+                    return False
+                self._caps_accepted = True
                 self._frames_rendered += 1
-        self._record_latency(started_ns)
-        return not failed
+                return True
+            self._isolated = True
+            self._caps_accepted = False
+            self._transform_failures += 1
+            self._frames_passthrough += 1
+            self._sync_failures += int(not started or end_error is not None)
+            self._last_error = _bounded_error(failure)
+            return False
 
     def isolate(self, error: BaseException | str) -> None:
         """Latch a callback/extraction failure before any unsafe access."""
@@ -681,7 +727,7 @@ class NativeNv12OverlayCore:
                 "ISOLATED"
                 if self._isolated
                 else "SILENT"
-                if self._bitmap is None
+                if self._bitmap_rows is None
                 else "ACTIVE"
                 if self._caps_accepted
                 else "UNCONFIGURED"
@@ -689,7 +735,7 @@ class NativeNv12OverlayCore:
             return NativeOverlaySnapshot(
                 state=state,
                 caps_accepted=self._caps_accepted,
-                enabled=self._bitmap is not None,
+                enabled=self._bitmap_rows is not None,
                 updates=self._updates,
                 update_rejections=self._update_rejections,
                 frames_seen=self._frames_seen,
@@ -816,7 +862,9 @@ def _extract_dmabuf_frame(
     )
     if len(offsets) != 4 or len(strides) != 4:
         raise NativeOverlayContractError("native overlay GstVideoMeta arrays differ")
-    frame = NativeDmabufFrame(
+    # Validation remains in ``NativeNv12OverlayCore.render`` so direct callers
+    # and this GI extraction path share exactly one authoritative check.
+    return NativeDmabufFrame(
         caps_features=feature_text,
         caps_media_type=media_type,
         caps_width=int(cast(SupportsInt, get_value("width"))),
@@ -846,8 +894,6 @@ def _extract_dmabuf_frame(
         video_meta_offsets=offsets,
         video_meta_strides=strides,
     )
-    frame.validate()
-    return frame
 
 
 class GstDmabufOverlayRenderer:

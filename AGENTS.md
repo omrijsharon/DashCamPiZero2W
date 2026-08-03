@@ -46,18 +46,35 @@
   never refresh between the saved plan and apply. Apply is exact-version,
   no-upgrade, bounded, and must be repeated through a new dry-run to prove
   idempotency.
-- The current installed exact-Pi release is the rejected Milestone 9
-  `textoverlay` candidate `0.1.0.dev0-e727ddccd94659ff`. Its exact-version and
-  idempotent deployment passed, but its production run delivered only about
-  10.4 fps at the unchanged 1080p30 hardware-H.264 profile. Stock
-  `gdkpixbufoverlay` reached only about 18.3 fps. Do not start that release
-  again. `dashcamd.service` is deliberately disabled and inactive so a reboot
-  cannot start it; storage check and network fallback remain enabled. An
-  isolated recorder-owned native-NV12 fixed-luma-region `GstBaseTransform`
-  capability probe matched the 30.006 fps no-overlay baseline while writing
-  every frame, but production integration and the full Milestone 9 matrix
-  remain open. Evidence:
-  `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
+- The installed exact-Pi release is the hash-closed final-safe Milestone 9
+  candidate `0.1.0.dev0-5f95dd806342ac9e`. Its manifest, `SHA256SUMS`, and
+  wheel SHA-256 values are respectively
+  `619fe30e8123e0ceaec55269de0a6faf6ec88ccb4859a98bbef2d87776dbb655`,
+  `a42983edbf0c85acc44609c7961fe48ab9847ff03d339ab05e8c40dbed1c24c8`,
+  and `12761d42144abf776868582d2b6308de5a497e2b8df9ab873bb4fa7617cd7e98`.
+  Exact-version apply and the separate idempotent plan/apply passed with zero
+  package changes and no service starts; `dashcamd` remains enabled and
+  inactive. The rejected
+  `textoverlay` candidate remains historical (about 10.4 fps; stock
+  `gdkpixbufoverlay` about 18.3 fps). The recorder-owned native NV12/DMABUF
+  overlay is implemented and its v7 runtime-only active GPS/audio/hardware
+  H.264/exFAT probe advanced 2,103 frames with zero drops, restarts, renderer
+  failures, sync failures, or throttle. Its 75x1-Hz resource measurement had
+  mean CPU 97.3591% but p95 100.9876%, which strictly fails the Section C1
+  100% maximum. Do not round, waive, or mark the Milestone 9 resource/exit
+  gates passed. A separate 30-sample post-install diagnostic had mean CPU
+  96.9534% and p95 99.9871% with zero drops/restarts/failures/throttle, but is
+  too short to override the repeated 75-s failures or the unrun paired
+  ten-clip matrix; its privacy-safe result SHA-256 is
+  `597c394e8604aaa8ca6facc905903df1a8d0c601db4c89997968a014b14ba27e`.
+  The v7 wheel SHA-256 is
+  `12761d42144abf776868582d2b6308de5a497e2b8df9ab873bb4fa7617cd7e98`, from
+  Git `d4741f9`; that exact wheel is now the installed release. GPS-only phase 2/3/final
+  probes reduced CPU from 10.4467% to 8.3741%/7.8989% and 5.7699% with 100 ms
+  coalescing while retaining about 10 Hz valid throughput. An identity-only
+  overlay cache is unsafe because a DMABUF identity does not bind per-buffer
+  `GstMemory` geometry/video metadata; retain per-buffer validation. Evidence:
+  `docs/test-reports/2026-08-03-milestone9-overlay-resource-limit.md`.
 - The last M8-qualified exact-Pi deployment ran hash-closed release
   `0.1.0.dev0-921164f96ad53e0b`; its manifest, final `SHA256SUMS`, and wheel
   SHA-256 values are respectively
@@ -219,8 +236,8 @@
   owner subsequently authorized the exact archived media/catalog reset and
   obsolete-root cleanup recorded in the current Milestone 9 report. That
   authorization was one transaction, not a general permission to delete later
-  recording/evidence. The current rejected-release and disabled-service state
-  is authoritative at the top of this file.
+  recording/evidence. The installed final-safe release and dormant enabled
+  service state at the top of this file are authoritative.
 - The earlier exact-Pi configured-GPS-absence simulation also passed on
   release `d72`: a temporary config used
   `/dev/dashcam-gps-deliberately-absent` while the physical module stayed

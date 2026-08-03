@@ -237,13 +237,16 @@ Phone-preview transport remains open.
   NV12 path negotiated correctly but delivered only about 10.4 fps on the
   exact Pi. Stock `gdkpixbufoverlay` with a pre-rendered small RGBA region
   delivered about 18.3 fps. Neither may be used for the production profile.
-- Current candidate: register one recorder-owned native-NV12
-  `GstBaseTransform` after the raw caps and before `v4l2h264enc`, and copy a
-  cached opaque fixed luma region into each writable buffer. The isolated
-  capability probe delivered 30.006 fps, matching a same-session no-overlay
-  arm, with no RGB conversion, short write, decode failure, or throttling.
-  Video-only, legacy A/V, and immutable audio-generation graphs must still
-  share exactly one camera, overlay transform, and hardware encoder.
+- Current path: attach one recorder-owned native NV12/DMABUF pad renderer at
+  the exact raw caps before `v4l2h264enc`; it caches bounded mappings and a
+  pre-rendered opaque fixed luma region while retaining per-buffer allocation
+  and metadata validation. The isolated capability probe delivered 30.006 fps,
+  matching a same-session no-overlay arm. A later active GPS/audio/overlay
+  runtime-only v7 wheel probe sustained hardware 1080p30 on verified exFAT
+  with zero drops/restarts/renderer failures, but p95 process CPU was 100.9876%
+  and therefore missed the strict Section C1 ceiling by 0.9876 percentage
+  points. Video-only, legacy A/V, and immutable audio-generation graphs must
+  still share exactly one camera, overlay path, and hardware encoder.
 - Decision: configure the initial overlay while the graph is still stopped so
   the first encoded buffer is never briefly unmarked. Later updates are one
   fixed two-line printable-ASCII payload, deduplicated at 2 Hz with no queue or
@@ -266,8 +269,13 @@ Phone-preview transport remains open.
   alternative, native-transform capability arm, and matched no-overlay arm are
   recorded in
   `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
-  Dynamic production rendering, shared-snapshot proof, integrated audio/GPS,
-  clip-boundary stress, and the longer resource comparison remain unchecked.
+  The diagnostic active-GPS resource near-pass and its strict refusal are in
+  `docs/test-reports/2026-08-03-milestone9-overlay-resource-limit.md`.
+  Dynamic production rendering is implemented, but shared-snapshot proof,
+  clip-boundary stress and the longer paired resource comparison remain
+  unchecked. The exact v7 wheel is now installed as hash-closed release
+  `0.1.0.dev0-5f95dd806342ac9e`; deployment does not change its strict resource
+  refusal.
 - Comparative acceptance is fixed before the integrated run: paired arms use
   one warm-up plus at least ten one-minute clips and at least 1 Hz samples.
   Each clip must deliver at least 29.9 fps; drops/restarts may not increase;

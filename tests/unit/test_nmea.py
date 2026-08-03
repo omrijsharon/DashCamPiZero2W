@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from dashcam.gps.nmea import (
+    MAX_NMEA_FIELDS,
     MAX_NMEA_LINE_BYTES,
     NmeaError,
     SentenceType,
@@ -27,6 +29,22 @@ def _sentence(body: str) -> str:
     for character in body:
         checksum ^= ord(character)
     return f"${body}*{checksum:02X}"
+
+
+def _split_first_header_error(body: str) -> NmeaError | None:
+    """Reference the former split-first header classification."""
+
+    fields = body.split(",")
+    if len(fields) > MAX_NMEA_FIELDS:
+        return NmeaError.TOO_MANY_FIELDS
+    identifier = fields[0]
+    if re.fullmatch(r"[A-Z0-9]{5}", identifier) is None:
+        return NmeaError.MALFORMED_ENVELOPE
+    if identifier[:2] not in {"BD", "GA", "GB", "GI", "GL", "GN", "GP", "GQ"}:
+        return NmeaError.UNSUPPORTED_TALKER
+    if identifier[2:] not in {"RMC", "ZDA", "GGA"}:
+        return NmeaError.UNSUPPORTED_SENTENCE
+    return None
 
 
 def test_parse_valid_rmc_with_units_and_utc() -> None:
@@ -193,6 +211,42 @@ def test_field_count_is_bounded_independently_of_byte_count() -> None:
     outcome = parse_nmea_line(_sentence("GPRMC" + "," * 20))
 
     assert outcome.error is NmeaError.TOO_MANY_FIELDS
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "XXRMC,1",
+        "GPTXT,1",
+        "GPRM!,1",
+        "XXRMC" + "," * (MAX_NMEA_FIELDS - 1),
+        "XXRMC" + "," * MAX_NMEA_FIELDS,
+        "GPTXT" + "," * (MAX_NMEA_FIELDS - 1),
+        "GPTXT" + "," * MAX_NMEA_FIELDS,
+        "GPRM!" + "," * MAX_NMEA_FIELDS,
+        "GPRMC" + "," * MAX_NMEA_FIELDS,
+    ],
+)
+def test_header_fast_path_matches_split_first_error_order(body: str) -> None:
+    expected = _split_first_header_error(body)
+    outcome = parse_nmea_line(_sentence(body))
+
+    if expected is None:
+        assert outcome.error is NmeaError.MALFORMED_FIELDS
+    else:
+        assert outcome.error is expected
+
+
+def test_checksum_errors_still_precede_over_field_and_unsupported_errors() -> None:
+    body = "XXTXT" + "," * MAX_NMEA_FIELDS
+    correct = _sentence(body)
+    correct_checksum = correct[-2:]
+    wrong_checksum = "00" if correct_checksum != "00" else "01"
+
+    assert _split_first_header_error(body) is NmeaError.TOO_MANY_FIELDS
+    assert parse_nmea_line(f"${body}*{wrong_checksum}").error is NmeaError.CHECKSUM_MISMATCH
+    assert parse_nmea_line(f"${body}*ZZ").error is NmeaError.BAD_CHECKSUM_FORMAT
+    assert parse_nmea_line(correct).error is NmeaError.TOO_MANY_FIELDS
 
 
 def test_line_endings_count_toward_bound_and_bytes_are_accepted() -> None:

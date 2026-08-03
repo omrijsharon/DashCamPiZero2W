@@ -81,7 +81,7 @@ class GpsServiceLimits:
     read_size_bytes: int = 256
     open_timeout_s: float = 2.0
     read_timeout_s: float = 0.25
-    read_coalesce_s: float = 0.020
+    read_coalesce_s: float = 0.100
     stale_after_s: float = 2.0
     reconnect_min_s: float = 0.25
     reconnect_max_s: float = 30.0
@@ -378,7 +378,7 @@ class GpsService:
         while not stop_requested.is_set():
             transport: GpsTransport | None = None
             received_data = False
-            self._increment(connection_attempts=1)
+            self._counters.connection_attempts += 1
             try:
                 transport = await asyncio.wait_for(
                     self._factory.open(),
@@ -441,11 +441,11 @@ class GpsService:
             if not isinstance(chunk, bytes) or len(chunk) > self._limits.read_size_bytes:
                 raise _TransportProtocolError("read returned an invalid or oversized byte chunk")
             if not chunk:
-                self._increment(read_timeouts=1)
+                self._counters.read_timeouts += 1
                 self._refresh_freshness(now_ns)
                 continue
             received_data = True
-            self._increment(bytes_received=len(chunk))
+            self._counters.bytes_received += len(chunk)
             self._consume_chunk(chunk, now_ns)
             self._refresh_freshness(now_ns)
             if (
@@ -477,7 +477,8 @@ class GpsService:
                 overflow_offset = offset + max_line_bytes - buffered_size
                 self._line_buffer.clear()
                 self._discarding_oversized_line = chunk[overflow_offset] != 0x0A
-                self._increment(oversized_lines=1, lines_received=1)
+                self._counters.oversized_lines += 1
+                self._counters.lines_received += 1
                 self._record_parse_failure(received_ns)
                 if newline < 0:
                     return
@@ -499,16 +500,15 @@ class GpsService:
             offset = end
 
     def _handle_line(self, raw_line: bytes, received_ns: int) -> None:
-        self._increment(lines_received=1)
+        self._counters.lines_received += 1
         outcome = parse_nmea_line(raw_line, received_monotonic_ns=received_ns)
         if not outcome.ok:
             assert outcome.error is not None
-            increments: dict[str, int] = {"parse_errors": 1}
+            self._counters.parse_errors += 1
             if outcome.error is NmeaError.CHECKSUM_MISMATCH:
-                increments["checksum_failures"] = 1
+                self._counters.checksum_failures += 1
             if outcome.error in {NmeaError.UNSUPPORTED_SENTENCE, NmeaError.UNSUPPORTED_TALKER}:
-                increments["unsupported_sentences"] = 1
-            self._increment(**increments)
+                self._counters.unsupported_sentences += 1
             state = (
                 self._state.state
                 if self._state.navigation is not None
@@ -527,12 +527,12 @@ class GpsService:
         if collector is not None:
             collector.observe(sentence)
         self._last_sentence_ns = received_ns
-        increments = {"valid_sentences": 1}
+        self._counters.valid_sentences += 1
         navigation = self._state.navigation
         if sentence.navigation_valid:
             navigation = sentence
             self._last_navigation_ns = received_ns
-            increments["valid_fixes"] = 1
+            self._counters.valid_fixes += 1
             state = GpsState.NAVIGATION_VALID
         elif sentence.sentence_type in {SentenceType.RMC, SentenceType.GGA}:
             navigation = None
@@ -550,7 +550,6 @@ class GpsService:
                 if sentence.time_anchor_candidate
                 else GpsState.RECEIVING_INVALID
             )
-        self._increment(**increments)
         self._state.state = state
         self._state.navigation = navigation
         self._state.latest_sentence = sentence
@@ -574,7 +573,7 @@ class GpsService:
         state = self._state.state
         if sentence_stale and state is not GpsState.STALE:
             state = GpsState.STALE
-            self._increment(stale_transitions=1)
+            self._counters.stale_transitions += 1
         elif navigation is None and self._state.navigation is not None:
             latest = self._state.latest_sentence
             state = (
@@ -605,12 +604,12 @@ class GpsService:
         }:
             return
 
-        self._increment(anchor_attempts=1)
+        self._counters.anchor_attempts += 1
         outcome = tracker.consider(sentence)
         self._anchor_tracker = outcome.tracker
         clock_outcome = outcome.clock_outcome
         if clock_outcome is None:
-            self._increment(anchor_rejections=1)
+            self._counters.anchor_rejections += 1
             self._state.gps_time_state = _tracker_time_state(
                 outcome.tracker,
                 sentence.received_monotonic_ns,
@@ -623,18 +622,16 @@ class GpsService:
             self._state.last_anchor_disagreement_ns = None
             return
 
-        increments: dict[str, int]
         if clock_outcome.status is AnchorStatus.ACCEPTED:
-            increments = {"anchor_acceptances": 1}
+            self._counters.anchor_acceptances += 1
         elif clock_outcome.status is AnchorStatus.CONFIRMED:
-            increments = {"anchor_confirmations": 1}
+            self._counters.anchor_confirmations += 1
         elif clock_outcome.status is AnchorStatus.REACQUIRED:
-            increments = {"anchor_reacquisitions": 1}
+            self._counters.anchor_reacquisitions += 1
         elif clock_outcome.status is AnchorStatus.IDEMPOTENT:
-            increments = {"anchor_idempotent": 1}
+            self._counters.anchor_idempotent += 1
         else:
-            increments = {"anchor_rejections": 1}
-        self._increment(**increments)
+            self._counters.anchor_rejections += 1
         self._state.gps_time_state = _tracker_time_state(
             outcome.tracker,
             sentence.received_monotonic_ns,
@@ -656,10 +653,9 @@ class GpsService:
         self._consecutive_parse_errors = 0
         self._parse_error_window_started_ns = None
         self._parse_errors_in_window = 0
-        increments = {"connections": 1}
+        self._counters.connections += 1
         if reconnect:
-            increments["reconnects"] = 1
-        self._increment(**increments)
+            self._counters.reconnects += 1
         state = self._state.state
         if state in {GpsState.UART_UNAVAILABLE, GpsState.FAULTED}:
             state = GpsState.RECEIVING_INVALID
@@ -676,16 +672,15 @@ class GpsService:
         disconnected: bool,
         faulted: bool = False,
     ) -> None:
-        increments = {"transport_errors": 1}
+        self._counters.transport_errors += 1
         if disconnected:
-            increments["disconnects"] = 1
-        self._increment(**increments)
+            self._counters.disconnects += 1
         self._line_buffer.clear()
         self._discarding_oversized_line = False
         if disconnected and self._last_sentence_ns is not None:
             state = GpsState.STALE
             if self._state.state is not GpsState.STALE:
-                self._increment(stale_transitions=1)
+                self._counters.stale_transitions += 1
         else:
             state = GpsState.FAULTED if faulted else GpsState.UART_UNAVAILABLE
         self._state.state = state
@@ -705,7 +700,7 @@ class GpsService:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self._increment(transport_errors=1)
+            self._counters.transport_errors += 1
             self._state.connected = False
             self._state.last_error = GpsServiceError.CLOSE_FAILURE
             self._state.last_error_detail = _error_detail(error)
@@ -739,11 +734,6 @@ class GpsService:
             raise _TransportProtocolError(
                 "GPS parse-error rate limit reached"
             )
-
-    def _increment(self, **increments: int) -> None:
-        counters = self._counters
-        for name, amount in increments.items():
-            setattr(counters, name, getattr(counters, name) + amount)
 
     def _now_ns(self) -> int:
         value = self._monotonic_ns()

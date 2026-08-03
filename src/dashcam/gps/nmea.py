@@ -140,10 +140,10 @@ def parse_nmea_line(
     if _checksum(body) != int(transmitted_checksum, 16):
         return _failure(NmeaError.CHECKSUM_MISMATCH, "checksum does not match sentence body")
 
-    fields = body.split(",")
-    if len(fields) > MAX_NMEA_FIELDS:
+    if body.count(",") + 1 > MAX_NMEA_FIELDS:
         return _failure(NmeaError.TOO_MANY_FIELDS, "sentence exceeds the field limit")
-    identifier = fields[0]
+    first_comma = body.find(",")
+    identifier = body if first_comma < 0 else body[:first_comma]
     if not _IDENTIFIER_RE.fullmatch(identifier):
         return _failure(NmeaError.MALFORMED_ENVELOPE, "invalid talker/formatter identifier")
     talker, formatter = identifier[:2], identifier[2:]
@@ -155,6 +155,7 @@ def parse_nmea_line(
     except ValueError:
         return _failure(NmeaError.UNSUPPORTED_SENTENCE, f"unsupported formatter {formatter}")
 
+    fields = body.split(",")
     try:
         if sentence_type is SentenceType.RMC:
             sentence = _parse_rmc(talker, fields[1:], received_monotonic_ns)

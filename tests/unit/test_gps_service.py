@@ -10,7 +10,7 @@ import pytest
 
 from dashcam.gps.anchors import NmeaAnchorTracker
 from dashcam.gps.clock import AnchorPolicy, AnchorSource, AnchorStatus
-from dashcam.gps.nmea import MAX_NMEA_LINE_BYTES
+from dashcam.gps.nmea import MAX_NMEA_LINE_BYTES, NmeaError
 from dashcam.gps.service import (
     GpsService,
     GpsServiceError,
@@ -35,6 +35,7 @@ _VALID_RMC = _sentence("GPRMC,123519.25,A,4807.038,N,01131.000,E,22.4,84.4,23072
 _LATER_RMC = _sentence("GNRMC,123520.25,A,4807.050,N,01131.020,E,10.0,90.0,230726,,,A")
 _INVALID_FIX = _sentence("GPRMC,123519.25,V,,,,,0.0,0.0,230726,,,N")
 _UNSUPPORTED = _sentence("GPTXT,01,01,02,receiver-message")
+_UNSUPPORTED_OVER_FIELDS = _sentence("GPTXT" + "," * 20)
 _BAD_CHECKSUM = _VALID_RMC[:-4] + b"00\r\n"
 
 
@@ -147,7 +148,8 @@ class ReferenceBytewiseGpsService(GpsService):
             if len(self._line_buffer) > self._limits.max_line_bytes:
                 self._line_buffer.clear()
                 self._discarding_oversized_line = value != 0x0A
-                self._increment(oversized_lines=1, lines_received=1)
+                self._counters.oversized_lines += 1
+                self._counters.lines_received += 1
                 self._record_parse_failure(received_ns)
                 continue
 
@@ -321,6 +323,10 @@ def test_transport_outer_deadline_has_small_bounded_scheduler_margin() -> None:
     assert _limits(read_timeout_s=30.0).transport_read_deadline_s == pytest.approx(30.25)
 
 
+def test_default_short_read_coalescing_uses_the_validated_target_bound() -> None:
+    assert GpsServiceLimits().read_coalesce_s == pytest.approx(0.100)
+
+
 def test_short_nonfinal_read_coalesces_once_with_the_configured_delay() -> None:
     async def scenario() -> None:
         stop = asyncio.Event()
@@ -469,6 +475,29 @@ def test_partial_malformed_unsupported_and_oversized_lines_are_bounded() -> None
         assert all(max_bytes == 128 for max_bytes, _ in transport.read_limits)
 
     asyncio.run(scenario())
+
+
+def test_parser_fast_path_preserves_error_counter_classification() -> None:
+    service = GpsService(
+        transport_factory=ScriptedFactory([]),
+        limits=_limits(
+            read_size_bytes=4096,
+            max_parse_errors_per_second=10_000,
+        ),
+    )
+    service._on_connected()
+
+    service._consume_chunk(
+        _UNSUPPORTED + _UNSUPPORTED_OVER_FIELDS + _BAD_CHECKSUM,
+        0,
+    )
+    snapshot = service.snapshot
+
+    assert snapshot.counters.lines_received == 3
+    assert snapshot.counters.parse_errors == 3
+    assert snapshot.counters.unsupported_sentences == 1
+    assert snapshot.counters.checksum_failures == 1
+    assert snapshot.last_parse_error is NmeaError.CHECKSUM_MISMATCH
 
 
 def test_consecutive_parse_error_limit_forces_bounded_reconnect() -> None:

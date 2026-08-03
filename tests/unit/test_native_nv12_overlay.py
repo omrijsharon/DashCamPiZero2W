@@ -268,7 +268,10 @@ def test_render_maps_once_reuses_identity_syncs_and_writes_only_luma_region() ->
     assert snapshot.mappings_cached == snapshot.mappings_created == 1
     assert snapshot.sync_starts == snapshot.sync_ends == 2
     assert snapshot.render_latency_samples == 2
+    assert snapshot.render_latency_last_ns is not None
     assert snapshot.render_latency_max_ns >= snapshot.render_latency_last_ns >= 0
+    assert isinstance(snapshot.render_latency_bucket_bounds_ns, list)
+    assert isinstance(snapshot.render_latency_bucket_counts, list)
     assert sum(snapshot.render_latency_bucket_counts) == 2
 
 

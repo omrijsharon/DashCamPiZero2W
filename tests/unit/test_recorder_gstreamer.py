@@ -412,8 +412,8 @@ class FakeDriver:
             "render_latency_last_ns": 1_000_000,
             "render_latency_max_ns": 2_000_000,
             "render_latency_total_ns": 30_000_000,
-            "render_latency_bucket_bounds_ns": (1_000_000, 2_000_000),
-            "render_latency_bucket_counts": (20, 10, 0),
+            "render_latency_bucket_bounds_ns": [1_000_000, 2_000_000],
+            "render_latency_bucket_counts": [20, 10, 0],
             "last_error": None,
         }
     )
@@ -2428,8 +2428,9 @@ def test_overlay_close_delay_cannot_prevent_pipeline_null_transition() -> None:
     states: list[tuple[object, str, float]] = []
     driver = PyGObjectGStreamerDriver(object())
     driver._overlay_renderers[id(pipeline)] = cast(Any, renderer)
-    driver._set_and_verify_state = (  # type: ignore[method-assign]
-        lambda target, state, timeout: states.append((target, state, timeout))
+    driver._set_and_verify_state = cast(  # type: ignore[method-assign]
+        Any,
+        lambda target, state, timeout: states.append((target, state, timeout)),
     )
 
     with pytest.raises(GStreamerDriverError, match="pre-NULL bound"):

@@ -1817,8 +1817,8 @@ class GStreamerBackend:
                 "render_latency_last_ns": None,
                 "render_latency_max_ns": 0,
                 "render_latency_total_ns": 0,
-                "render_latency_bucket_bounds_ns": (),
-                "render_latency_bucket_counts": (),
+                "render_latency_bucket_bounds_ns": [],
+                "render_latency_bucket_counts": [],
                 "last_error": None,
             }
         observed = observe(pipeline)

@@ -218,8 +218,10 @@ class NativeOverlaySnapshot:
     render_latency_last_ns: int | None
     render_latency_max_ns: int
     render_latency_total_ns: int
-    render_latency_bucket_bounds_ns: tuple[int, ...]
-    render_latency_bucket_counts: tuple[int, ...]
+    # Snapshot values cross the runtime-status JSON boundary.  The fixed
+    # internal tuple/list accounting is copied into fresh JSON arrays here.
+    render_latency_bucket_bounds_ns: list[int]
+    render_latency_bucket_counts: list[int]
     last_error: str | None
 
 
@@ -707,10 +709,8 @@ class NativeNv12OverlayCore:
                 render_latency_last_ns=self._render_latency_last_ns,
                 render_latency_max_ns=self._render_latency_max_ns,
                 render_latency_total_ns=self._render_latency_total_ns,
-                render_latency_bucket_bounds_ns=_LATENCY_BUCKET_BOUNDS_NS,
-                render_latency_bucket_counts=tuple(
-                    self._render_latency_bucket_counts
-                ),
+                render_latency_bucket_bounds_ns=list(_LATENCY_BUCKET_BOUNDS_NS),
+                render_latency_bucket_counts=list(self._render_latency_bucket_counts),
                 last_error=self._last_error,
             )
 

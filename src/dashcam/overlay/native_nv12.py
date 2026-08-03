@@ -116,19 +116,12 @@ class NativeDmabufFrame:
         """Refuse every drift from the measured libcamerasrc allocation."""
 
         if (
-            self.caps_features,
-            self.caps_media_type,
-            self.caps_width,
-            self.caps_height,
-            self.caps_format,
-            self.caps_framerate,
-        ) != (
-            SYSTEM_MEMORY_FEATURE,
-            "video/x-raw",
-            NV12_FRAME_WIDTH,
-            NV12_FRAME_HEIGHT,
-            NV12_FORMAT,
-            "30/1",
+            self.caps_features != SYSTEM_MEMORY_FEATURE
+            or self.caps_media_type != "video/x-raw"
+            or self.caps_width != NV12_FRAME_WIDTH
+            or self.caps_height != NV12_FRAME_HEIGHT
+            or self.caps_format != NV12_FORMAT
+            or self.caps_framerate != "30/1"
         ):
             raise NativeOverlayContractError(
                 "overlay caps differ from exact 1920x1080 NV12 SystemMemory"
@@ -158,33 +151,20 @@ class NativeDmabufFrame:
                 "overlay NV12 planes do not share one valid DMABUF fd"
             )
         if (
-            y_memory.size,
-            y_memory.offset,
-            y_memory.maxsize,
-            uv_memory.size,
-            uv_memory.offset,
-            uv_memory.maxsize,
-        ) != (
-            NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT,
-            NV12_Y_OFFSET,
-            NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT,
-            NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT // 2,
-            NV12_UV_OFFSET,
-            NV12_BUFFER_SIZE,
+            y_memory.size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
+            or y_memory.offset != NV12_Y_OFFSET
+            or y_memory.maxsize != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
+            or uv_memory.size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT // 2
+            or uv_memory.offset != NV12_UV_OFFSET
+            or uv_memory.maxsize != NV12_BUFFER_SIZE
         ):
             raise NativeOverlayContractError("overlay DMABUF plane geometry differs")
         if (
-            self.video_meta_width,
-            self.video_meta_height,
-            self.video_meta_planes,
-            self.video_meta_offsets,
-            self.video_meta_strides,
-        ) != (
-            NV12_FRAME_WIDTH,
-            NV12_FRAME_HEIGHT,
-            2,
-            (NV12_Y_OFFSET, NV12_UV_OFFSET, 0, 0),
-            (NV12_Y_STRIDE, NV12_UV_STRIDE, 0, 0),
+            self.video_meta_width != NV12_FRAME_WIDTH
+            or self.video_meta_height != NV12_FRAME_HEIGHT
+            or self.video_meta_planes != 2
+            or self.video_meta_offsets != (NV12_Y_OFFSET, NV12_UV_OFFSET, 0, 0)
+            or self.video_meta_strides != (NV12_Y_STRIDE, NV12_UV_STRIDE, 0, 0)
         ):
             raise NativeOverlayContractError("overlay GstVideoMeta geometry differs")
 
@@ -625,7 +605,10 @@ class NativeNv12OverlayCore:
             identity = self._access.identity(frame.dmabuf_fd)
             if (
                 len(identity) != 2
-                or any(isinstance(value, bool) or value < 0 for value in identity)
+                or isinstance(identity[0], bool)
+                or identity[0] < 0
+                or isinstance(identity[1], bool)
+                or identity[1] < 0
             ):
                 raise NativeOverlayContractError(
                     "native overlay DMABUF identity is invalid"

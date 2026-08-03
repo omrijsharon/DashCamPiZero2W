@@ -386,6 +386,8 @@ class FakeDriver:
     )
     restore_calls: list[tuple[AudioCapturePlan, float]] = field(default_factory=list)
     restore_error: Exception | None = None
+    overlay_texts: list[str | None] = field(default_factory=list)
+    overlay_error: Exception | None = None
     topology_snapshot: dict[str, object] = field(
         default_factory=lambda: {
             "topology_observation": "stable",
@@ -434,6 +436,12 @@ class FakeDriver:
         self.playing_timeouts.append(timeout_s)
         if self.set_playing_error is not None:
             raise self.set_playing_error
+
+    def set_overlay_text(self, pipeline: object, text: str | None) -> None:
+        assert pipeline is self.pipeline
+        if self.overlay_error is not None:
+            raise self.overlay_error
+        self.overlay_texts.append(text)
 
     def effective_caps(self, pipeline: object) -> EffectiveCaps:
         assert pipeline is self.pipeline
@@ -525,6 +533,15 @@ def test_graph_is_exact_and_omits_unsafe_encoder_assignments() -> None:
     assert (
         "video/x-raw,width=(int)1920,height=(int)1080,format=(string)NV12,framerate=(fraction)30/1"
     ) in PIPELINE_DESCRIPTION
+    assert PIPELINE_DESCRIPTION.count("textoverlay name=burned_overlay") == 1
+    assert PIPELINE_DESCRIPTION.index("framerate=(fraction)30/1") < (
+        PIPELINE_DESCRIPTION.index("textoverlay name=burned_overlay")
+    ) < PIPELINE_DESCRIPTION.index("v4l2h264enc name=encoder")
+    assert (
+        "textoverlay name=burned_overlay text=\"\" silent=true "
+        "valignment=top halignment=left xpad=40 ypad=40 "
+        'font-desc="Monospace 20" shaded-background=true'
+    ) in PIPELINE_DESCRIPTION
     assert (
         'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
         'h264_i_frame_period=30"'
@@ -592,6 +609,10 @@ def test_matched_audio_graph_is_exact_clocked_bounded_generation_ingress() -> No
         "tee name=video_tee allow-not-linked=true "
     )
     assert description.endswith("tee name=audio_tee allow-not-linked=true")
+    assert description.count("textoverlay name=burned_overlay") == 1
+    assert description.index("textoverlay name=burned_overlay") < description.index(
+        "v4l2h264enc name=encoder"
+    )
     assert description.count("name=video_continuity_queue") == 1
     assert (
         "video_tee. ! queue name=video_continuity_queue "
@@ -923,6 +944,36 @@ def test_start_returns_only_the_verified_effective_profile() -> None:
         assert driver.descriptions == [PIPELINE_DESCRIPTION]
         assert driver.output_settings == [(config.location_pattern, 123)]
         assert driver.playing_timeouts == [15.0]
+
+        driver.messages.append(BusMessage(BusMessageKind.EOS))
+        await backend.stop()
+
+    run_async(scenario())
+
+
+def test_backend_overlay_updates_are_bounded_serial_and_deduplicated() -> None:
+    async def scenario() -> None:
+        driver = FakeDriver()
+        backend = GStreamerBackend(output=output_config(), driver=driver)
+
+        with pytest.raises(PipelineContractError, match="active pipeline"):
+            await backend.set_overlay_text("TIME UNSYNCED\nGPS INVALID")
+        with pytest.raises(ValueError, match="two-line ASCII"):
+            await backend.set_overlay_text("one\ntwo\nthree")
+        with pytest.raises(ValueError, match="two-line ASCII"):
+            await backend.set_overlay_text("x" * 97)
+
+        backend.configure_overlay_text("TIME UNSYNCED\nGPS INVALID")
+        await backend.start(VideoProfile())
+        with pytest.raises(PipelineContractError, match="already bound"):
+            backend.configure_overlay_text(None)
+        await backend.set_overlay_text("TIME UNSYNCED\nGPS INVALID")
+        await backend.set_overlay_text("TIME UNSYNCED\nGPS INVALID")
+        await backend.set_overlay_text(None)
+        assert driver.overlay_texts == [
+            "TIME UNSYNCED\nGPS INVALID",
+            None,
+        ]
 
         driver.messages.append(BusMessage(BusMessageKind.EOS))
         await backend.stop()
@@ -2285,6 +2336,30 @@ def test_pygobject_driver_sets_output_properties_outside_parse_launch() -> None:
         ("start-index", 42),
     ]
     assert config.location_pattern not in PIPELINE_DESCRIPTION
+
+
+def test_pygobject_driver_updates_and_silences_named_burned_overlay() -> None:
+    overlay = FakeElement()
+    pipeline = FakeGstPipeline(
+        FakeElement(),
+        FakeBus([]),
+        elements={"burned_overlay": overlay},
+    )
+    driver = PyGObjectGStreamerDriver(FakeGst(pipeline))
+
+    driver.set_overlay_text(pipeline, "TIME UNSYNCED\nGPS INVALID")
+    driver.set_overlay_text(pipeline, None)
+
+    assert overlay.properties == [
+        ("text", "TIME UNSYNCED\nGPS INVALID"),
+        ("silent", False),
+        ("silent", True),
+        ("text", ""),
+    ]
+
+    missing = FakeGstPipeline(FakeElement(), FakeBus([]))
+    with pytest.raises(GStreamerDriverError, match="no burned overlay"):
+        driver.set_overlay_text(missing, "REC")
 
 
 @pytest.mark.parametrize("source_name", sorted(AUDIO_BRANCH_ELEMENT_NAMES))

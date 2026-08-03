@@ -197,7 +197,7 @@ This is the execution checklist for `Pizero_dashcam_PROJECT.md`. The product spe
 
 - [ ] **Milestone 9 complete**
   - [x] **LOCAL:** Define overlay field formatting, numeric UTC offset, units, stale/invalid states, and layout bounds. Evidence: `docs/test-reports/2026-07-24-pre-pi-implementation.md`.
-  - [ ] **PI:** Implement the measured fixed-region/pre-rendered overlay path before the recording encoder.
+  - [ ] **PI:** Implement the measured fixed-region/pre-rendered overlay path before the recording encoder. Local production wiring now places one bounded, initially preconfigured `textoverlay` in the common NV12 path before `v4l2h264enc`, with a queue-free 2 Hz shared GPS/time-snapshot updater and fail-closed installer capability check. Exact-Pi deployment is blocked because the full recording volume has zero free bytes and target cleanup requires owner authorization; `gstreamer1.0-x` is now declared for the missing target `textoverlay` factory.
   - [ ] **PI:** Show `TIME UNSYNCED`, `GPS LOST`, and hidden/marked stale navigation values correctly.
   - [ ] **PI:** Prove the overlay and sidecar use the same telemetry snapshot/time model.
   - [ ] **PI:** Measure no-overlay versus overlay CPU, memory, temperature, encoded frame rate, and drop counts.

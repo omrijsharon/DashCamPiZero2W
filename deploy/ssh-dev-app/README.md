@@ -35,8 +35,9 @@ recorder is eligible to start automatically on the next boot.
 The release venv deliberately includes the declared system Python site packages
 so the in-process PyGObject GStreamer backend can use the OS ABI. Before a new
 release is finalized, the staging venv must import GI/Gst 1.0, initialize
-GStreamer, and discover the `queue`, `libcamerasrc`, `v4l2h264enc`, `alsasrc`,
-`audioconvert`, `audioresample`, `voaacenc`, and `aacparse` factories. The
+GStreamer, and discover the `queue`, `libcamerasrc`, `textoverlay`,
+`v4l2h264enc`, `alsasrc`, `audioconvert`, `audioresample`, `voaacenc`, and
+`aacparse` factories. The
 installer first verifies the existing `dashcam` account and `video` group,
 idempotently adds that reviewed account membership when needed, then runs this
 factory smoke as `dashcam` with its initialized account groups. The installed

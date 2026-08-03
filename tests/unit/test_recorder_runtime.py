@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -138,12 +139,23 @@ class FakeBackend:
     stop_calls: int = 0
     run_started: asyncio.Event = field(default_factory=asyncio.Event)
     finalized: asyncio.Queue[FinalizedFragment] = field(default_factory=asyncio.Queue)
+    configured_overlay_texts: list[str | None] = field(default_factory=list)
+    overlay_texts: list[str | None] = field(default_factory=list)
+    overlay_error: BaseException | None = None
+
+    def configure_overlay_text(self, text: str | None) -> None:
+        self.configured_overlay_texts.append(text)
 
     async def start(self, requested_profile: VideoProfile) -> VideoProfile:
         self.started_with.append(requested_profile)
         if self.start_error is not None:
             raise self.start_error
         return self.effective
+
+    async def set_overlay_text(self, text: str | None) -> None:
+        if self.overlay_error is not None:
+            raise self.overlay_error
+        self.overlay_texts.append(text)
 
     async def run(self, stop_requested: asyncio.Event) -> None:
         self.run_started.set()
@@ -460,6 +472,7 @@ def runtime_for(
     ownership: CameraOwnership | None = None,
     limits: RuntimeLimits | None = None,
     gps_factory: RecordingGpsFactory | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
 ) -> tuple[GStreamerRecorderRuntime, RecordingFactory]:
     factory = RecordingFactory(backend)
     runtime = GStreamerRecorderRuntime(
@@ -472,6 +485,7 @@ def runtime_for(
         ownership=ownership or CameraOwnership(),
         limits=limits,
         gps_service_factory=gps_factory,
+        monotonic_ns=monotonic_ns or time.monotonic_ns,
     )
     return runtime, factory
 
@@ -656,6 +670,136 @@ def test_unexpected_gps_cancellation_marks_time_stale_and_hides_navigation() -> 
         assert snapshot["pipeline_restart_count"] == 0
 
         await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_overlay_uses_one_gps_anchor_model_and_hides_stale_navigation() -> None:
+    async def scenario() -> None:
+        navigation = NmeaSentence(
+            sentence_type=SentenceType.GGA,
+            talker="GN",
+            received_monotonic_ns=1_000_000_000,
+            latitude_deg=32.12345,
+            longitude_deg=34.98765,
+            speed_knots=10.0,
+            altitude_m=12.0,
+            fix_quality=1,
+            satellites=8,
+            hdop=0.8,
+            navigation_valid=True,
+        )
+        anchor = UtcAnchor(
+            monotonic_ns=1_000_000_000,
+            utc=datetime(2026, 7, 28, 16, 0, tzinfo=UTC),
+            uncertainty_ns=250_000_000,
+            source=AnchorSource.GPS_RMC_VALID,
+            provenance="NMEA:GNRMC:active-valid:complete-utc",
+        )
+        gps = FakeGpsService(
+            current_snapshot=GpsSnapshot(
+                state=GpsState.NAVIGATION_VALID,
+                navigation=navigation,
+                latest_sentence=navigation,
+                connected=True,
+                gps_time_state=GpsTimeState.GPS_TIME_VALID,
+                time_anchor=anchor,
+            )
+        )
+        backend = FakeBackend()
+        runtime, _ = runtime_for(
+            backend,
+            gps_factory=RecordingGpsFactory(gps),
+            monotonic_ns=lambda: 2_000_000_000,
+            limits=RuntimeLimits(overlay_update_interval_s=0.001),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+
+        async def wait_for_updates(count: int) -> None:
+            while len(backend.overlay_texts) < count:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_updates(1), timeout=1)
+        assert backend.overlay_texts[-1] == (
+            "2026-07-28 19:00:01  +03:00  REC\n"
+            "32.12345, 34.98765   19 km/h   ALT 12 m   SAT 8"
+        )
+
+        gps.current_snapshot = replace(
+            gps.current_snapshot,
+            state=GpsState.STALE,
+            gps_time_state=GpsTimeState.GPS_TIME_STALE,
+        )
+        await asyncio.wait_for(wait_for_updates(2), timeout=1)
+        assert backend.overlay_texts[-1] == (
+            "2026-07-28 19:00:01  +03:00  REC\nGPS LOST"
+        )
+        assert "32.12345" not in str(backend.overlay_texts[-1])
+        assert runtime.runtime_snapshot()["overlay"] == {
+            "enabled": True,
+            "state": "ACTIVE",
+            "updates": 2,
+            "last_error": None,
+        }
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_overlay_unsynced_disabled_and_failure_paths_do_not_restart_video() -> None:
+    async def scenario() -> None:
+        unsynced_backend = FakeBackend()
+        unsynced, _ = runtime_for(
+            unsynced_backend,
+            limits=RuntimeLimits(overlay_update_interval_s=0.001),
+        )
+        config = default_config()
+        await unsynced.check(config)
+        await unsynced.start(config)
+        while not unsynced_backend.overlay_texts:
+            await asyncio.sleep(0)
+        assert unsynced_backend.overlay_texts == [
+            "TIME UNSYNCED  REC\nGPS INVALID"
+        ]
+        await unsynced.stop()
+
+        disabled_backend = FakeBackend()
+        disabled, _ = runtime_for(disabled_backend)
+        disabled_config = replace(
+            config,
+            overlay=replace(config.overlay, enabled=False),
+        )
+        await disabled.check(disabled_config)
+        await disabled.start(disabled_config)
+        await asyncio.sleep(0)
+        assert disabled_backend.overlay_texts == []
+        assert disabled.runtime_snapshot()["overlay"] == {
+            "enabled": False,
+            "state": "DISABLED",
+            "updates": 0,
+            "last_error": None,
+        }
+        await disabled.stop()
+
+        failed_backend = FakeBackend(overlay_error=OSError("overlay setter failed"))
+        failed, _ = runtime_for(
+            failed_backend,
+            limits=RuntimeLimits(overlay_update_interval_s=0.001),
+        )
+        await failed.check(config)
+        await failed.start(config)
+        while cast(dict[str, object], failed.runtime_snapshot()["overlay"])[
+            "state"
+        ] != "FAULTED":
+            await asyncio.sleep(0)
+        overlay_status = cast(dict[str, object], failed.runtime_snapshot()["overlay"])
+        assert "overlay setter failed" in str(overlay_status["last_error"])
+        assert failed.runtime_snapshot()["pipeline_restart_count"] == 0
+        assert failed._backend_run_task is not None
+        assert not failed._backend_run_task.done()
+        await failed.stop()
 
     run_async(scenario)
 

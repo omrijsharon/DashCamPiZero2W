@@ -947,6 +947,7 @@ def test_release_uses_system_site_packages_and_smokes_application_and_gstreamer_
     for factory in (
         "queue",
         "libcamerasrc",
+        "textoverlay",
         "v4l2h264enc",
         "alsasrc",
         "audioconvert",

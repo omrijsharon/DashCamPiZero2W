@@ -231,6 +231,31 @@ Phone-preview transport remains open.
   ordinary startup with the configured microphone absent must select truthful
   video-only recording; that gate passed on the exact Pi.
 
+### ADR-P0B-005: Burned-in telemetry overlay
+
+- Decision for Milestone 9 implementation: insert one named GStreamer
+  `textoverlay` in the common 1920x1080 NV12 path after the raw caps and before
+  `v4l2h264enc`. Video-only, legacy A/V, and immutable audio-generation graphs
+  therefore share exactly one camera, overlay, and hardware encoder.
+- Decision: configure the initial overlay while the graph is still stopped so
+  the first encoded buffer is never briefly unmarked. Later updates are one
+  fixed two-line printable-ASCII payload, deduplicated at 2 Hz with no queue or
+  frame copies. A failed live property update is bounded to the optional
+  overlay worker and cannot restart or backpressure recording.
+- Decision: take one immutable `GpsSnapshot` per update. Project its accepted
+  monotonic/UTC anchor with the same `AnchorPolicy` builder used by the GPS
+  service, then apply the configured IANA timezone. Navigation values are used
+  only when both the service state and sentence say they are valid; stale
+  values collapse to `GPS LOST`, and absent/untrusted time collapses to
+  `TIME UNSYNCED`.
+- Dependency gate: the exact Pi currently lacks the `textoverlay` factory.
+  `gstreamer1.0-x` is therefore a declared exact-version installation
+  dependency, and the hash-closed installer must discover `textoverlay` before
+  accepting a staged release.
+- Evidence state: local graph, bounds, stale-data, failure-isolation, installer,
+  lint, and type checks pass. Exact-Pi negotiation, rendering, dynamic stress,
+  shared-snapshot media proof, and performance comparison remain unchecked.
+
 ## Implemented hardware-independent boundaries
 
 The local implementation keeps target-dependent operations behind injectable
@@ -272,7 +297,9 @@ interfaces:
   leases, retention eligibility, durable pair-operation intents, event windows,
   and bounded startup reconciliation against an injected recording filesystem.
 - Overlay formatting consumes one coherent telemetry snapshot and emits bounded
-  text/layout data; the target renderer is not selected.
+  text/layout data. The first target candidate is now wired as one common
+  pre-encoder `textoverlay`; initial state is bound before PLAYING and later
+  changed text is updated through a queue-free optional worker.
 - The unprivileged web policy layer owns sessions, CSRF, reauthentication, input
   bounds, and secret redaction. It talks only through a closed, bounded
   Unix-socket protocol; recorder-approved downloads carry leases and are released
@@ -284,8 +311,8 @@ A/V, and repeated logical microphone-loss/restoration evidence. Direct dynamic
 audio-pad mutation remains refused; immutable-generation/IDR handoff with
 bounded three-slot recycling is selected. Microphone-absent startup has passed;
 physical hot-unplug/replug is outside current acceptance. Remaining work
-includes the GPS/time fault matrix, actual socket ownership, HTTP
-serving, overlay rendering, and the privileged removal helper.
+includes exact-Pi overlay qualification, retention/protection, actual socket
+ownership, HTTP serving, preview, and the privileged removal helper.
 
 ## Structured logging convention
 

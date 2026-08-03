@@ -45,6 +45,9 @@ PIPELINE_DESCRIPTION = (
     "libcamerasrc name=camera ! "
     "video/x-raw,width=(int)1920,height=(int)1080,format=(string)NV12,"
     "framerate=(fraction)30/1 ! "
+    "textoverlay name=burned_overlay text=\"\" silent=true "
+    "valignment=top halignment=left xpad=40 ypad=40 "
+    'font-desc="Monospace 20" shaded-background=true ! '
     "v4l2h264enc name=encoder "
     'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
     'h264_i_frame_period=30" ! '
@@ -70,6 +73,9 @@ _MAX_AUDIO_TIMESTAMPS: Final = 8192
 _MAX_GENERATION_CONTEXTS: Final = 4
 _MAX_QUARANTINED_AUDIO_ERRORS: Final = 4
 _FORCED_IDR_EDGE_BOUND_NS: Final = 100_000_000
+_MAX_OVERLAY_LINE_CHARS: Final = 96
+_MAX_OVERLAY_LINES: Final = 2
+_OVERLAY_UNSET: Final = object()
 _MAX_FOREIGN_FORCE_KEY_EVENTS: Final = 8
 _EXPECTED_QUARANTINED_AUDIO_ERROR_MARKERS: Final = (
     "Internal data stream error",
@@ -1422,6 +1428,9 @@ class GStreamerDriver(Protocol):
     def set_playing(self, pipeline: object, timeout_s: float) -> None:
         """Enter and verify PLAYING within ``timeout_s``."""
 
+    def set_overlay_text(self, pipeline: object, text: str | None) -> None:
+        """Update or silence the bounded burned-in overlay."""
+
     def effective_caps(self, pipeline: object) -> EffectiveCaps:
         """Read the negotiated encoder sink/source caps."""
 
@@ -1528,6 +1537,26 @@ def _bounded_detail(error: BaseException | str) -> str:
     return detail[:512] or type(error).__name__
 
 
+def _validate_overlay_text(text: str | None) -> None:
+    """Validate one fixed-region overlay payload before touching GStreamer."""
+
+    if text is None:
+        return
+    if not isinstance(text, str):
+        raise ValueError("overlay text must be a string or None")
+    lines = text.split("\n")
+    if (
+        len(lines) > _MAX_OVERLAY_LINES
+        or any(
+            len(line) > _MAX_OVERLAY_LINE_CHARS
+            or not line.isascii()
+            or any(not character.isprintable() for character in line)
+            for line in lines
+        )
+    ):
+        raise ValueError("overlay text exceeds the fixed two-line ASCII bounds")
+
+
 def _device_path_is_dynamic_video_node(value: str) -> bool:
     prefix = "/dev/video"
     return value.startswith(prefix) and value[len(prefix) :].isdecimal()
@@ -1603,6 +1632,8 @@ class GStreamerBackend:
         self._audio_loss_observations: tuple[dict[str, object], ...] = ()
         self._initial_media_contract: FragmentMediaContract | None = None
         self._fragment_audio_counter_baseline = 0
+        self._configured_overlay_text: str | object | None = _OVERLAY_UNSET
+        self._last_overlay_text: str | object | None = _OVERLAY_UNSET
 
     @property
     def audio_loss_isolated(self) -> bool:
@@ -1767,6 +1798,27 @@ class GStreamerBackend:
         if opened is None:
             raise PipelineContractError("fragment-opened signal lost its validated event")
         return opened
+
+    def configure_overlay_text(self, text: str | None) -> None:
+        """Bind initial overlay state before any camera buffer can flow."""
+
+        if self._started_once:
+            raise PipelineContractError("initial overlay is already bound")
+        _validate_overlay_text(text)
+        self._configured_overlay_text = text
+
+    async def set_overlay_text(self, text: str | None) -> None:
+        """Set one bounded overlay payload without queueing native work."""
+
+        _validate_overlay_text(text)
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise PipelineContractError("overlay update requires an active pipeline")
+        if text == self._last_overlay_text:
+            return
+        driver = self._load_driver()
+        await self._driver_call(driver.set_overlay_text, pipeline, text)
+        self._last_overlay_text = text
 
     def _load_driver(self) -> GStreamerDriver:
         if self._driver is None:
@@ -1977,6 +2029,14 @@ class GStreamerBackend:
                 self._audio_plan,
             )
             self._pipeline = pipeline
+            configured_overlay = self._configured_overlay_text
+            if configured_overlay is not _OVERLAY_UNSET:
+                await self._driver_call(
+                    driver.set_overlay_text,
+                    pipeline,
+                    cast(str | None, configured_overlay),
+                )
+                self._last_overlay_text = configured_overlay
             await self._driver_call(
                 driver.set_playing,
                 pipeline,
@@ -3908,6 +3968,27 @@ class PyGObjectGStreamerDriver:
                 raise
             raise GStreamerDriverError(
                 f"could not construct the selected pipeline: {_bounded_detail(error)}"
+            ) from error
+
+    def set_overlay_text(self, pipeline: object, text: str | None) -> None:
+        """Apply one validated live text update to the named common overlay."""
+
+        try:
+            _validate_overlay_text(text)
+            overlay = self._method(pipeline, "get_by_name")("burned_overlay")
+            if overlay is None:
+                raise GStreamerDriverError("selected pipeline has no burned overlay")
+            if text is None:
+                self._method(overlay, "set_property")("silent", True)
+                self._method(overlay, "set_property")("text", "")
+                return
+            self._method(overlay, "set_property")("text", text)
+            self._method(overlay, "set_property")("silent", False)
+        except Exception as error:
+            if isinstance(error, GStreamerDriverError | ValueError):
+                raise
+            raise GStreamerDriverError(
+                f"could not update the burned overlay: {_bounded_detail(error)}"
             ) from error
 
     @staticmethod

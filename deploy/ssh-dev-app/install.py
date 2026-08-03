@@ -92,7 +92,7 @@ GSTREAMER_IMPORT_SMOKE: Final = (
     "caps=Gst.Caps.from_string('video/x-raw,framerate=30/1');"
     "rate=caps.get_structure(0).get_value('framerate');"
     "assert int(rate.num)==30 and int(rate.denom)==1;"
-    "missing=[name for name in ('queue','libcamerasrc','v4l2h264enc',"
+    "missing=[name for name in ('queue','libcamerasrc','textoverlay','v4l2h264enc',"
     "'alsasrc','audioconvert','audioresample','voaacenc','aacparse') "
     "if Gst.ElementFactory.find(name) is None];"
     "__import__('sys').exit('missing GStreamer factories: '+','.join(missing)) if missing else None"

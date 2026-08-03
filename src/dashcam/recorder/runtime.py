@@ -23,9 +23,9 @@ from dashcam.audio.linux import (
     discover_capture_device,
 )
 from dashcam.catalog import ClipCatalog
-from dashcam.config import AudioConfig, DashcamConfig, GpsConfig, VideoConfig
+from dashcam.config import AudioConfig, DashcamConfig, GpsConfig, OverlayConfig, VideoConfig
 from dashcam.gps.anchors import NmeaAnchorTracker
-from dashcam.gps.clock import AnchorPolicy
+from dashcam.gps.clock import AnchorPolicy, MonotonicUtcClock, to_local_time
 from dashcam.gps.service import GpsCounters, GpsService, GpsServiceLimits, GpsSnapshot
 from dashcam.gps.telemetry import (
     GpsTelemetryCollector,
@@ -42,6 +42,7 @@ from dashcam.metadata.schema import (
     TimeAnchorSource,
     VideoSummary,
 )
+from dashcam.overlay import OverlayOptions, OverlayTelemetry, build_overlay
 from dashcam.recorder.finalizer import (
     DurableRootedFinalizationFilesystem,
     FinalizationRecoveryReport,
@@ -98,6 +99,7 @@ _CASE_INSENSITIVE_CLIP_IDENTITY_RE = re.compile(
     r"s(?P<utc_sequence>\d{6}))\.(?:mp4|json)",
     re.IGNORECASE,
 )
+_METRES_PER_SECOND_PER_KNOT = 1852.0 / 3600.0
 
 
 class RecorderStorageFault(PipelineContractError):
@@ -174,7 +176,11 @@ class RuntimeAudioState(StrEnum):
 
 
 class RuntimeBackend(Protocol):
+    def configure_overlay_text(self, text: str | None) -> None: ...
+
     async def start(self, requested_profile: VideoProfile) -> VideoProfile: ...
+
+    async def set_overlay_text(self, text: str | None) -> None: ...
 
     async def run(self, stop_requested: asyncio.Event) -> None: ...
 
@@ -316,6 +322,7 @@ class RuntimeLimits:
     task_stop_timeout_s: float = 2.0
     finalizer_timeout_s: float = 6.0
     metadata_reconciliation_interval_s: float = 1.0
+    overlay_update_interval_s: float = 0.5
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -326,6 +333,7 @@ class RuntimeLimits:
                 "metadata_reconciliation_interval_s",
                 self.metadata_reconciliation_interval_s,
             ),
+            ("overlay_update_interval_s", self.overlay_update_interval_s),
         ):
             if (
                 isinstance(value, bool)
@@ -493,6 +501,45 @@ def _video_profile(config: VideoConfig) -> VideoProfile:
     return VideoProfile()
 
 
+def _anchor_policy(config: GpsConfig) -> AnchorPolicy:
+    """Build the one GPS/overlay UTC policy from checked configuration."""
+
+    earliest = datetime.fromisoformat(
+        config.anchor_earliest_utc.removesuffix("Z") + "+00:00"
+    ).astimezone(UTC)
+    latest = datetime.fromisoformat(
+        config.anchor_latest_utc.removesuffix("Z") + "+00:00"
+    ).astimezone(UTC)
+    return AnchorPolicy(
+        earliest_utc=earliest,
+        latest_utc=latest,
+        max_uncertainty_ns=config.anchor_uncertainty_ms * 1_000_000,
+        max_conflict_ns=config.anchor_max_conflict_ms * 1_000_000,
+        max_reacquire_disagreement_ns=(
+            config.anchor_max_reacquire_disagreement_ms * 1_000_000
+        ),
+        max_anchor_interval_ns=config.anchor_max_interval_s * 1_000_000_000,
+        gps_stale_after_ns=int(config.stale_after_s * 1_000_000_000),
+    )
+
+
+def _overlay_options(config: OverlayConfig) -> OverlayOptions:
+    """Map checked product settings into the renderer-independent contract."""
+
+    return OverlayOptions(
+        show_local_datetime=config.show_local_datetime,
+        show_utc_offset=config.show_utc_offset,
+        show_rec=config.show_rec,
+        show_speed=config.show_speed,
+        speed_unit=config.speed_unit,
+        show_coordinates=config.show_coordinates,
+        coordinate_decimals=config.coordinate_decimals,
+        show_altitude=config.show_altitude,
+        show_satellites=config.show_satellites,
+        show_hdop=config.show_hdop,
+    )
+
+
 class GStreamerRecorderRuntime:
     """Bind fresh READY storage evidence to one continuous backend session."""
 
@@ -536,6 +583,10 @@ class GStreamerRecorderRuntime:
         self._gps_stop = asyncio.Event()
         self._gps_task: asyncio.Task[None] | None = None
         self._gps_task_error: str | None = None
+        self._overlay_stop = asyncio.Event()
+        self._overlay_task: asyncio.Task[None] | None = None
+        self._overlay_task_error: str | None = None
+        self._overlay_updates = 0
         self._lifecycle_observer: RuntimeLifecycleObserver | None = None
         self._checked_config: DashcamConfig | None = None
         self._preflight_result: PreflightResult | None = None
@@ -738,6 +789,20 @@ class GStreamerRecorderRuntime:
                 "restoration": restoration_snapshot,
                 "last_restoration_failure": self._last_audio_restoration_failure,
             },
+            "overlay": {
+                "enabled": False if config is None else config.overlay.enabled,
+                "state": (
+                    "DISABLED"
+                    if config is not None and not config.overlay.enabled
+                    else "FAULTED"
+                    if self._overlay_task_error is not None
+                    else "ACTIVE"
+                    if self._overlay_task is not None
+                    else "INACTIVE"
+                ),
+                "updates": self._overlay_updates,
+                "last_error": self._overlay_task_error,
+            },
             "gps": self._gps_runtime_snapshot(),
             "metadata_reconciliation": {
                 "completed": self._metadata_reconciliations,
@@ -797,6 +862,8 @@ class GStreamerRecorderRuntime:
                 observed is None
                 or supervisor_faulted
                 or observed.state is not GpsState.NAVIGATION_VALID
+                or observed.navigation is None
+                or not observed.navigation.navigation_valid
             )
             else observed.navigation
         )
@@ -1092,6 +1159,156 @@ class GStreamerRecorderRuntime:
                 return
         self._gps_task_finished(task)
         self._gps_task = None
+
+    def _current_overlay_text(self) -> str:
+        """Render one coherent immutable GPS/time snapshot for the live frame."""
+
+        config = self._config
+        if config is None:
+            raise PipelineContractError("overlay renderer lacks its bound configuration")
+        service = self._gps_service
+        observed = None if service is None else service.snapshot
+        if observed is not None and not isinstance(observed, GpsSnapshot):
+            raise TypeError("GPS service returned an invalid overlay snapshot")
+
+        supervisor_faulted = self._gps_task_error is not None
+        now_ns = self._monotonic_ns()
+        gps_state = (
+            GpsState.UART_UNAVAILABLE
+            if observed is None
+            else (
+                GpsState.STALE
+                if supervisor_faulted and observed.time_anchor is not None
+                else GpsState.UART_UNAVAILABLE
+                if supervisor_faulted
+                else observed.state
+            )
+        )
+        gps_time_state = (
+            GpsTimeState.UNSYNCED
+            if observed is None
+            else (
+                GpsTimeState.GPS_TIME_STALE
+                if supervisor_faulted and observed.time_anchor is not None
+                else GpsTimeState.UNSYNCED
+                if supervisor_faulted
+                else observed.gps_time_state
+            )
+        )
+        navigation = (
+            None
+            if (
+                observed is None
+                or supervisor_faulted
+                or observed.state is not GpsState.NAVIGATION_VALID
+                or observed.navigation is None
+                or not observed.navigation.navigation_valid
+            )
+            else observed.navigation
+        )
+
+        local_time = None
+        timestamp_quality = TimestampQuality.MONOTONIC_ONLY
+        anchor = None if observed is None else observed.time_anchor
+        if anchor is not None:
+            conversion = MonotonicUtcClock(
+                anchor=anchor,
+                latest_confirmation=anchor,
+            ).convert(now_ns, _anchor_policy(config.gps))
+            if conversion.ok and conversion.estimate is not None:
+                local = to_local_time(
+                    conversion.estimate.utc,
+                    config.time.timezone,
+                )
+                if local.ok and local.local is not None:
+                    local_time = local.local
+                    timestamp_quality = conversion.estimate.quality
+
+        speed_mps = (
+            None
+            if navigation is None or navigation.speed_knots is None
+            else navigation.speed_knots * _METRES_PER_SECOND_PER_KNOT
+        )
+        frame = build_overlay(
+            OverlayTelemetry(
+                gps_time_state=gps_time_state,
+                timestamp_quality=timestamp_quality,
+                gps_state=gps_state,
+                local_time=local_time,
+                latitude_deg=None if navigation is None else navigation.latitude_deg,
+                longitude_deg=None if navigation is None else navigation.longitude_deg,
+                speed_mps=speed_mps,
+                altitude_m=None if navigation is None else navigation.altitude_m,
+                satellites=None if navigation is None else navigation.satellites,
+                hdop=None if navigation is None else navigation.hdop,
+            ),
+            _overlay_options(config.overlay),
+        )
+        return f"{frame.top_line}\n{frame.bottom_line}"
+
+    async def _overlay_loop(self) -> None:
+        """Update changed text only; one failed backend waits for replacement."""
+
+        last_backend: RuntimeBackend | None = None
+        last_text: str | None = None
+        failed_backend: RuntimeBackend | None = None
+        while not self._overlay_stop.is_set():
+            backend = self._backend
+            if backend is not None and backend is not failed_backend:
+                update = getattr(backend, "set_overlay_text", None)
+                try:
+                    if not callable(update):
+                        raise PipelineContractError(
+                            "active backend lacks the burned-overlay update seam"
+                        )
+                    text = self._current_overlay_text()
+                    if backend is not last_backend or text != last_text:
+                        await update(text)
+                        last_backend = backend
+                        last_text = text
+                        self._overlay_updates += 1
+                        self._overlay_task_error = None
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    self._overlay_task_error = _bounded_exception_detail(error)
+                    failed_backend = backend
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._overlay_stop.wait(),
+                    timeout=self._limits.overlay_update_interval_s,
+                )
+
+    def _start_overlay(self, config: OverlayConfig) -> None:
+        """Start one optional queue-free updater for the active recording graph."""
+
+        if not config.enabled or self._overlay_task is not None:
+            return
+        self._overlay_task = asyncio.create_task(
+            self._overlay_loop(),
+            name="recorder-overlay",
+        )
+
+    async def _stop_overlay(self) -> None:
+        """Join the optional updater within the common worker deadline."""
+
+        self._overlay_stop.set()
+        task = self._overlay_task
+        if task is None:
+            return
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=self._limits.task_stop_timeout_s,
+        )
+        if task not in done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        else:
+            try:
+                task.result()
+            except BaseException as error:
+                self._overlay_task_error = _bounded_exception_detail(error)
+        self._overlay_task = None
 
     def recording_progress_token(self) -> int | None:
         """Return cumulative encoded-frame progress for watchdog supervision."""
@@ -1852,6 +2069,12 @@ class GStreamerRecorderRuntime:
                 )
             )
             self._backend = backend
+            config = self._config
+            if config is None:
+                raise PipelineContractError("backend startup lacks its bound configuration")
+            backend.configure_overlay_text(
+                self._current_overlay_text() if config.overlay.enabled else None
+            )
             bind_loss_probe = getattr(backend, "bind_audio_loss_probe", None)
             if audio_plan is not None and callable(bind_loss_probe):
                 selector = self._audio_selector
@@ -1982,6 +2205,7 @@ class GStreamerRecorderRuntime:
             self._audio_plan = None
             await self._start_attempt(profile)
         self._start_gps(config.gps)
+        self._start_overlay(config.overlay)
         self._start_metadata_reconciliation()
 
     async def _supervise_attempt(self, stop_requested: asyncio.Event) -> None:
@@ -2209,6 +2433,7 @@ class GStreamerRecorderRuntime:
                 return
         except asyncio.CancelledError:
             try:
+                await self._stop_overlay()
                 await self._cleanup_current_attempt()
                 await self._run_metadata_reconciliation_pass()
             finally:
@@ -2224,6 +2449,7 @@ class GStreamerRecorderRuntime:
 
         media_cleanup: BaseException | None = None
         try:
+            await self._stop_overlay()
             await self._cleanup_current_attempt()
         except BaseException as error:
             media_cleanup = error
@@ -2278,24 +2504,8 @@ def build_production_runtime(
     def build_gps_service(config: GpsConfig) -> GpsService:
         from dashcam.gps.linux import LinuxGpsTransportFactory
 
-        earliest = datetime.fromisoformat(
-            config.anchor_earliest_utc.removesuffix("Z") + "+00:00"
-        ).astimezone(UTC)
-        latest = datetime.fromisoformat(
-            config.anchor_latest_utc.removesuffix("Z") + "+00:00"
-        ).astimezone(UTC)
         anchor_tracker = NmeaAnchorTracker(
-            policy=AnchorPolicy(
-                earliest_utc=earliest,
-                latest_utc=latest,
-                max_uncertainty_ns=config.anchor_uncertainty_ms * 1_000_000,
-                max_conflict_ns=config.anchor_max_conflict_ms * 1_000_000,
-                max_reacquire_disagreement_ns=(
-                    config.anchor_max_reacquire_disagreement_ms * 1_000_000
-                ),
-                max_anchor_interval_ns=config.anchor_max_interval_s * 1_000_000_000,
-                gps_stale_after_ns=int(config.stale_after_s * 1_000_000_000),
-            ),
+            policy=_anchor_policy(config),
             uncertainty_ns=config.anchor_uncertainty_ms * 1_000_000,
         )
         return GpsService(

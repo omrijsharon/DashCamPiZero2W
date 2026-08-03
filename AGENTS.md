@@ -200,6 +200,19 @@
   transient fault-harness runs used synthetic anchors and must not be cited as
   physical-receiver UTC/filename evidence; sequences 398/399 remain the accepted
   late-lock reconciliation authority.
+- On 2026-08-03 the Milestone 9 local overlay slice added one named, initially
+  preconfigured GStreamer `textoverlay` in the common NV12 path before
+  `v4l2h264enc`, plus a deduplicated queue-free 2 Hz updater using the same GPS
+  anchor policy and IANA projection model as metadata reconciliation.
+  `gstreamer1.0-x` is now a declared package and the installer smoke requires
+  the `textoverlay` factory. Keep all Milestone 9 Pi boxes unchecked until the
+  exact target passes negotiation, dynamic rendering, shared-snapshot, and
+  performance gates. The Pi is on boot ID
+  `91dc363d-3e76-47d3-9c10-56f897c99e9d`; `dashcamd` was stopped cleanly after
+  reporting `STORAGE_FAULT` because `/srv/dashcam` had zero free bytes.
+  `clips` held about 22.77 GB, `pending` about 1.05 GB, `quarantine` about
+  649 MB, and `protected` was empty. Do not delete any recording/evidence
+  without the owner's explicit authorization.
 - The earlier exact-Pi configured-GPS-absence simulation also passed on
   release `d72`: a temporary config used
   `/dev/dashcam-gps-deliberately-absent` while the physical module stayed

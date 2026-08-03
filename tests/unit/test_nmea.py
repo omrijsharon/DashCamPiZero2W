@@ -10,6 +10,7 @@ from dashcam.gps.nmea import (
     NmeaError,
     SentenceType,
     TimeTrust,
+    _checksum,
     is_stale,
     parse_nmea_line,
 )
@@ -170,6 +171,22 @@ def test_printable_ascii_gate_matches_the_full_byte_domain() -> None:
         outcome = parse_nmea_line(b"$GP" + bytes((value,)) + b"X*00")
         expected_non_ascii = value < 0x20 or value > 0x7E
         assert (outcome.error is NmeaError.NON_ASCII) is expected_non_ascii
+
+
+def test_checksum_fast_path_matches_reference_for_all_printable_pairs() -> None:
+    printable = tuple(chr(value) for value in range(0x20, 0x7F))
+    assert _checksum("") == 0
+    for first in printable:
+        first_checksum = ord(first)
+        assert _checksum(first) == first_checksum
+        for second in printable:
+            assert _checksum(first + second) == first_checksum ^ ord(second)
+
+    bounded = "".join(printable[index % len(printable)] for index in range(82))
+    reference = 0
+    for character in bounded:
+        reference ^= ord(character)
+    assert _checksum(bounded) == reference
 
 
 def test_field_count_is_bounded_independently_of_byte_count() -> None:

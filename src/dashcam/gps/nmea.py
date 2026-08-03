@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
+from functools import reduce
+from operator import xor
 from typing import Final
 
 MAX_NMEA_LINE_BYTES: Final = 82
@@ -218,10 +220,7 @@ def _failure(error: NmeaError, detail: str) -> NmeaParseOutcome:
 
 
 def _checksum(body: str) -> int:
-    checksum = 0
-    for character in body:
-        checksum ^= ord(character)
-    return checksum
+    return reduce(xor, body.encode("ascii"), 0)
 
 
 def _field(fields: list[str], index: int) -> str:

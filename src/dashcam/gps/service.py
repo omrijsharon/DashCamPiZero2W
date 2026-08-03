@@ -457,24 +457,46 @@ class GpsService:
         return received_data
 
     def _consume_chunk(self, chunk: bytes, received_ns: int) -> None:
-        for value in chunk:
+        offset = 0
+        chunk_size = len(chunk)
+        max_line_bytes = self._limits.max_line_bytes
+        while offset < chunk_size:
             if self._discarding_oversized_line:
-                if value == 0x0A:
-                    self._discarding_oversized_line = False
+                newline = chunk.find(b"\n", offset)
+                if newline < 0:
+                    return
+                self._discarding_oversized_line = False
+                offset = newline + 1
                 continue
 
-            self._line_buffer.append(value)
-            if len(self._line_buffer) > self._limits.max_line_bytes:
+            newline = chunk.find(b"\n", offset)
+            end = chunk_size if newline < 0 else newline + 1
+            segment_size = end - offset
+            buffered_size = len(self._line_buffer)
+            if buffered_size + segment_size > max_line_bytes:
+                overflow_offset = offset + max_line_bytes - buffered_size
                 self._line_buffer.clear()
-                self._discarding_oversized_line = value != 0x0A
+                self._discarding_oversized_line = chunk[overflow_offset] != 0x0A
                 self._increment(oversized_lines=1, lines_received=1)
                 self._record_parse_failure(received_ns)
+                if newline < 0:
+                    return
+                self._discarding_oversized_line = False
+                offset = end
                 continue
 
-            if value == 0x0A:
+            if newline < 0:
+                self._line_buffer.extend(chunk[offset:end])
+                return
+
+            if buffered_size:
+                self._line_buffer.extend(chunk[offset:end])
                 raw_line = bytes(self._line_buffer)
                 self._line_buffer.clear()
-                self._handle_line(raw_line, received_ns)
+            else:
+                raw_line = chunk[offset:end]
+            self._handle_line(raw_line, received_ns)
+            offset = end
 
     def _handle_line(self, raw_line: bytes, received_ns: int) -> None:
         self._increment(lines_received=1)

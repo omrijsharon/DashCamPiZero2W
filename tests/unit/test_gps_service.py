@@ -133,6 +133,30 @@ class RecordingCoalescer:
         self.delays.append(delay_s)
 
 
+class ReferenceBytewiseGpsService(GpsService):
+    """Literal pre-optimization consumer used only for differential tests."""
+
+    def _consume_chunk(self, chunk: bytes, received_ns: int) -> None:
+        for value in chunk:
+            if self._discarding_oversized_line:
+                if value == 0x0A:
+                    self._discarding_oversized_line = False
+                continue
+
+            self._line_buffer.append(value)
+            if len(self._line_buffer) > self._limits.max_line_bytes:
+                self._line_buffer.clear()
+                self._discarding_oversized_line = value != 0x0A
+                self._increment(oversized_lines=1, lines_received=1)
+                self._record_parse_failure(received_ns)
+                continue
+
+            if value == 0x0A:
+                raw_line = bytes(self._line_buffer)
+                self._line_buffer.clear()
+                self._handle_line(raw_line, received_ns)
+
+
 def _limits(**changes: float | int) -> GpsServiceLimits:
     values: dict[str, float | int] = {
         "read_size_bytes": 128,
@@ -863,6 +887,122 @@ def test_freshness_refresh_with_no_transition_preserves_observable_values() -> N
     assert id(service._state) == mutable_state_identity
     assert service.snapshot == before
     assert service.snapshot.counters.stale_transitions == 0
+
+
+def test_line_oriented_consumer_matches_bytewise_reference_across_boundaries() -> None:
+    stream = (
+        _VALID_RMC
+        + _INVALID_FIX
+        + _UNSUPPORTED
+        + _BAD_CHECKSUM
+        + b"$"
+        + b"A" * MAX_NMEA_LINE_BYTES
+        + b"\n"
+        + b"$"
+        + b"B" * (MAX_NMEA_LINE_BYTES - 1)
+        + b"\n"
+        + b"\xff\n"
+        + _LATER_RMC
+        + b"$G"
+    )
+
+    for chunk_size in range(1, 129):
+        limits = _limits(
+            read_size_bytes=4096,
+            max_consecutive_parse_errors=32,
+            max_parse_errors_per_second=10_000,
+        )
+        optimized = GpsService(
+            transport_factory=ScriptedFactory([]),
+            limits=limits,
+        )
+        reference = ReferenceBytewiseGpsService(
+            transport_factory=ScriptedFactory([]),
+            limits=limits,
+        )
+        optimized._on_connected()
+        reference._on_connected()
+
+        for index, offset in enumerate(range(0, len(stream), chunk_size)):
+            chunk = stream[offset : offset + chunk_size]
+            received_ns = index * 1_000_000
+            optimized._consume_chunk(chunk, received_ns)
+            reference._consume_chunk(chunk, received_ns)
+            optimized._refresh_freshness(received_ns)
+            reference._refresh_freshness(received_ns)
+            assert optimized.snapshot == reference.snapshot
+
+
+def test_line_oriented_consumer_matches_parse_guard_failure_boundary() -> None:
+    stream = _BAD_CHECKSUM * 5
+    for chunk_size in range(1, len(_BAD_CHECKSUM) + 2):
+        limits = _limits(
+            read_size_bytes=4096,
+            max_consecutive_parse_errors=4,
+            max_parse_errors_per_second=10_000,
+        )
+        optimized = GpsService(
+            transport_factory=ScriptedFactory([]),
+            limits=limits,
+        )
+        reference = ReferenceBytewiseGpsService(
+            transport_factory=ScriptedFactory([]),
+            limits=limits,
+        )
+        optimized._on_connected()
+        reference._on_connected()
+
+        optimized_error: RuntimeError | None = None
+        reference_error: RuntimeError | None = None
+        for offset in range(0, len(stream), chunk_size):
+            chunk = stream[offset : offset + chunk_size]
+            try:
+                optimized._consume_chunk(chunk, 0)
+            except RuntimeError as error:
+                optimized_error = error
+            try:
+                reference._consume_chunk(chunk, 0)
+            except RuntimeError as error:
+                reference_error = error
+            assert (type(optimized_error), str(optimized_error)) == (
+                type(reference_error),
+                str(reference_error),
+            )
+            assert optimized.snapshot == reference.snapshot
+            if optimized_error is not None:
+                break
+
+        assert optimized_error is not None
+
+
+def test_line_oriented_consumer_preserves_exact_oversized_discard_boundaries() -> None:
+    service = GpsService(
+        transport_factory=ScriptedFactory([]),
+        limits=_limits(),
+    )
+    service._on_connected()
+
+    service._consume_chunk(b"A" * MAX_NMEA_LINE_BYTES, 0)
+    at_limit = service.snapshot
+    service._consume_chunk(b"X", 0)
+    overflowed = service.snapshot
+    service._consume_chunk(b"discarded\n", 0)
+    resynchronized = service.snapshot
+    service._consume_chunk(b"B" * MAX_NMEA_LINE_BYTES + b"\n", 0)
+    newline_overflow = service.snapshot
+
+    assert at_limit.buffered_bytes == MAX_NMEA_LINE_BYTES
+    assert at_limit.counters.oversized_lines == 0
+    assert overflowed.buffered_bytes == 0
+    assert overflowed.discarding_oversized_line
+    assert overflowed.counters.oversized_lines == 1
+    assert resynchronized.buffered_bytes == 0
+    assert not resynchronized.discarding_oversized_line
+    assert resynchronized.counters.oversized_lines == 1
+    assert newline_overflow.buffered_bytes == 0
+    assert not newline_overflow.discarding_oversized_line
+    assert newline_overflow.counters.oversized_lines == 2
+    assert newline_overflow.counters.lines_received == 2
 
 
 @pytest.mark.parametrize(

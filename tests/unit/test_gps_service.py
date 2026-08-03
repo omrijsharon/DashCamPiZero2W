@@ -15,6 +15,7 @@ from dashcam.gps.service import (
     GpsService,
     GpsServiceError,
     GpsServiceLimits,
+    GpsSnapshot,
     GpsTransport,
 )
 from dashcam.gps.telemetry import GpsTelemetryCollector
@@ -124,11 +125,20 @@ class ScriptedWaiter:
         return stop_requested.is_set()
 
 
+class RecordingCoalescer:
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay_s: float) -> None:
+        self.delays.append(delay_s)
+
+
 def _limits(**changes: float | int) -> GpsServiceLimits:
     values: dict[str, float | int] = {
         "read_size_bytes": 128,
         "open_timeout_s": 0.1,
         "read_timeout_s": 0.1,
+        "read_coalesce_s": 0.0,
         "stale_after_s": 2.0,
         "reconnect_min_s": 0.1,
         "reconnect_max_s": 0.4,
@@ -285,6 +295,84 @@ def test_transport_outer_deadline_has_small_bounded_scheduler_margin() -> None:
     assert _limits(read_timeout_s=0.01).transport_read_deadline_s == pytest.approx(0.02)
     assert _limits(read_timeout_s=0.25).transport_read_deadline_s == pytest.approx(0.3125)
     assert _limits(read_timeout_s=30.0).transport_read_deadline_s == pytest.approx(30.25)
+
+
+def test_short_nonfinal_read_coalesces_once_with_the_configured_delay() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        coalescer = RecordingCoalescer()
+        transport = ScriptedTransport(
+            [_VALID_RMC[:7], _VALID_RMC[7:]],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(read_coalesce_s=0.02),
+            monotonic_ns=clock,
+            read_coalescer=coalescer,
+        )
+
+        await service.run(stop)
+
+        assert coalescer.delays == [0.02]
+        assert service.snapshot.counters.valid_sentences == 1
+
+    asyncio.run(scenario())
+
+
+def test_full_read_skips_coalescing_so_backlog_drains_immediately() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        coalescer = RecordingCoalescer()
+        transport = ScriptedTransport(
+            [b"x" * 128, b"\n"],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(read_coalesce_s=0.02),
+            monotonic_ns=clock,
+            read_coalescer=coalescer,
+        )
+
+        await service.run(stop)
+
+        assert coalescer.delays == []
+        assert service.snapshot.counters.bytes_received == 129
+
+    asyncio.run(scenario())
+
+
+def test_stop_after_short_read_prevents_an_extra_coalescing_delay() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        coalescer = RecordingCoalescer()
+        transport = ScriptedTransport(
+            [_VALID_RMC],
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(read_coalesce_s=0.1),
+            monotonic_ns=clock,
+            read_coalescer=coalescer,
+        )
+
+        await service.run(stop)
+
+        assert coalescer.delays == []
+        assert service.snapshot.counters.valid_sentences == 1
+
+    asyncio.run(scenario())
 
 
 def test_transport_read_deadline_is_enforced_even_if_adapter_hangs() -> None:
@@ -687,6 +775,96 @@ def test_transport_cannot_exceed_read_bound_or_grow_internal_buffer() -> None:
     asyncio.run(scenario())
 
 
+def test_high_volume_chunking_preserves_the_exact_public_snapshot() -> None:
+    async def run_with_chunks(chunks: list[ReadAction]) -> GpsSnapshot:
+        stop = asyncio.Event()
+        clock = FakeClock()
+        transport = ScriptedTransport(
+            chunks,
+            clock=clock,
+            stop=stop,
+            stop_on_exhaustion=True,
+        )
+        service = GpsService(
+            transport_factory=ScriptedFactory([transport]),
+            limits=_limits(
+                read_size_bytes=4096,
+                max_consecutive_parse_errors=8,
+                max_parse_errors_per_second=10_000,
+            ),
+            monotonic_ns=clock,
+        )
+        await service.run(stop)
+        return service.snapshot
+
+    stream = (_VALID_RMC + _INVALID_FIX + _UNSUPPORTED + _BAD_CHECKSUM) * 1_000
+    coarse_chunks: list[ReadAction] = [
+        stream[offset : offset + 4096] for offset in range(0, len(stream), 4096)
+    ]
+    uneven_chunks: list[ReadAction] = [
+        stream[offset : offset + 251] for offset in range(0, len(stream), 251)
+    ]
+
+    coarse = asyncio.run(run_with_chunks(coarse_chunks))
+    uneven = asyncio.run(run_with_chunks(uneven_chunks))
+
+    assert coarse == uneven
+    assert coarse.state is GpsState.RECEIVING_INVALID
+    assert coarse.counters.lines_received == 4_000
+    assert coarse.counters.valid_sentences == 2_000
+    assert coarse.counters.parse_errors == 2_000
+    assert coarse.counters.valid_fixes == 1_000
+
+
+def test_observed_snapshots_do_not_follow_later_mutable_state() -> None:
+    service = GpsService(
+        transport_factory=ScriptedFactory([]),
+        limits=_limits(),
+        monotonic_ns=FakeClock(),
+    )
+    initial = service.snapshot
+
+    service._on_connected()
+    connected = service.snapshot
+    service._consume_chunk(_VALID_RMC[:7], 0)
+    partial = service.snapshot
+    service._consume_chunk(_VALID_RMC[7:], 0)
+    final = service.snapshot
+
+    assert initial.state is GpsState.UART_UNAVAILABLE
+    assert not initial.connected
+    assert initial.buffered_bytes == 0
+    assert initial.counters == initial.counters.__class__()
+    assert connected.state is GpsState.RECEIVING_INVALID
+    assert connected.connected
+    assert connected.buffered_bytes == 0
+    assert connected.counters.connections == 1
+    assert partial.buffered_bytes == 7
+    assert partial.counters.valid_sentences == 0
+    assert final.state is GpsState.NAVIGATION_VALID
+    assert final.buffered_bytes == 0
+    assert final.counters.valid_sentences == 1
+
+
+def test_freshness_refresh_with_no_transition_preserves_observable_values() -> None:
+    service = GpsService(
+        transport_factory=ScriptedFactory([]),
+        limits=_limits(),
+        monotonic_ns=FakeClock(),
+    )
+    service._on_connected()
+    service._consume_chunk(_VALID_RMC, 0)
+    before = service.snapshot
+    mutable_state_identity = id(service._state)
+
+    for now_ns in (0, 1, 2, 3):
+        service._refresh_freshness(now_ns)
+
+    assert id(service._state) == mutable_state_identity
+    assert service.snapshot == before
+    assert service.snapshot.counters.stale_transitions == 0
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -694,6 +872,10 @@ def test_transport_cannot_exceed_read_bound_or_grow_internal_buffer() -> None:
         {"read_size_bytes": 4097},
         {"open_timeout_s": 0.0},
         {"read_timeout_s": 0.0},
+        {"read_coalesce_s": -0.001},
+        {"read_coalesce_s": 0.101},
+        {"read_coalesce_s": float("nan")},
+        {"read_coalesce_s": float("inf")},
         {"stale_after_s": 0.0},
         {"reconnect_min_s": 2.0, "reconnect_max_s": 1.0},
         {"max_line_bytes": MAX_NMEA_LINE_BYTES + 1},

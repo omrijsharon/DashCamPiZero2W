@@ -127,7 +127,7 @@ def parse_nmea_line(
 
     if not line:
         return _failure(NmeaError.EMPTY, "empty NMEA record")
-    if any(ord(character) < 0x20 or ord(character) > 0x7E for character in line):
+    if not line.isprintable():
         return _failure(NmeaError.NON_ASCII, "record contains non-printable ASCII")
     if not line.startswith("$") or line.count("*") != 1:
         return _failure(NmeaError.MALFORMED_ENVELOPE, "expected one '$...*HH' envelope")

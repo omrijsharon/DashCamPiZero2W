@@ -165,6 +165,13 @@ def test_input_is_ascii_checked_and_bounded_before_parsing() -> None:
     assert outcome.error is NmeaError.TOO_LONG
 
 
+def test_printable_ascii_gate_matches_the_full_byte_domain() -> None:
+    for value in range(256):
+        outcome = parse_nmea_line(b"$GP" + bytes((value,)) + b"X*00")
+        expected_non_ascii = value < 0x20 or value > 0x7E
+        assert (outcome.error is NmeaError.NON_ASCII) is expected_non_ascii
+
+
 def test_field_count_is_bounded_independently_of_byte_count() -> None:
     outcome = parse_nmea_line(_sentence("GPRMC" + "," * 20))
 

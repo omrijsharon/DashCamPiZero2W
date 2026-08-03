@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final, Protocol
 
@@ -81,6 +81,7 @@ class GpsServiceLimits:
     read_size_bytes: int = 256
     open_timeout_s: float = 2.0
     read_timeout_s: float = 0.25
+    read_coalesce_s: float = 0.020
     stale_after_s: float = 2.0
     reconnect_min_s: float = 0.25
     reconnect_max_s: float = 30.0
@@ -93,6 +94,12 @@ class GpsServiceLimits:
         _bounded_int(self.read_size_bytes, "read_size_bytes", minimum=1, maximum=_MAX_READ_BYTES)
         _bounded_float(self.open_timeout_s, "open_timeout_s", minimum=0.001, maximum=30.0)
         _bounded_float(self.read_timeout_s, "read_timeout_s", minimum=0.001, maximum=30.0)
+        _bounded_float(
+            self.read_coalesce_s,
+            "read_coalesce_s",
+            minimum=0.0,
+            maximum=0.100,
+        )
         _bounded_float(self.stale_after_s, "stale_after_s", minimum=0.001, maximum=3600.0)
         _bounded_float(
             self.reconnect_min_s,
@@ -198,6 +205,76 @@ class GpsSnapshot:
     )
 
 
+@dataclass(slots=True)
+class _MutableGpsCounters:
+    """Private hot-path accounting, materialized immutably only for observers."""
+
+    connection_attempts: int = 0
+    connections: int = 0
+    reconnects: int = 0
+    disconnects: int = 0
+    read_timeouts: int = 0
+    bytes_received: int = 0
+    lines_received: int = 0
+    valid_sentences: int = 0
+    parse_errors: int = 0
+    checksum_failures: int = 0
+    unsupported_sentences: int = 0
+    oversized_lines: int = 0
+    transport_errors: int = 0
+    valid_fixes: int = 0
+    stale_transitions: int = 0
+    anchor_attempts: int = 0
+    anchor_acceptances: int = 0
+    anchor_confirmations: int = 0
+    anchor_reacquisitions: int = 0
+    anchor_idempotent: int = 0
+    anchor_rejections: int = 0
+
+    def snapshot(self) -> GpsCounters:
+        return GpsCounters(
+            connection_attempts=self.connection_attempts,
+            connections=self.connections,
+            reconnects=self.reconnects,
+            disconnects=self.disconnects,
+            read_timeouts=self.read_timeouts,
+            bytes_received=self.bytes_received,
+            lines_received=self.lines_received,
+            valid_sentences=self.valid_sentences,
+            parse_errors=self.parse_errors,
+            checksum_failures=self.checksum_failures,
+            unsupported_sentences=self.unsupported_sentences,
+            oversized_lines=self.oversized_lines,
+            transport_errors=self.transport_errors,
+            valid_fixes=self.valid_fixes,
+            stale_transitions=self.stale_transitions,
+            anchor_attempts=self.anchor_attempts,
+            anchor_acceptances=self.anchor_acceptances,
+            anchor_confirmations=self.anchor_confirmations,
+            anchor_reacquisitions=self.anchor_reacquisitions,
+            anchor_idempotent=self.anchor_idempotent,
+            anchor_rejections=self.anchor_rejections,
+        )
+
+
+@dataclass(slots=True)
+class _MutableGpsState:
+    """Private current state; public observations remain frozen value objects."""
+
+    state: GpsState = GpsState.UART_UNAVAILABLE
+    navigation: NmeaSentence | None = None
+    latest_sentence: NmeaSentence | None = None
+    connected: bool = False
+    last_error: GpsServiceError | None = None
+    last_error_detail: str | None = None
+    last_parse_error: NmeaError | None = None
+    gps_time_state: GpsTimeState = GpsTimeState.UNSYNCED
+    time_anchor: UtcAnchor | None = None
+    last_anchor_status: AnchorStatus | None = None
+    last_anchor_error: str | None = None
+    last_anchor_disagreement_ns: int | None = None
+
+
 class _AsyncioReconnectWaiter:
     async def wait(self, stop_requested: asyncio.Event, delay_s: float) -> bool:
         try:
@@ -217,6 +294,7 @@ class GpsService:
         limits: GpsServiceLimits | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         reconnect_waiter: ReconnectWaiter | None = None,
+        read_coalescer: Callable[[float], Awaitable[None]] | None = None,
         anchor_tracker: NmeaAnchorTracker | None = None,
         telemetry_collector: GpsTelemetryCollector | None = None,
     ) -> None:
@@ -224,9 +302,11 @@ class GpsService:
         self._limits = limits or GpsServiceLimits()
         self._monotonic_ns = monotonic_ns
         self._waiter = reconnect_waiter or _AsyncioReconnectWaiter()
+        self._read_coalescer = read_coalescer or asyncio.sleep
         self._anchor_tracker = anchor_tracker
         self._telemetry_collector = telemetry_collector
-        self._snapshot = GpsSnapshot()
+        self._state = _MutableGpsState()
+        self._counters = _MutableGpsCounters()
         self._line_buffer = bytearray()
         self._discarding_oversized_line = False
         self._last_sentence_ns: int | None = None
@@ -241,7 +321,28 @@ class GpsService:
     def snapshot(self) -> GpsSnapshot:
         """Return the latest immutable status object."""
 
-        return self._snapshot
+        state = self._state
+        collector = self._telemetry_collector
+        return GpsSnapshot(
+            state=state.state,
+            navigation=state.navigation,
+            latest_sentence=state.latest_sentence,
+            counters=self._counters.snapshot(),
+            connected=state.connected,
+            buffered_bytes=len(self._line_buffer),
+            discarding_oversized_line=self._discarding_oversized_line,
+            last_error=state.last_error,
+            last_error_detail=state.last_error_detail,
+            last_parse_error=state.last_parse_error,
+            gps_time_state=state.gps_time_state,
+            time_anchor=state.time_anchor,
+            last_anchor_status=state.last_anchor_status,
+            last_anchor_error=state.last_anchor_error,
+            last_anchor_disagreement_ns=state.last_anchor_disagreement_ns,
+            telemetry_counters=(
+                GpsTelemetryCounters() if collector is None else collector.counters
+            ),
+        )
 
     def telemetry_window(
         self,
@@ -347,6 +448,12 @@ class GpsService:
             self._increment(bytes_received=len(chunk))
             self._consume_chunk(chunk, now_ns)
             self._refresh_freshness(now_ns)
+            if (
+                len(chunk) < self._limits.read_size_bytes
+                and not stop_requested.is_set()
+                and self._limits.read_coalesce_s > 0.0
+            ):
+                await self._read_coalescer(self._limits.read_coalesce_s)
         return received_data
 
     def _consume_chunk(self, chunk: bytes, received_ns: int) -> None:
@@ -354,7 +461,6 @@ class GpsService:
             if self._discarding_oversized_line:
                 if value == 0x0A:
                     self._discarding_oversized_line = False
-                    self._publish_buffer_status()
                 continue
 
             self._line_buffer.append(value)
@@ -362,16 +468,13 @@ class GpsService:
                 self._line_buffer.clear()
                 self._discarding_oversized_line = value != 0x0A
                 self._increment(oversized_lines=1, lines_received=1)
-                self._publish_buffer_status()
                 self._record_parse_failure(received_ns)
                 continue
 
             if value == 0x0A:
                 raw_line = bytes(self._line_buffer)
                 self._line_buffer.clear()
-                self._publish_buffer_status()
                 self._handle_line(raw_line, received_ns)
-        self._publish_buffer_status()
 
     def _handle_line(self, raw_line: bytes, received_ns: int) -> None:
         self._increment(lines_received=1)
@@ -385,15 +488,12 @@ class GpsService:
                 increments["unsupported_sentences"] = 1
             self._increment(**increments)
             state = (
-                self._snapshot.state
-                if self._snapshot.navigation is not None
+                self._state.state
+                if self._state.navigation is not None
                 else GpsState.RECEIVING_INVALID
             )
-            self._snapshot = replace(
-                self._snapshot,
-                state=state,
-                last_parse_error=outcome.error,
-            )
+            self._state.state = state
+            self._state.last_parse_error = outcome.error
             self._record_parse_failure(received_ns)
             return
 
@@ -406,7 +506,7 @@ class GpsService:
             collector.observe(sentence)
         self._last_sentence_ns = received_ns
         increments = {"valid_sentences": 1}
-        navigation = self._snapshot.navigation
+        navigation = self._state.navigation
         if sentence.navigation_valid:
             navigation = sentence
             self._last_navigation_ns = received_ns
@@ -429,21 +529,15 @@ class GpsService:
                 else GpsState.RECEIVING_INVALID
             )
         self._increment(**increments)
-        self._snapshot = replace(
-            self._snapshot,
-            state=state,
-            navigation=navigation,
-            latest_sentence=sentence,
-            last_error=None,
-            last_error_detail=None,
-            last_parse_error=None,
-            telemetry_counters=(
-                GpsTelemetryCounters() if collector is None else collector.counters
-            ),
-        )
+        self._state.state = state
+        self._state.navigation = navigation
+        self._state.latest_sentence = sentence
+        self._state.last_error = None
+        self._state.last_error_detail = None
+        self._state.last_parse_error = None
 
     def _refresh_freshness(self, now_ns: int) -> None:
-        navigation = self._snapshot.navigation
+        navigation = self._state.navigation
         if navigation is not None and (
             self._last_navigation_ns is None
             or now_ns < self._last_navigation_ns
@@ -455,12 +549,12 @@ class GpsService:
         sentence_stale = last_sentence is not None and (
             now_ns < last_sentence or now_ns - last_sentence > self._limits.stale_after_ns
         )
-        state = self._snapshot.state
+        state = self._state.state
         if sentence_stale and state is not GpsState.STALE:
             state = GpsState.STALE
             self._increment(stale_transitions=1)
-        elif navigation is None and self._snapshot.navigation is not None:
-            latest = self._snapshot.latest_sentence
+        elif navigation is None and self._state.navigation is not None:
+            latest = self._state.latest_sentence
             state = (
                 GpsState.TIME_VALID_POSITION_INVALID
                 if latest is not None
@@ -474,12 +568,12 @@ class GpsService:
             if tracker is None
             else tracker.gps_time_state(now_ns)
         )
-        self._snapshot = replace(
-            self._snapshot,
-            state=state,
-            navigation=navigation,
-            gps_time_state=gps_time_state,
-        )
+        if state is not self._state.state:
+            self._state.state = state
+        if navigation is not self._state.navigation:
+            self._state.navigation = navigation
+        if gps_time_state is not self._state.gps_time_state:
+            self._state.gps_time_state = gps_time_state
 
     def _consider_anchor(self, sentence: NmeaSentence) -> None:
         tracker = self._anchor_tracker
@@ -495,19 +589,16 @@ class GpsService:
         clock_outcome = outcome.clock_outcome
         if clock_outcome is None:
             self._increment(anchor_rejections=1)
-            self._snapshot = replace(
-                self._snapshot,
-                gps_time_state=_tracker_time_state(
-                    outcome.tracker,
-                    sentence.received_monotonic_ns,
-                ),
-                time_anchor=outcome.tracker.clock.anchor,
-                last_anchor_status=None,
-                last_anchor_error=(
-                    None if outcome.error is None else f"NMEA:{outcome.error.value}"
-                ),
-                last_anchor_disagreement_ns=None,
+            self._state.gps_time_state = _tracker_time_state(
+                outcome.tracker,
+                sentence.received_monotonic_ns,
             )
+            self._state.time_anchor = outcome.tracker.clock.anchor
+            self._state.last_anchor_status = None
+            self._state.last_anchor_error = (
+                None if outcome.error is None else f"NMEA:{outcome.error.value}"
+            )
+            self._state.last_anchor_disagreement_ns = None
             return
 
         increments: dict[str, int]
@@ -522,21 +613,18 @@ class GpsService:
         else:
             increments = {"anchor_rejections": 1}
         self._increment(**increments)
-        self._snapshot = replace(
-            self._snapshot,
-            gps_time_state=_tracker_time_state(
-                outcome.tracker,
-                sentence.received_monotonic_ns,
-            ),
-            time_anchor=outcome.tracker.clock.anchor,
-            last_anchor_status=clock_outcome.status,
-            last_anchor_error=(
-                None
-                if clock_outcome.error is None
-                else f"CLOCK:{clock_outcome.error.value}"
-            ),
-            last_anchor_disagreement_ns=clock_outcome.disagreement_ns,
+        self._state.gps_time_state = _tracker_time_state(
+            outcome.tracker,
+            sentence.received_monotonic_ns,
         )
+        self._state.time_anchor = outcome.tracker.clock.anchor
+        self._state.last_anchor_status = clock_outcome.status
+        self._state.last_anchor_error = (
+            None
+            if clock_outcome.error is None
+            else f"CLOCK:{clock_outcome.error.value}"
+        )
+        self._state.last_anchor_disagreement_ns = clock_outcome.disagreement_ns
 
     def _on_connected(self) -> None:
         reconnect = self._had_connection
@@ -550,18 +638,13 @@ class GpsService:
         if reconnect:
             increments["reconnects"] = 1
         self._increment(**increments)
-        state = self._snapshot.state
+        state = self._state.state
         if state in {GpsState.UART_UNAVAILABLE, GpsState.FAULTED}:
             state = GpsState.RECEIVING_INVALID
-        self._snapshot = replace(
-            self._snapshot,
-            state=state,
-            connected=True,
-            buffered_bytes=0,
-            discarding_oversized_line=False,
-            last_error=None,
-            last_error_detail=None,
-        )
+        self._state.state = state
+        self._state.connected = True
+        self._state.last_error = None
+        self._state.last_error_detail = None
 
     def _on_transport_error(
         self,
@@ -579,24 +662,19 @@ class GpsService:
         self._discarding_oversized_line = False
         if disconnected and self._last_sentence_ns is not None:
             state = GpsState.STALE
-            if self._snapshot.state is not GpsState.STALE:
+            if self._state.state is not GpsState.STALE:
                 self._increment(stale_transitions=1)
         else:
             state = GpsState.FAULTED if faulted else GpsState.UART_UNAVAILABLE
-        self._snapshot = replace(
-            self._snapshot,
-            state=state,
-            navigation=None,
-            connected=False,
-            buffered_bytes=0,
-            discarding_oversized_line=False,
-            last_error=error_code,
-            last_error_detail=_error_detail(error),
-            gps_time_state=(
-                GpsTimeState.GPS_TIME_STALE
-                if self._snapshot.time_anchor is not None
-                else GpsTimeState.UNSYNCED
-            ),
+        self._state.state = state
+        self._state.navigation = None
+        self._state.connected = False
+        self._state.last_error = error_code
+        self._state.last_error_detail = _error_detail(error)
+        self._state.gps_time_state = (
+            GpsTimeState.GPS_TIME_STALE
+            if self._state.time_anchor is not None
+            else GpsTimeState.UNSYNCED
         )
 
     async def _close_transport(self, transport: GpsTransport) -> None:
@@ -606,21 +684,11 @@ class GpsService:
             raise
         except Exception as error:
             self._increment(transport_errors=1)
-            self._snapshot = replace(
-                self._snapshot,
-                connected=False,
-                last_error=GpsServiceError.CLOSE_FAILURE,
-                last_error_detail=_error_detail(error),
-            )
+            self._state.connected = False
+            self._state.last_error = GpsServiceError.CLOSE_FAILURE
+            self._state.last_error_detail = _error_detail(error)
         else:
-            self._snapshot = replace(self._snapshot, connected=False)
-
-    def _publish_buffer_status(self) -> None:
-        self._snapshot = replace(
-            self._snapshot,
-            buffered_bytes=len(self._line_buffer),
-            discarding_oversized_line=self._discarding_oversized_line,
-        )
+            self._state.connected = False
 
     def _record_parse_failure(self, received_ns: int) -> None:
         """Trip bounded reconnect/backoff before malformed input can starve media."""
@@ -651,14 +719,9 @@ class GpsService:
             )
 
     def _increment(self, **increments: int) -> None:
-        counters = self._snapshot.counters
-        self._snapshot = replace(
-            self._snapshot,
-            counters=replace(
-                counters,
-                **{name: getattr(counters, name) + amount for name, amount in increments.items()},
-            ),
-        )
+        counters = self._counters
+        for name, amount in increments.items():
+            setattr(counters, name, getattr(counters, name) + amount)
 
     def _now_ns(self) -> int:
         value = self._monotonic_ns()

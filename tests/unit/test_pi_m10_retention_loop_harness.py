@@ -1190,6 +1190,7 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert '"--cell-cutpoint"' in source
     assert "--cell-catalog" not in source
     assert "--cell-root" not in source
+    assert "max_active_leases=" not in source
     assert source.count("os.kill(os.getpid(), SIGKILL_NUMBER)") == 3
     assert '"sigkill-all-operation-cutpoint-matrix"' not in source
     for function in (

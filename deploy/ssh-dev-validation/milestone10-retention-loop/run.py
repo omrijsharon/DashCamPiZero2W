@@ -1922,7 +1922,6 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
             monotonic_now_ns=100,
             duration_ns=300 * 1_000_000_000,
             boot_id="m10-loop-boot",
-            max_active_leases=32,
         )
         unmanaged = _fixture_clip(42, managed=False)
         _materialize_clip(root, unmanaged)

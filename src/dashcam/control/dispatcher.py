@@ -13,10 +13,10 @@ import copy
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from contextlib import suppress
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import Final, Protocol, cast
+from typing import Final, Protocol, TypeVar, cast
 from uuid import UUID, uuid4
 
 from dashcam.catalog import (
@@ -28,6 +28,7 @@ from dashcam.catalog import (
     EventProtectionResult,
     EventSource,
 )
+from dashcam.catalog.database import DownloadLeaseCapacityReached
 from dashcam.config import (
     ConfigError,
     DashcamConfig,
@@ -77,9 +78,16 @@ class CatalogBackend(Protocol):
         monotonic_now_ns: int,
         duration_ns: int,
         boot_id: str,
+        max_active_leases: int = MAX_ACTIVE_DOWNLOAD_LEASES,
     ) -> DownloadLease: ...
 
-    def release_download_lease(self, clip_id: UUID, *, holder: str) -> None: ...
+    def release_download_lease(
+        self,
+        clip_id: UUID,
+        *,
+        holder: str,
+        monotonic_now_ns: int,
+    ) -> bool: ...
 
     def prepare_protect(
         self, clip_id: UUID, *, reason: str, monotonic_now_ns: int
@@ -116,13 +124,7 @@ EventExecutor = Callable[
     Awaitable[EventProtectionResult],
 ]
 OperationCallback = Callable[[], Awaitable[Mapping[str, object] | None]]
-
-
-@dataclass(frozen=True, slots=True)
-class _IssuedLease:
-    clip_id: UUID
-    catalog_holder: str
-    expires_at_monotonic_ns: int
+_Result = TypeVar("_Result")
 
 
 class RecorderControlDispatcher:
@@ -184,7 +186,6 @@ class RecorderControlDispatcher:
         self._lease_duration_override_ns = download_lease_duration_ns
         self._max_leases = max_active_download_leases
         self._operation_timeout_s = float(operation_timeout_s)
-        self._leases: dict[str, _IssuedLease] = {}
         self._lease_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
         self._operation_state = ControlOperationState.IDLE
@@ -208,6 +209,12 @@ class RecorderControlDispatcher:
         except DownloadLeaseError as error:
             raise ControlOperationError(
                 ErrorCode.CLIP_BUSY, "Clip is unavailable for download", retryable=True
+            ) from error
+        except DownloadLeaseCapacityReached as error:
+            raise ControlOperationError(
+                ErrorCode.CONFLICT,
+                "Download lease limit reached",
+                retryable=True,
             ) from error
         except CatalogConflictError as error:
             raise ControlOperationError(
@@ -237,7 +244,7 @@ class RecorderControlDispatcher:
             return await self._snapshot(self._health_provider)
         if command is ControlCommand.GET_CONFIG:
             _exact_arguments(arguments, set())
-            config = await asyncio.to_thread(self._config_provider)
+            config = await _run_blocking(self._config_provider)
             return cast(dict[str, object], _public_value(config_to_mapping(config)))
         if command is ControlCommand.UPDATE_CONFIG:
             return await self._update_config(arguments)
@@ -245,8 +252,12 @@ class RecorderControlDispatcher:
             return await self._list_clips(arguments)
         if command is ControlCommand.GET_CLIP:
             _exact_arguments(arguments, {"clip_id"})
-            clip = await asyncio.to_thread(self._catalog.get_clip, _clip_id(arguments))
-            return _clip_payload(clip)
+            clip = await _run_blocking(self._catalog.get_clip, _clip_id(arguments))
+            return _clip_payload(
+                clip,
+                monotonic_now_ns=_now(self._monotonic_ns),
+                boot_id=self._boot_id,
+            )
         if command is ControlCommand.ACQUIRE_DOWNLOAD:
             await self._begin_mutation()
             try:
@@ -279,7 +290,7 @@ class RecorderControlDispatcher:
         raise ControlOperationError(ErrorCode.INVALID_REQUEST, "Invalid recorder command")
 
     async def _snapshot(self, provider: SnapshotProvider) -> dict[str, object]:
-        snapshot = await asyncio.to_thread(provider)
+        snapshot = await _run_blocking(provider)
         raw = snapshot if isinstance(snapshot, Mapping) else snapshot.as_dict()
         public = _public_mapping(raw)
         async with self._state_lock:
@@ -291,12 +302,12 @@ class RecorderControlDispatcher:
             raise _invalid("Configuration update cannot be empty")
         await self._begin_mutation()
         try:
-            current = await asyncio.to_thread(self._config_provider)
+            current = await _run_blocking(self._config_provider)
             current_mapping = config_to_mapping(current)
             candidate_mapping = _merge_closed(current_mapping, arguments, path="configuration")
             candidate = config_from_mapping(candidate_mapping)
             try:
-                await asyncio.to_thread(self._config_writer, candidate)
+                await _run_blocking(self._config_writer, candidate)
             except ConfigError as error:
                 raise ControlOperationError(
                     ErrorCode.STORAGE_FAULT,
@@ -314,15 +325,19 @@ class RecorderControlDispatcher:
         protected_value = arguments.get("protected", "all")
         if protected_value not in {"all", "true", "false"}:
             raise _invalid("protected must be all, true, or false")
-        rows = await asyncio.to_thread(self._catalog.list_clips, limit=MAX_QUERY_ROWS)
+        rows = await _run_blocking(self._catalog.list_clips, limit=MAX_QUERY_ROWS)
         finalized = [clip for clip in rows if clip.lifecycle is ClipLifecycle.FINALIZED]
         if protected_value != "all":
             required = protected_value == "true"
             finalized = [clip for clip in finalized if clip.protected is required]
         finalized.sort(key=lambda clip: (clip.retention_order, str(clip.clip_id)), reverse=True)
         selected = finalized[offset : offset + limit]
+        now_ns = _now(self._monotonic_ns)
         return {
-            "clips": [_clip_payload(clip) for clip in selected],
+            "clips": [
+                _clip_payload(clip, monotonic_now_ns=now_ns, boot_id=self._boot_id)
+                for clip in selected
+            ],
             "limit": limit,
             "offset": offset,
             "total": len(finalized),
@@ -340,37 +355,29 @@ class RecorderControlDispatcher:
         now_ns = _now(self._monotonic_ns)
 
         async with self._lease_lock:
-            self._expire_local_leases(now_ns)
-            if len(self._leases) >= self._max_leases:
-                raise ControlOperationError(
-                    ErrorCode.CONFLICT, "Download lease limit reached", retryable=True
-                )
-            clip = await asyncio.to_thread(self._catalog.get_clip, clip_id)
-            relative_path = _approved_member_path(clip, member)
-            config = await asyncio.to_thread(self._config_provider)
-            approved_path = _absolute_managed_path(config, relative_path)
+            config = await _run_blocking(self._config_provider)
             lease_duration_ns = self._lease_duration_override_ns
             if lease_duration_ns is None:
                 lease_duration_ns = config.storage.download_lease_timeout_s * 1_000_000_000
             lease_id = uuid4().hex
             catalog_holder = f"control-{lease_id}"
-            lease = await asyncio.to_thread(
+            lease = await _run_blocking(
                 self._catalog.acquire_download_lease,
                 clip_id,
                 holder=catalog_holder,
                 monotonic_now_ns=now_ns,
                 duration_ns=lease_duration_ns,
                 boot_id=self._boot_id,
+                max_active_leases=self._max_leases,
             )
-            self._leases[lease_id] = _IssuedLease(
-                clip_id=clip_id,
-                catalog_holder=catalog_holder,
-                expires_at_monotonic_ns=lease.expires_at_monotonic_ns,
-            )
+            # The lease transaction linearizes before this path read. Every
+            # pair-path mutation now refuses or defers while the lease is live.
+            clip = await _run_blocking(self._catalog.get_clip, clip_id)
+            _approved_member_path(clip, member)
         return {
             "clip_id": str(clip_id),
             "lease_id": lease_id,
-            "approved_path": approved_path,
+            "member": member,
             "expires_at_monotonic_ns": lease.expires_at_monotonic_ns,
         }
 
@@ -382,21 +389,31 @@ class RecorderControlDispatcher:
             raise _invalid("lease_id must be a bounded safe identifier")
         now_ns = _now(self._monotonic_ns)
         async with self._lease_lock:
-            self._expire_local_leases(now_ns)
-            issued = self._leases.get(lease_id)
-            if issued is None:
-                return {"clip_id": str(clip_id), "released": False}
-            if issued.clip_id != clip_id:
-                raise ControlOperationError(
-                    ErrorCode.CONFLICT, "Download lease does not belong to clip"
-                )
-            await asyncio.to_thread(
+            released = await _run_blocking(
                 self._catalog.release_download_lease,
                 clip_id,
-                holder=issued.catalog_holder,
+                holder=f"control-{lease_id}",
+                monotonic_now_ns=now_ns,
             )
-            del self._leases[lease_id]
-        return {"clip_id": str(clip_id), "released": True}
+            clip = await _run_blocking(self._catalog.get_clip, clip_id)
+            directory = PurePosixPath(clip.video_path).parent.as_posix()
+            intent_id: UUID | None = None
+            if clip.protected and directory == "clips":
+                intent_id = await _run_blocking(
+                    self._catalog.prepare_protect,
+                    clip_id,
+                    reason=clip.protection_reason or "released download protection",
+                    monotonic_now_ns=now_ns,
+                )
+            elif not clip.protected and directory == "protected":
+                intent_id = await _run_blocking(
+                    self._catalog.prepare_unprotect,
+                    clip_id,
+                    monotonic_now_ns=now_ns,
+                )
+            if intent_id is not None:
+                await self._execute_intent(intent_id)
+        return {"clip_id": str(clip_id), "released": released}
 
     async def _mutate(
         self, command: ControlCommand, arguments: Mapping[str, JsonValue]
@@ -409,7 +426,7 @@ class RecorderControlDispatcher:
                 if arguments["source"] != EventSource.WEB.value:
                     raise _invalid("event source must be web")
                 event_id = _canonical_uuid(arguments, "event_id")
-                config = await asyncio.to_thread(self._config_provider)
+                config = await _run_blocking(self._config_provider)
                 event = await self._event_executor(
                     EventSource.WEB,
                     now_ns,
@@ -423,20 +440,20 @@ class RecorderControlDispatcher:
             clip_id = _clip_id(arguments)
             intent_id: UUID | None
             if command is ControlCommand.PROTECT_CLIP:
-                intent_id = await asyncio.to_thread(
+                intent_id = await _run_blocking(
                     self._catalog.prepare_protect,
                     clip_id,
                     reason="manual:web",
                     monotonic_now_ns=now_ns,
                 )
             elif command is ControlCommand.UNPROTECT_CLIP:
-                intent_id = await asyncio.to_thread(
+                intent_id = await _run_blocking(
                     self._catalog.prepare_unprotect,
                     clip_id,
                     monotonic_now_ns=now_ns,
                 )
             else:
-                intent_id = await asyncio.to_thread(
+                intent_id = await _run_blocking(
                     self._catalog.prepare_delete,
                     clip_id,
                     monotonic_now_ns=now_ns,
@@ -450,8 +467,12 @@ class RecorderControlDispatcher:
                     "intent_id": str(intent_id),
                     "accepted": True,
                 }
-            clip = await asyncio.to_thread(self._catalog.get_clip, clip_id)
-            payload = _clip_payload(clip)
+            clip = await _run_blocking(self._catalog.get_clip, clip_id)
+            payload = _clip_payload(
+                clip,
+                monotonic_now_ns=_now(self._monotonic_ns),
+                boot_id=self._boot_id,
+            )
             payload["intent_id"] = None if intent_id is None else str(intent_id)
             return payload
         finally:
@@ -535,14 +556,22 @@ class RecorderControlDispatcher:
         async with self._state_lock:
             self._active_mutations -= 1
 
-    def _expire_local_leases(self, monotonic_now_ns: int) -> None:
-        expired = [
-            lease_id
-            for lease_id, lease in self._leases.items()
-            if lease.expires_at_monotonic_ns <= monotonic_now_ns
-        ]
-        for lease_id in expired:
-            del self._leases[lease_id]
+
+async def _run_blocking(
+    operation: Callable[..., _Result],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> _Result:
+    """Join native work after cancellation so catalog lifetime cannot overlap it."""
+
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with suppress(BaseException):
+            await worker
+        raise
 
 
 def _invalid(message: str) -> ControlOperationError:
@@ -678,7 +707,12 @@ def _public_value(value: object, *, key: str | None = None, depth: int = 0) -> o
     raise TypeError("public value is not JSON-compatible")
 
 
-def _clip_payload(clip: CatalogClip) -> dict[str, object]:
+def _clip_payload(
+    clip: CatalogClip,
+    *,
+    monotonic_now_ns: int,
+    boot_id: str,
+) -> dict[str, object]:
     duration_ns = (
         None if clip.end_monotonic_ns is None else clip.end_monotonic_ns - clip.start_monotonic_ns
     )
@@ -694,7 +728,11 @@ def _clip_payload(clip: CatalogClip) -> dict[str, object]:
         "protection_reason": clip.protection_reason,
         "pair_reconciled": clip.pair_reconciled,
         "managed": clip.managed,
-        "download_active": clip.download_lease is not None,
+        "download_active": (
+            clip.download_lease is not None
+            and clip.lease_boot_id == boot_id
+            and monotonic_now_ns < clip.download_lease.expires_at_monotonic_ns
+        ),
     }
 
 
@@ -718,14 +756,6 @@ def _approved_member_path(clip: CatalogClip, member: str) -> str:
     ):
         raise DownloadLeaseError("catalog path is outside the managed namespace")
     return path.as_posix()
-
-
-def _absolute_managed_path(config: DashcamConfig, relative_path: str) -> str:
-    root = PurePosixPath(config.storage.recording_root)
-    if not root.is_absolute() or ".." in root.parts:
-        raise ConfigError("recording root is invalid")
-    result = root.joinpath(*PurePosixPath(relative_path).parts)
-    return result.as_posix()
 
 
 def _event_payload(event: EventProtectionResult) -> dict[str, object]:

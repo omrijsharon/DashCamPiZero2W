@@ -8,7 +8,7 @@ import re
 import stat
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -33,6 +33,7 @@ from dashcam.config import (
     StorageConfig,
     VideoConfig,
 )
+from dashcam.control.dispatcher import CatalogBackend
 from dashcam.gps.anchors import NmeaAnchorTracker
 from dashcam.gps.clock import AnchorPolicy, MonotonicUtcClock, to_local_time
 from dashcam.gps.service import GpsCounters, GpsService, GpsServiceLimits, GpsSnapshot
@@ -227,6 +228,8 @@ class RuntimeFinalizer(Protocol):
 
     def reclaim_storage_once(self, *, boot_id: str, allow_new: bool) -> ReclamationStep: ...
 
+    def expire_download_leases(self, boot_id: str) -> bool: ...
+
     def finalize(
         self,
         *,
@@ -248,9 +251,12 @@ class RuntimeFinalizer(Protocol):
 
     def execute_intent(self, intent_id: UUID) -> object: ...
 
+    @property
+    def control_catalog(self) -> CatalogBackend: ...
+
     def trigger_event(
         self,
-        current_clip_id: UUID,
+        current_clip_id: UUID | None,
         *,
         source: EventSource,
         monotonic_now_ns: int,
@@ -287,6 +293,27 @@ class FinalizerFactory(Protocol):
         recording_root: Path,
         expected_device_id: str,
     ) -> RuntimeFinalizer: ...
+
+
+class RuntimeControlEndpoint(Protocol):
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    def snapshot(self) -> dict[str, object]: ...
+
+
+class RuntimeControlEndpointFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        runtime: GStreamerRecorderRuntime,
+        catalog: CatalogBackend,
+        config_path: Path,
+        boot_id: str,
+        status_provider: Callable[[], Mapping[str, object]],
+        fault_callback: Callable[[str], None],
+    ) -> RuntimeControlEndpoint: ...
 
 
 class BackendFactory(Protocol):
@@ -637,6 +664,7 @@ class GStreamerRecorderRuntime:
         backoff_waiter: RuntimeBackoffWaiter = _wait_for_backoff,
         gps_service_factory: GpsServiceFactory | None = None,
         storage_space_monitor_factory: StorageSpaceMonitorFactory | None = None,
+        control_endpoint_factory: RuntimeControlEndpointFactory | None = None,
     ) -> None:
         self._config_path = _absolute_posix(config_path, "config_path")
         self._identity_path = _absolute_posix(identity_path, "identity_path")
@@ -655,6 +683,8 @@ class GStreamerRecorderRuntime:
         self._backoff_waiter = backoff_waiter
         self._gps_service_factory = gps_service_factory
         self._storage_space_monitor_factory = storage_space_monitor_factory
+        self._control_endpoint_factory = control_endpoint_factory
+        self._control_endpoint: RuntimeControlEndpoint | None = None
         self._storage_space_monitor: StorageSpaceMonitor | None = None
         self._storage_space_task: asyncio.Task[None] | None = None
         self._storage_space_stop = asyncio.Event()
@@ -766,6 +796,46 @@ class GStreamerRecorderRuntime:
             intent_id,
             deadline_detail="control pair mutation exceeded its deadline",
         )
+
+    async def start_control_endpoint(
+        self,
+        status_provider: Callable[[], Mapping[str, object]],
+        fault_callback: Callable[[str], None],
+    ) -> None:
+        """Start control only after startup reconciliation created the owned catalog."""
+
+        if self._control_endpoint is not None:
+            raise PipelineFault("control endpoint is already constructed")
+        factory = self._control_endpoint_factory
+        if factory is None:
+            return
+        finalizer = self._finalizer
+        boot_uuid = self._boot_uuid
+        if finalizer is None or boot_uuid is None:
+            raise PipelineFault("control endpoint lacks reconciled runtime ownership")
+        endpoint = factory(
+            runtime=self,
+            catalog=finalizer.control_catalog,
+            config_path=Path(self._config_path),
+            boot_id=str(boot_uuid),
+            status_provider=status_provider,
+            fault_callback=fault_callback,
+        )
+        self._control_endpoint = endpoint
+        await endpoint.start()
+
+    async def stop_control_endpoint(self) -> None:
+        """Stop accepting and drain clients before runtime catalog shutdown."""
+
+        endpoint = self._control_endpoint
+        if endpoint is None:
+            return
+        self._control_endpoint = None
+        await endpoint.stop()
+
+    def control_endpoint_snapshot(self) -> dict[str, object] | None:
+        endpoint = self._control_endpoint
+        return None if endpoint is None else endpoint.snapshot()
 
     async def trigger_control_event(
         self,
@@ -985,6 +1055,7 @@ class GStreamerRecorderRuntime:
                 if self._storage_space_monitor is None
                 else self._storage_space_monitor.snapshot.as_dict()
             ),
+            "control_endpoint": self.control_endpoint_snapshot(),
             "storage_preflight": None
             if preflight is None
             else {
@@ -2591,6 +2662,22 @@ class GStreamerRecorderRuntime:
             self._finalizer_device_id = device_id
             self._finalizer = self._finalizer_factory(recording_root, device_id)
             for _ in range(self._limits.max_startup_reconciliation_passes):
+                leases_more = await self._durable_worker(
+                    self._finalizer.expire_download_leases,
+                    str(self._boot_uuid),
+                    deadline_detail="download lease recovery exceeded its deadline",
+                )
+                if not isinstance(leases_more, bool):
+                    raise RecorderFinalizationFault(
+                        "download lease recovery returned invalid evidence"
+                    )
+                if not leases_more:
+                    break
+            else:
+                raise RecorderFinalizationFault(
+                    "download lease recovery exceeded its bounded convergence passes"
+                )
+            for _ in range(self._limits.max_startup_reconciliation_passes):
                 orphan_value = await self._durable_worker(
                     self._finalizer.reconcile_orphaned_writing,
                     limit=self._limits.max_startup_reclamation_steps,
@@ -3027,6 +3114,12 @@ def build_production_runtime(
     if enable_audio_restoration and not enable_unvalidated_audio_loss_isolation:
         raise ValueError("audio restoration requires audio-loss isolation")
 
+    from dashcam.control.runtime_server import (
+        CONTROL_CATALOG_BUSY_TIMEOUT_MS,
+        CONTROL_DURABLE_WORKER_TIMEOUT_S,
+        build_runtime_control_endpoint,
+    )
+
     def build_finalizer(
         recording_root: Path,
         expected_device_id: str,
@@ -3035,7 +3128,10 @@ def build_production_runtime(
             recording_root,
             expected_device_id=expected_device_id,
         )
-        catalog = ClipCatalog(Path("/var/lib/dashcam/catalog.sqlite3"))
+        catalog = ClipCatalog(
+            Path("/var/lib/dashcam/catalog.sqlite3"),
+            busy_timeout_ms=CONTROL_CATALOG_BUSY_TIMEOUT_MS,
+        )
         return RecorderClipFinalizer(
             catalog=catalog,
             filesystem=filesystem,
@@ -3077,6 +3173,8 @@ def build_production_runtime(
         finalizer_factory=build_finalizer,
         gps_service_factory=build_gps_service,
         storage_space_monitor_factory=build_storage_space_monitor,
+        control_endpoint_factory=build_runtime_control_endpoint,
+        limits=RuntimeLimits(finalizer_timeout_s=CONTROL_DURABLE_WORKER_TIMEOUT_S),
     )
 
 

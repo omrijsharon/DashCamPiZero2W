@@ -545,6 +545,62 @@ def test_download_lease_is_bounded_expires_and_has_a_boot_epoch(tmp_path: Path) 
             )
 
 
+def test_download_lease_global_cap_is_transactional_and_restart_durable(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    with ClipCatalog(database) as catalog:
+        catalog.register_clip(_clip(1))
+        catalog.register_clip(_clip(2))
+        catalog.acquire_download_lease(
+            UUID(int=1),
+            holder="control-opaque-one",
+            monotonic_now_ns=100,
+            duration_ns=1_000,
+            boot_id="boot-a",
+            max_active_leases=1,
+        )
+
+    with ClipCatalog(database) as restarted:
+        with pytest.raises(CatalogConflictError, match="global download lease limit"):
+            restarted.acquire_download_lease(
+                UUID(int=2),
+                holder="control-opaque-two",
+                monotonic_now_ns=101,
+                duration_ns=1_000,
+                boot_id="boot-a",
+                max_active_leases=1,
+            )
+        assert restarted.release_download_lease(
+            UUID(int=1),
+            holder="control-opaque-one",
+            monotonic_now_ns=102,
+        )
+        assert not restarted.release_download_lease(
+            UUID(int=1),
+            holder="control-opaque-one",
+            monotonic_now_ns=102,
+        )
+        restarted.acquire_download_lease(
+            UUID(int=2),
+            holder="control-opaque-two",
+            monotonic_now_ns=102,
+            duration_ns=1_000,
+            boot_id="boot-a",
+            max_active_leases=1,
+        )
+        # A previous-boot row is stale immediately and cannot consume this
+        # boot's global lease capacity.
+        restarted.acquire_download_lease(
+            UUID(int=1),
+            holder="control-opaque-three",
+            monotonic_now_ns=1,
+            duration_ns=1_000,
+            boot_id="boot-b",
+            max_active_leases=1,
+        )
+
+
 def test_delete_and_download_acquisition_cannot_race_through_catalog_state(
     tmp_path: Path,
 ) -> None:
@@ -562,6 +618,70 @@ def test_delete_and_download_acquisition_cannot_race_through_catalog_state(
         intent_id = catalog.prepare_delete(UUID(int=1), monotonic_now_ns=200, boot_id="boot-a")
         assert catalog.get_clip(UUID(int=1)).lifecycle is ClipLifecycle.DELETING
         assert catalog.list_pending_intents(limit=1)[0].intent_id == intent_id
+
+
+def test_active_lease_freezes_manual_and_event_pair_moves_until_release_or_expiry(
+    tmp_path: Path,
+) -> None:
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(_clip(1), catalog_now_ns=1)
+        catalog.acquire_download_lease(
+            UUID(int=1),
+            holder="control-event",
+            monotonic_now_ns=100,
+            duration_ns=1_000,
+            boot_id="boot-a",
+        )
+        with pytest.raises(DownloadLeaseError, match="freezes"):
+            catalog.prepare_protect(UUID(int=1), reason="manual", monotonic_now_ns=200)
+
+        event = catalog.trigger_event(
+            UUID(int=1),
+            source=EventSource.WEB,
+            monotonic_now_ns=201,
+            previous_count=0,
+            next_count=0,
+        )
+        leased = catalog.get_clip(UUID(int=1))
+        assert leased.protected
+        assert leased.video_path.startswith("clips/")
+        assert leased.pair_reconciled
+        assert event.queued_intent_ids == ()
+
+        assert catalog.release_download_lease(
+            UUID(int=1),
+            holder="control-event",
+            monotonic_now_ns=300,
+        )
+        pending = catalog.list_pending_intents_by_kind(
+            kinds=(IntentKind.PROTECT,),
+            limit=1,
+        )
+        assert len(pending) == 1 and pending[0].clip_id == UUID(int=1)
+        assert not catalog.get_clip(UUID(int=1)).pair_reconciled
+
+        catalog.register_clip(
+            _clip(2, protected=True, directory="protected"),
+            catalog_now_ns=2,
+        )
+        catalog.acquire_download_lease(
+            UUID(int=2),
+            holder="control-unprotect",
+            monotonic_now_ns=400,
+            duration_ns=100,
+            boot_id="boot-a",
+        )
+        with pytest.raises(DownloadLeaseError, match="freezes"):
+            catalog.prepare_unprotect(UUID(int=2), monotonic_now_ns=450)
+        assert catalog.get_clip(UUID(int=2)).video_path.startswith("protected/")
+
+        expired, more = catalog.clear_expired_download_leases(
+            monotonic_now_ns=500,
+            boot_id="boot-a",
+            limit=1,
+        )
+        assert (expired, more) == (1, False)
+        assert catalog.get_clip(UUID(int=2)).download_lease is None
 
 
 def test_event_window_protects_previous_two_current_and_next_one_durably(

@@ -46,7 +46,7 @@ class BackendTransport:
                 result = {
                     "clip_id": decoded["arguments"]["clip_id"],
                     "lease_id": "bounded_lease_identifier",
-                    "approved_path": f"/srv/dashcam/clips/{CLIP_ID}.mp4",
+                    "member": decoded["arguments"]["member"],
                     "expires_at_monotonic_ns": 100,
                 }
             response = {
@@ -184,23 +184,58 @@ def test_mutation_requires_csrf_and_prepare_removal_requires_reauth_and_phrase(
     assert transport.requests[-1]["command"] == RecorderCommand.PREPARE_REMOVAL.value
 
 
-def test_clip_path_is_never_forwarded_and_download_path_is_not_json(
+def test_download_route_is_stably_unavailable_without_lease_or_filesystem_access(
     web: tuple[WebApplication, BackendTransport, list[float]],
 ) -> None:
     application, transport, _ = web
     token, _ = _login(application)
     bad = application.handle(_request("GET", "/api/v1/clips/../../etc/passwd", token=token))
     assert bad.status == 404
+    requests_before = len(transport.requests)
     response = application.handle(_request("GET", f"/api/v1/clips/{CLIP_ID}/video", token=token))
-    assert response.status == 200
-    assert response.body is None
-    assert response.download is not None
-    assert "approved_path" not in json.dumps(response.body)
-    assert transport.requests[-1]["arguments"] == {
-        "clip_id": CLIP_ID,
-        "member": "video",
-        "holder": f"web-{token[:16]}",
+    assert response.status == 501
+    assert response.download is None
+    assert response.body == {
+        "error": {
+            "code": "UNSUPPORTED_CONFIGURATION",
+            "message": "Download delivery is not available in this release",
+            "retryable": False,
+        }
     }
+    assert len(transport.requests) == requests_before
+
+
+def test_event_passes_one_canonical_id_and_preserves_caller_retry_identity(
+    web: tuple[WebApplication, BackendTransport, list[float]],
+) -> None:
+    application, transport, _ = web
+    token, csrf = _login(application)
+    event_id = "00000000-0000-0000-0000-000000000777"
+
+    first = application.handle(
+        _request(
+            "POST",
+            "/api/v1/event",
+            token=token,
+            csrf=csrf,
+            body={"source": "web", "event_id": event_id},
+        )
+    )
+    second = application.handle(
+        _request(
+            "POST",
+            "/api/v1/event",
+            token=token,
+            csrf=csrf,
+            body={"source": "web", "event_id": event_id},
+        )
+    )
+
+    assert first.status == second.status == 200
+    assert [request["arguments"] for request in transport.requests[-2:]] == [
+        {"source": "web", "event_id": event_id},
+        {"source": "web", "event_id": event_id},
+    ]
 
 
 def test_clip_list_query_is_strict_and_bounded(

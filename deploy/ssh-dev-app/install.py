@@ -40,10 +40,12 @@ NETWORK_FALLBACK_UNIT_NAME: Final = "dashcam-network-fallback.service"
 RECORDER_UNIT_NAME: Final = "dashcamd.service"
 SERVICE_USER: Final = "dashcam"
 VIDEO_GROUP: Final = "video"
+API_GROUP: Final = "dashcam-api"
 SERVICE_HOME: Final = "/var/lib/dashcam"
 SERVICE_SHELL: Final = "/usr/sbin/nologin"
 MANAGED_UNITS: Final = (UNIT_NAME, NETWORK_FALLBACK_UNIT_NAME, RECORDER_UNIT_NAME)
 DORMANT_UNITS: Final = (
+    "dashcamd.socket",
     "dashcam-web.service",
     "dashcam-prepare-removal.service",
 )
@@ -604,7 +606,7 @@ def _manifest(bundle: Path) -> dict[str, object]:
         "NotifyAccess=main",
         "User=dashcam",
         "Group=dashcam",
-        "SupplementaryGroups=audio video render dialout dashcam-storage",
+        "SupplementaryGroups=audio video render dialout dashcam-storage dashcam-api",
         "WorkingDirectory=/var/lib/dashcam",
         recorder_exec,
         "Restart=on-failure",
@@ -1652,6 +1654,27 @@ def _ensure_dashcam_video_membership(runner: Runner) -> None:
         raise Refusal("service account remains absent from the video group")
 
 
+def _api_group_present(runner: Runner) -> bool:
+    result = runner.run(
+        ["/usr/bin/getent", "group", API_GROUP],
+        accepted=frozenset({0, 2}),
+    )
+    if result.returncode == 2:
+        if result.stdout or result.stderr:
+            raise Refusal("missing dashcam-api group lookup returned output")
+        return False
+    _group_gid(result.stdout, API_GROUP)
+    return True
+
+
+def _ensure_api_group(runner: Runner) -> None:
+    if _api_group_present(runner):
+        return
+    runner.run(["/usr/sbin/groupadd", "--system", API_GROUP])
+    if not _api_group_present(runner):
+        raise Refusal("dashcam-api group was not created")
+
+
 def install(
     bundle: Path,
     *,
@@ -1672,6 +1695,7 @@ def install(
     if architecture != "armhf":
         raise Refusal("target architecture is not armhf")
     dashcam_video_member = _dashcam_video_membership(command_runner)
+    api_group_present = _api_group_present(command_runner)
     storage_group = command_runner.run(["/usr/bin/getent", "group", "dashcam-storage"])
     storage_gid = _group_gid(storage_group.stdout, "dashcam-storage")
     storage = _verify_storage(root, command_runner, storage_gid)
@@ -1716,6 +1740,7 @@ def install(
         "services_to_start": [],
         "dormant_services": list(DORMANT_UNITS),
         "dashcam_video_group_member_before": dashcam_video_member,
+        "dashcam_api_group_present_before": api_group_present,
     }
     if not apply:
         if approved_plan is not None:
@@ -1755,6 +1780,7 @@ def install(
                 output_limit=MAX_APT_COMMAND_BYTES,
             )
     _ensure_dashcam_video_membership(command_runner)
+    _ensure_api_group(command_runner)
     release = _install_release(bundle, root, manifest, command_runner)
     for managed in _managed_files(bundle, root):
         _install_managed_file(

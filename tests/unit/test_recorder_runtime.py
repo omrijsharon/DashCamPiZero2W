@@ -384,10 +384,17 @@ class FakeFinalizer:
     reconciliation_reports: list[FinalizationRecoveryReport] = field(default_factory=list)
     active_registrations: list[tuple[str, UUID, int, int]] = field(default_factory=list)
     orphan_reports: list[tuple[int, bool]] = field(default_factory=list)
+    lease_expiry_reports: list[bool] = field(default_factory=list)
+    lease_expiry_calls: list[str] = field(default_factory=list)
     executed_intents: list[UUID] = field(default_factory=list)
     triggered_events: list[tuple[UUID, UUID]] = field(default_factory=list)
     triggered_event_targets: dict[UUID, UUID] = field(default_factory=dict)
     next_order: int = 7
+    catalog: object = field(default_factory=object)
+
+    @property
+    def control_catalog(self) -> object:
+        return self.catalog
 
     def register_active_clip(
         self,
@@ -463,6 +470,10 @@ class FakeFinalizer:
         if self.reclamation_steps:
             return self.reclamation_steps.pop(0)
         return ReclamationStep(None, None, False, False, False, 0)
+
+    def expire_download_leases(self, boot_id: str) -> bool:
+        self.lease_expiry_calls.append(boot_id)
+        return self.lease_expiry_reports.pop(0) if self.lease_expiry_reports else False
 
     def metadata_reconciliation_candidates(
         self,
@@ -1393,6 +1404,68 @@ def test_current_clip_is_durable_before_exposure_and_uuid_survives_rollover() ->
     run_async(scenario)
 
 
+def test_control_endpoint_binds_only_after_reconciled_runtime_and_stops_idempotently() -> None:
+    @dataclass
+    class Endpoint:
+        started: bool = False
+        stopped: int = 0
+
+        async def start(self) -> None:
+            self.started = True
+
+        async def stop(self) -> None:
+            self.stopped += 1
+
+        def snapshot(self) -> dict[str, object]:
+            return {"started": self.started, "stopped": self.stopped}
+
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer()
+        endpoint = Endpoint()
+        factory_calls: list[dict[str, object]] = []
+
+        def endpoint_factory(**keywords: object) -> Endpoint:
+            factory_calls.append(keywords)
+            return endpoint
+
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            control_endpoint_factory=endpoint_factory,  # type: ignore[arg-type]
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        with pytest.raises(PipelineFault, match="lacks reconciled"):
+            await runtime.start_control_endpoint(
+                lambda: {"state": "STARTING"},
+                lambda _detail: None,
+            )
+        await runtime.start(config)
+        await runtime.start_control_endpoint(
+            lambda: {"state": "RECORDING"},
+            lambda _detail: None,
+        )
+
+        assert endpoint.started
+        assert factory_calls[0]["catalog"] is finalizer.catalog
+        assert factory_calls[0]["boot_id"] == "12345678-1234-5678-9234-567812345678"
+        assert runtime.control_endpoint_snapshot() == {"started": True, "stopped": 0}
+        await runtime.stop_control_endpoint()
+        await runtime.stop_control_endpoint()
+        assert endpoint.stopped == 1
+        await runtime.stop()
+
+    run_async(scenario)
+
+
 def test_event_mutation_waits_for_inflight_fragment_finalization() -> None:
     @dataclass
     class BlockingFinalizer(FakeFinalizer):
@@ -1574,6 +1647,60 @@ def test_startup_orphan_recovery_is_bounded_and_precedes_camera() -> None:
         assert backend.started_with == [VideoProfile()]
         assert finalizer.orphan_reports == []
         await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_startup_expired_lease_recovery_converges_before_camera() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(lease_expiry_reports=[True, False])
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+
+        assert finalizer.lease_expiry_calls == [
+            "12345678-1234-5678-9234-567812345678",
+            "12345678-1234-5678-9234-567812345678",
+        ]
+        assert backend.started_with == [VideoProfile()]
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_startup_expired_lease_backlog_refuses_before_camera() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(lease_expiry_reports=[True, True])
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            limits=RuntimeLimits(max_startup_reconciliation_passes=2),
+        )
+        config = default_config()
+        await runtime.check(config)
+        with pytest.raises(RecorderFinalizationFault, match="lease recovery exceeded"):
+            await runtime.start(config)
+        assert backend.started_with == []
 
     run_async(scenario)
 

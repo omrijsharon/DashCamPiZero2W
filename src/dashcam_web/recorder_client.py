@@ -8,18 +8,18 @@ import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Final, Protocol, TypeAlias, cast
 from uuid import UUID, uuid4
 
 from dashcam.control.api import ErrorCode, parse_clip_id
 
 PROTOCOL_VERSION: Final = 1
-DEFAULT_SOCKET_PATH: Final = Path("/run/dashcam/dashcamd.sock")
+DEFAULT_SOCKET_PATH: Final = Path("/run/dashcam/control.sock")
 MAX_REQUEST_BYTES: Final = 64 * 1024
 MAX_RESPONSE_BYTES: Final = 1024 * 1024
 MAX_PROTOCOL_DEPTH: Final = 12
-DEFAULT_TIMEOUT_S: Final = 5.0
+DEFAULT_TIMEOUT_S: Final = 12.0
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -139,11 +139,11 @@ class UnixSocketTransport:
 
 @dataclass(frozen=True, slots=True)
 class ApprovedDownload:
-    """Recorder-approved immutable pair member held by a bounded lease."""
+    """Recorder-issued bounded lease; byte delivery remains an M11 data plane."""
 
     clip_id: UUID
     lease_id: str
-    approved_path: PurePosixPath
+    member: str
     expires_at_monotonic_ns: int
 
     def __post_init__(self) -> None:
@@ -155,8 +155,8 @@ class ApprovedDownload:
             or not self.lease_id.replace("-", "").replace("_", "").isalnum()
         ):
             raise RecorderProtocolError("download lease ID is invalid")
-        if not self.approved_path.is_absolute():
-            raise RecorderProtocolError("approved download path must be absolute")
+        if self.member not in {"video", "metadata"}:
+            raise RecorderProtocolError("download member is invalid")
         if (
             isinstance(self.expires_at_monotonic_ns, bool)
             or not isinstance(self.expires_at_monotonic_ns, int)
@@ -270,14 +270,16 @@ class RecorderClient:
         try:
             returned_clip_id = parse_clip_id(cast(str, result["clip_id"]))
             lease_id = cast(str, result["lease_id"])
-            approved_path = PurePosixPath(cast(str, result["approved_path"]))
+            returned_member = cast(str, result["member"])
             expiry = cast(int, result["expires_at_monotonic_ns"])
         except (KeyError, TypeError, ValueError) as error:
             raise RecorderProtocolError("recorder returned an invalid download approval") from error
         requested_clip_id = parse_clip_id(clip_id)
         if returned_clip_id != requested_clip_id:
             raise RecorderProtocolError("download approval clip ID mismatch")
-        return ApprovedDownload(returned_clip_id, lease_id, approved_path, expiry)
+        if returned_member != member:
+            raise RecorderProtocolError("download approval member mismatch")
+        return ApprovedDownload(returned_clip_id, lease_id, returned_member, expiry)
 
 
 __all__ = [

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from pathlib import PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from dashcam.control.api import ErrorCode
 from dashcam_web.recorder_client import (
+    DEFAULT_SOCKET_PATH,
+    DEFAULT_TIMEOUT_S,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     RecorderClient,
@@ -20,6 +22,10 @@ from dashcam_web.recorder_client import (
 CLIP_ID = "00000000-0000-0000-0000-000000000123"
 
 
+def test_default_recorder_socket_matches_recorder_owned_listener() -> None:
+    assert Path("/run/dashcam/control.sock") == DEFAULT_SOCKET_PATH
+
+
 class FakeTransport:
     def __init__(self, responder: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self.responder = responder
@@ -27,7 +33,7 @@ class FakeTransport:
 
     def exchange(self, request: bytes, *, timeout_s: float, max_response_bytes: int) -> bytes:
         assert len(request) <= MAX_REQUEST_BYTES
-        assert timeout_s == 5
+        assert timeout_s == DEFAULT_TIMEOUT_S
         assert max_response_bytes == MAX_RESPONSE_BYTES
         decoded = json.loads(request)
         self.requests.append(decoded)
@@ -72,7 +78,7 @@ def test_download_approval_is_tied_to_requested_clip() -> None:
             {
                 "clip_id": CLIP_ID,
                 "lease_id": "safe_lease_identifier",
-                "approved_path": "/srv/dashcam/clips/owned.mp4",
+                "member": "video",
                 "expires_at_monotonic_ns": 123,
             },
         )
@@ -83,7 +89,7 @@ def test_download_approval_is_tied_to_requested_clip() -> None:
     )
 
     assert approval.clip_id.hex.endswith("0123")
-    assert approval.approved_path == PurePosixPath("/srv/dashcam/clips/owned.mp4")
+    assert approval.member == "video"
     assert transport.requests[0]["arguments"]["clip_id"] == CLIP_ID
     assert "path" not in transport.requests[0]["arguments"]
 
@@ -95,7 +101,7 @@ def test_download_rejects_member_and_mismatched_identity() -> None:
             {
                 "clip_id": "00000000-0000-0000-0000-000000000124",
                 "lease_id": "safe_lease_identifier",
-                "approved_path": "/srv/dashcam/clips/owned.mp4",
+                "member": "video",
                 "expires_at_monotonic_ns": 123,
             },
         )

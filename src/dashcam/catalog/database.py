@@ -245,6 +245,10 @@ class ActiveClipProtectionChanged(CatalogConflictError):
     """The active clip's protection changed while its sidecar was staged."""
 
 
+class DownloadLeaseCapacityReached(CatalogConflictError):
+    """The durable same-boot global download lease cap is full."""
+
+
 class ClipCatalog:
     """Single-owner catalog API with transactional cross-process coordination."""
 
@@ -811,11 +815,13 @@ class ClipCatalog:
         monotonic_now_ns: int,
         duration_ns: int,
         boot_id: str,
+        max_active_leases: int = 32,
     ) -> DownloadLease:
-        """Atomically acquire or replace an expired/previous-boot lease."""
+        """Atomically enforce the global same-boot cap and acquire one lease."""
 
         _uuid(clip_id, "clip_id")
         _boot_id(boot_id)
+        _row_limit(max_active_leases, "max_active_leases")
         lease = DownloadLease.issue(
             holder=holder,
             monotonic_now_ns=monotonic_now_ns,
@@ -831,6 +837,19 @@ class ClipCatalog:
                 raise DownloadLeaseError("clip mutation is in progress")
             if _row_has_active_lease(row, monotonic_now_ns=monotonic_now_ns, boot_id=boot_id):
                 raise DownloadLeaseError("clip already has an active download lease")
+            active_count = int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM clips
+                    WHERE lease_holder IS NOT NULL
+                      AND lease_boot_id = ?
+                      AND lease_expires_ns > ?
+                    """,
+                    (boot_id, monotonic_now_ns),
+                ).fetchone()[0]
+            )
+            if active_count >= max_active_leases:
+                raise DownloadLeaseCapacityReached("global download lease limit reached")
             self._connection.execute(
                 """
                 UPDATE clips
@@ -849,16 +868,30 @@ class ClipCatalog:
             )
         return lease
 
-    def release_download_lease(self, clip_id: UUID, *, holder: str) -> None:
+    def release_download_lease(
+        self,
+        clip_id: UUID,
+        *,
+        holder: str,
+        monotonic_now_ns: int,
+    ) -> bool:
+        """Idempotently release the exact durable opaque holder."""
+
         _uuid(clip_id, "clip_id")
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
         with self._transaction():
             row = self._required_clip_row(clip_id)
             stored_holder = cast(str | None, row["lease_holder"])
             if stored_holder is None:
-                return
+                return False
             if stored_holder != holder:
                 raise DownloadLeaseError("lease is owned by a different holder")
             self._clear_lease_locked(clip_id)
+            self._queue_directory_invariant_repair_locked(
+                self._required_clip_row(clip_id),
+                monotonic_now_ns=monotonic_now_ns,
+            )
+            return True
 
     def clear_expired_download_leases(
         self,
@@ -885,7 +918,12 @@ class ClipCatalog:
             ).fetchall()
             selected = rows[:limit]
             for row in selected:
-                self._clear_lease_locked(UUID(str(row["clip_id"])))
+                clip_id = UUID(str(row["clip_id"]))
+                self._clear_lease_locked(clip_id)
+                self._queue_directory_invariant_repair_locked(
+                    self._required_clip_row(clip_id),
+                    monotonic_now_ns=monotonic_now_ns,
+                )
         return len(selected), len(rows) > limit
 
     def retention_candidates(
@@ -977,6 +1015,8 @@ class ClipCatalog:
         _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
         with self._transaction():
             row = self._required_clip_row(clip_id)
+            if _row_has_unexpired_lease(row, monotonic_now_ns=monotonic_now_ns):
+                raise DownloadLeaseError("download lease freezes the clip pair path")
             if not bool(row["protected"]):
                 return None
             pending = self._pending_intent_row(clip_id)
@@ -1873,6 +1913,8 @@ class ClipCatalog:
     ) -> UUID | None:
         _uuid(clip_id, "clip_id")
         row = self._required_clip_row(clip_id)
+        if _row_has_unexpired_lease(row, monotonic_now_ns=monotonic_now_ns):
+            raise DownloadLeaseError("download lease freezes the clip pair path")
         lifecycle = ClipLifecycle(str(row["lifecycle"]))
         if lifecycle in {ClipLifecycle.DELETING, ClipLifecycle.DELETED}:
             raise CatalogConflictError("clip no longer exists")
@@ -1964,6 +2006,10 @@ class ClipCatalog:
                 return UUID(str(pending["intent_id"]))
             # UNPROTECT, FINALIZE, and RECONCILE_NAME are allowed to reach their
             # intended pair state. Their completion queues a fresh PROTECT move.
+            return None
+        if _row_has_unexpired_lease(row, monotonic_now_ns=monotonic_now_ns):
+            # The event protection itself is durable, but the approved pair
+            # path remains frozen until release/expiry queues the repair.
             return None
         if lifecycle is not ClipLifecycle.FINALIZED:
             return None
@@ -2175,21 +2221,58 @@ class ClipCatalog:
     def _queue_directory_invariant_repair(self, clip_id: UUID, *, monotonic_now_ns: int) -> bool:
         """Queue a safe move when durable protection and directory disagree."""
 
-        clip = self.get_clip(clip_id)
-        if clip.lifecycle is not ClipLifecycle.FINALIZED:
-            return False
-        directory = PurePosixPath(clip.video_path).parent.as_posix()
-        if clip.protected and directory == "clips":
-            intent_id = self.prepare_protect(
-                clip_id,
-                reason=clip.protection_reason or "recovered protection state",
+        with self._transaction():
+            intent_id = self._queue_directory_invariant_repair_locked(
+                self._required_clip_row(clip_id),
                 monotonic_now_ns=monotonic_now_ns,
             )
-            return intent_id is not None
-        if not clip.protected and directory == "protected":
-            intent_id = self.prepare_unprotect(clip_id, monotonic_now_ns=monotonic_now_ns)
-            return intent_id is not None
-        return False
+        return intent_id is not None
+
+    def _queue_directory_invariant_repair_locked(
+        self,
+        row: sqlite3.Row,
+        *,
+        monotonic_now_ns: int,
+    ) -> UUID | None:
+        """Queue one protection-directory repair inside the caller transaction."""
+
+        clip_id = UUID(str(row["clip_id"]))
+        if (
+            ClipLifecycle(str(row["lifecycle"])) is not ClipLifecycle.FINALIZED
+            or self._pending_intent_row(clip_id) is not None
+            or _row_has_unexpired_lease(row, monotonic_now_ns=monotonic_now_ns)
+        ):
+            return None
+        video_source = str(row["video_path"])
+        sidecar_source = str(row["sidecar_path"])
+        directory = PurePosixPath(video_source).parent.as_posix()
+        if PurePosixPath(sidecar_source).parent.as_posix() != directory:
+            return None
+        if bool(row["protected"]) and directory == "clips":
+            kind = IntentKind.PROTECT
+            target_directory = "protected"
+            expected_revision = None
+        elif not bool(row["protected"]) and directory == "protected":
+            kind = IntentKind.UNPROTECT
+            target_directory = "clips"
+            expected_revision = int(row["protection_revision"])
+        else:
+            return None
+        intent = self._insert_intent_locked(
+            clip_id,
+            kind=kind,
+            paths=_move_paths(video_source, sidecar_source, target_directory),
+            monotonic_now_ns=monotonic_now_ns,
+            expected_protection_revision=expected_revision,
+        )
+        self._connection.execute(
+            """
+            UPDATE clips SET pair_reconciled = 0, updated_catalog_ns = ?
+            WHERE clip_id = ?
+            """,
+            (monotonic_now_ns, str(clip_id)),
+        )
+        return intent.intent_id
 
     def _record_pair_observation(
         self,
@@ -2559,6 +2642,15 @@ def _row_has_active_lease(row: sqlite3.Row, *, monotonic_now_ns: int, boot_id: s
     return (
         row["lease_holder"] is not None
         and str(row["lease_boot_id"]) == boot_id
+        and monotonic_now_ns < int(row["lease_expires_ns"])
+    )
+
+
+def _row_has_unexpired_lease(row: sqlite3.Row, *, monotonic_now_ns: int) -> bool:
+    """Conservatively freeze paths until startup clears a previous-boot lease."""
+
+    return (
+        row["lease_holder"] is not None
         and monotonic_now_ns < int(row["lease_expires_ns"])
     )
 

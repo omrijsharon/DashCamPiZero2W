@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Final, Protocol
+from typing import Final, Protocol, cast
 from uuid import UUID
 
 from dashcam.catalog.database import (
@@ -32,6 +32,7 @@ from dashcam.catalog.models import (
     EventSource,
     IntentReconciliationResult,
 )
+from dashcam.control.dispatcher import CatalogBackend
 from dashcam.metadata.coordinator import (
     ClipMetadataCoordinator,
     MetadataCoordinatorOutcome,
@@ -158,6 +159,14 @@ class PairPromotionCatalog(Protocol):
         kinds: tuple[IntentKind, ...],
         limit: int,
     ) -> tuple[OperationIntent, ...]: ...
+
+    def clear_expired_download_leases(
+        self,
+        *,
+        monotonic_now_ns: int,
+        boot_id: str,
+        limit: int,
+    ) -> tuple[int, bool]: ...
 
     def prepare_oldest_eligible_delete(
         self,
@@ -473,6 +482,12 @@ class RecorderClipFinalizer:
             monotonic_ns=monotonic_ns,
         )
 
+    @property
+    def control_catalog(self) -> CatalogBackend:
+        """Expose the single owned catalog only to recorder control composition."""
+
+        return cast(CatalogBackend, self._catalog)
+
     def register_active_clip(
         self,
         *,
@@ -708,7 +723,20 @@ class RecorderClipFinalizer:
     def reclaim_storage_once(self, *, boot_id: str, allow_new: bool) -> ReclamationStep:
         """Replay or delete one pair; the caller must reobserve before repeating."""
 
+        self.expire_download_leases(boot_id)
         return self._storage_reclaimer.run_one(boot_id=boot_id, allow_new=allow_new)
+
+    def expire_download_leases(self, boot_id: str) -> bool:
+        """Clear one bounded stale-holder page and converge queued pair repairs."""
+
+        expired, more = self._catalog.clear_expired_download_leases(
+            monotonic_now_ns=self._now(),
+            boot_id=boot_id,
+            limit=self._limits.max_pending_intents,
+        )
+        del expired
+        recovery = self.reconcile_pending()
+        return more or recovery.more_work
 
     def metadata_reconciliation_candidates(
         self,
@@ -720,6 +748,7 @@ class RecorderClipFinalizer:
     ) -> tuple[MetadataReconciliationCandidate, ...]:
         """Read one bounded, stable page from the durable catalog."""
 
+        self.expire_download_leases(str(expected_boot_id))
         clips = self._catalog.list_metadata_reconciliation_candidates(
             expected_boot_id,
             limit=limit,

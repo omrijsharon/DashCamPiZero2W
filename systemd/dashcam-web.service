@@ -1,8 +1,7 @@
 [Unit]
 Description=Dashcam local web UI
 Documentation=file:/opt/dashcam/docs/installation.md
-After=network.target dashcamd.socket
-Requires=dashcamd.socket
+After=network.target dashcamd.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

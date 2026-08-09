@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -27,7 +27,7 @@ from dashcam.recorder.runtime import (
 )
 from dashcam.recorder.status import RecorderReason
 from dashcam.state import RecorderState, StorageState
-from dashcam.storage.preflight import PreflightReason, PreflightResult
+from dashcam.storage.preflight import PreflightReason, PreflightResult, RecordingRootFacts
 
 AsyncTest = Callable[[], Coroutine[Any, Any, None]]
 REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -119,6 +119,16 @@ def faulted_storage() -> PreflightResult:
         StorageState.FAULTED,
         (PreflightReason.UNMOUNTED,),
         None,
+        False,
+        False,
+    )
+
+
+def reserve_exhausted_storage() -> PreflightResult:
+    return PreflightResult(
+        StorageState.EMERGENCY,
+        (PreflightReason.RESERVE_EXHAUSTED,),
+        cast(RecordingRootFacts, object()),
         False,
         False,
     )
@@ -481,6 +491,68 @@ def test_storage_fault_is_ready_and_observable_without_opening_camera() -> None:
             "state=FAULTED reason=STORAGE_FAULT "
             "detail=storage state=FAULTED reasons=UNMOUNTED config_schema=1"
         ]
+
+    run_async(scenario)
+
+
+def test_exact_reserve_exhaustion_is_delegated_to_pre_camera_runtime_recovery() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        storage = FakeStorageGate(reserve_exhausted_storage())
+        daemon = RecorderDaemon(
+            config_path=DEFAULT_CONFIG_PATH,
+            runtime=runtime,
+            storage_gate=storage,
+            limits=fast_limits(),
+        )
+        task = asyncio.create_task(daemon.run())
+        await wait_for_daemon_state(daemon, RecorderState.RECORDING)
+
+        assert runtime.started_with == [default_config()]
+        daemon.request_stop()
+        result = await asyncio.wait_for(task, timeout=0.2)
+        assert result.clean
+
+    run_async(scenario)
+
+
+def test_startup_timeout_joins_cancelled_mutation_before_runtime_stop() -> None:
+    class JoiningRuntime(FakeRuntime):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        exited = asyncio.Event()
+
+        async def start(self, config: DashcamConfig) -> None:
+            self.started_with.append(config)
+            self.entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+                self.exited.set()
+                raise
+
+        async def stop(self) -> None:
+            assert self.exited.is_set()
+            await super().stop()
+
+    async def scenario() -> None:
+        runtime = JoiningRuntime()
+        daemon = RecorderDaemon(
+            config_path=DEFAULT_CONFIG_PATH,
+            runtime=runtime,
+            limits=fast_limits(startup_timeout_s=0.01),
+        )
+        task = asyncio.create_task(daemon.run())
+        await asyncio.wait_for(runtime.entered.wait(), timeout=0.1)
+        await asyncio.sleep(0.02)
+
+        assert not task.done()
+        assert runtime.stop_calls == 0
+        runtime.release.set()
+        result = await asyncio.wait_for(task, timeout=0.2)
+        assert result.outcome is DaemonOutcome.STARTUP_TIMEOUT
+        assert runtime.stop_calls == 1
 
     run_async(scenario)
 

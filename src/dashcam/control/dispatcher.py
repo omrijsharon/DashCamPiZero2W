@@ -138,13 +138,13 @@ class RecorderControlDispatcher:
         prepare_removal_callback: OperationCallback,
         monotonic_ns: Callable[[], int],
         boot_id: str,
-        download_lease_duration_ns: int = DEFAULT_DOWNLOAD_LEASE_NS,
+        download_lease_duration_ns: int | None = None,
         max_active_download_leases: int = MAX_ACTIVE_DOWNLOAD_LEASES,
         operation_timeout_s: float = DEFAULT_OPERATION_TIMEOUT_S,
     ) -> None:
         if not isinstance(boot_id, str) or _BOOT_ID_RE.fullmatch(boot_id) is None:
             raise ValueError("boot_id must be a bounded safe identifier")
-        if (
+        if download_lease_duration_ns is not None and (
             isinstance(download_lease_duration_ns, bool)
             or not isinstance(download_lease_duration_ns, int)
             or not 1_000_000_000 <= download_lease_duration_ns <= 15 * 60 * 1_000_000_000
@@ -177,7 +177,7 @@ class RecorderControlDispatcher:
         self._prepare_removal_callback = prepare_removal_callback
         self._monotonic_ns = monotonic_ns
         self._boot_id = boot_id
-        self._lease_duration_ns = download_lease_duration_ns
+        self._lease_duration_override_ns = download_lease_duration_ns
         self._max_leases = max_active_download_leases
         self._operation_timeout_s = float(operation_timeout_s)
         self._leases: dict[str, _IssuedLease] = {}
@@ -345,6 +345,9 @@ class RecorderControlDispatcher:
             relative_path = _approved_member_path(clip, member)
             config = await asyncio.to_thread(self._config_provider)
             approved_path = _absolute_managed_path(config, relative_path)
+            lease_duration_ns = self._lease_duration_override_ns
+            if lease_duration_ns is None:
+                lease_duration_ns = config.storage.download_lease_timeout_s * 1_000_000_000
             lease_id = uuid4().hex
             catalog_holder = f"control-{lease_id}"
             lease = await asyncio.to_thread(
@@ -352,7 +355,7 @@ class RecorderControlDispatcher:
                 clip_id,
                 holder=catalog_holder,
                 monotonic_now_ns=now_ns,
-                duration_ns=self._lease_duration_ns,
+                duration_ns=lease_duration_ns,
                 boot_id=self._boot_id,
             )
             self._leases[lease_id] = _IssuedLease(

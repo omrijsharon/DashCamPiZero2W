@@ -145,6 +145,22 @@ class FakePromotionCatalog:
         )
         return tuple(values[:limit])
 
+    def list_pending_delete_intents(self, *, limit: int) -> tuple[OperationIntent, ...]:
+        return tuple(
+            intent
+            for intent in self.list_pending_intents(limit=limit)
+            if intent.kind is IntentKind.DELETE
+        )
+
+    def prepare_oldest_eligible_delete(
+        self,
+        *,
+        monotonic_now_ns: int,
+        boot_id: str,
+    ) -> UUID | None:
+        del monotonic_now_ns, boot_id
+        return None
+
     def reconcile_intent(
         self,
         intent_id: UUID,

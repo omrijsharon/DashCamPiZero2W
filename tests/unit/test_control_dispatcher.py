@@ -170,10 +170,12 @@ class FakeCatalog:
 class ConfigStore:
     def __init__(self) -> None:
         self.value = default_config()
+        self.reads = 0
         self.writes: list[DashcamConfig] = []
         self.failure: Exception | None = None
 
     def read(self) -> DashcamConfig:
+        self.reads += 1
         return self.value
 
     def write(self, value: DashcamConfig) -> None:
@@ -206,6 +208,7 @@ def _dispatcher(
     prepare_removal: OperationCallback | None = None,
     max_leases: int = 32,
     timeout_s: float = 1,
+    lease_duration_ns: int | None = None,
 ) -> RecorderControlDispatcher:
     selected_catalog = catalog or FakeCatalog((_clip(1),))
     selected_configs = configs or ConfigStore()
@@ -238,6 +241,7 @@ def _dispatcher(
         ),
         monotonic_ns=selected_clock,
         boot_id="boot-test",
+        download_lease_duration_ns=lease_duration_ns,
         max_active_download_leases=max_leases,
         operation_timeout_s=timeout_s,
     )
@@ -306,12 +310,19 @@ def test_get_and_partial_update_config_are_closed_validated_and_atomic() -> None
     updated = _run(
         dispatcher,
         ControlCommand.UPDATE_CONFIG,
-        {"video": {"bitrate_bps": 9_000_000}, "time": {"timezone": "UTC"}},
+        {
+            "video": {"bitrate_bps": 9_000_000},
+            "time": {"timezone": "UTC"},
+            "storage": {"download_lease_timeout_s": 7},
+        },
     )
 
+    assert cast(dict[str, object], before["storage"])["download_lease_timeout_s"] == 300
     assert cast(dict[str, object], updated["video"])["bitrate_bps"] == 9_000_000
+    assert cast(dict[str, object], updated["storage"])["download_lease_timeout_s"] == 7
     assert configs.value.video.bitrate_bps == 9_000_000
     assert configs.value.time.timezone == "UTC"
+    assert configs.value.storage.download_lease_timeout_s == 7
     assert len(configs.writes) == 1
     assert before["schema_version"] == updated["schema_version"] == 1
 
@@ -425,6 +436,7 @@ def test_download_lease_approves_catalog_pair_path_and_uses_opaque_authority() -
     lease_id = cast(str, approval["lease_id"])
     assert len(lease_id) == 32
     assert catalog.acquisitions[0]["holder"] != "web-session"
+    assert catalog.acquisitions[0]["duration_ns"] == 300_000_000_000
     assert "path" not in catalog.acquisitions[0]
 
     released = _run(
@@ -440,6 +452,58 @@ def test_download_lease_approves_catalog_pair_path_and_uses_opaque_authority() -
     assert released["released"] is True
     assert repeated["released"] is False
     assert len(catalog.releases) == 1
+
+
+def test_download_lease_uses_one_current_config_snapshot_per_acquisition() -> None:
+    catalog = FakeCatalog((_clip(1), _clip(2)))
+    configs = ConfigStore()
+    configs.value = replace(
+        configs.value,
+        storage=replace(configs.value.storage, download_lease_timeout_s=1),
+    )
+    dispatcher = _dispatcher(catalog=catalog, configs=configs)
+
+    first = _run(
+        dispatcher,
+        ControlCommand.ACQUIRE_DOWNLOAD,
+        {"clip_id": str(UUID(int=1)), "member": "video", "holder": "first"},
+    )
+    configs.value = replace(
+        configs.value,
+        storage=replace(configs.value.storage, download_lease_timeout_s=900),
+    )
+    second = _run(
+        dispatcher,
+        ControlCommand.ACQUIRE_DOWNLOAD,
+        {"clip_id": str(UUID(int=2)), "member": "video", "holder": "second"},
+    )
+
+    assert configs.reads == 2
+    assert [item["duration_ns"] for item in catalog.acquisitions] == [
+        1_000_000_000,
+        900_000_000_000,
+    ]
+    assert first["expires_at_monotonic_ns"] == 1_000_010_000
+    assert second["expires_at_monotonic_ns"] == 900_000_010_000
+
+
+def test_explicit_download_lease_duration_override_is_preserved() -> None:
+    catalog = FakeCatalog((_clip(1),))
+    configs = ConfigStore()
+    dispatcher = _dispatcher(
+        catalog=catalog,
+        configs=configs,
+        lease_duration_ns=7_000_000_000,
+    )
+
+    _run(
+        dispatcher,
+        ControlCommand.ACQUIRE_DOWNLOAD,
+        {"clip_id": str(UUID(int=1)), "member": "video", "holder": "override"},
+    )
+
+    assert configs.reads == 1
+    assert catalog.acquisitions[0]["duration_ns"] == 7_000_000_000
 
 
 @pytest.mark.parametrize(

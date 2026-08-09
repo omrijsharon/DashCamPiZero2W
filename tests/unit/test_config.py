@@ -44,6 +44,26 @@ def test_checked_in_defaults_are_valid_and_round_trip() -> None:
     assert loaded.time.system_clock_owner == "systemd-timesyncd"
     assert loaded.preview.max_clients == 1
     assert loaded.storage.recording_root == "/srv/dashcam"
+    assert loaded.storage.download_lease_timeout_s == 300
+    storage_mapping = config_to_mapping(loaded)["storage"]
+    assert isinstance(storage_mapping, dict)
+    assert storage_mapping["download_lease_timeout_s"] == 300
+
+
+@pytest.mark.parametrize("timeout_s", [1, 900])
+def test_download_lease_timeout_accepts_exact_boundaries(
+    raw_config: dict[str, object], timeout_s: int
+) -> None:
+    storage = raw_config["storage"]
+    assert isinstance(storage, dict)
+    storage["download_lease_timeout_s"] = timeout_s
+
+    parsed = config_from_mapping(raw_config)
+
+    assert parsed.storage.download_lease_timeout_s == timeout_s
+    round_tripped = config_to_mapping(parsed)["storage"]
+    assert isinstance(round_tripped, dict)
+    assert round_tripped["download_lease_timeout_s"] == timeout_s
 
 
 def test_enabled_audio_requires_stable_selector_and_exact_production_format() -> None:
@@ -84,6 +104,9 @@ def test_enabled_audio_requires_stable_selector_and_exact_production_format() ->
         (("overlay", "coordinate_decimals"), 9),
         (("preview", "max_clients"), 3),
         (("storage", "recording_root"), "/tmp/dashcam"),
+        (("storage", "download_lease_timeout_s"), 0),
+        (("storage", "download_lease_timeout_s"), 901),
+        (("storage", "download_lease_timeout_s"), True),
         (("network", "address"), "8.8.8.8/24"),
         (("service", "watchdog_s"), 0),
     ],

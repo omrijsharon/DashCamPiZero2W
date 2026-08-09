@@ -39,6 +39,7 @@ from dashcam.metadata.schema import ClipSidecar, TimeAnchor
 from dashcam.state import ClipLifecycle, GpsTimeState, SystemClockState
 from dashcam.storage.intents import IntentKind, OperationIntent, PairPaths
 from dashcam.storage.naming import ClipNameError, parse_clip_filename
+from dashcam.storage.reclaimer import ReclamationStep, StorageReclaimer
 
 MAX_SIDECAR_BYTES: Final = 1_048_576
 _MAX_DIRECTORY_ENTRIES: Final = 100_000
@@ -90,6 +91,15 @@ class PairPromotionCatalog(Protocol):
     ) -> tuple[CatalogClip, ...]: ...
 
     def list_pending_intents(self, *, limit: int) -> tuple[OperationIntent, ...]: ...
+
+    def list_pending_delete_intents(self, *, limit: int) -> tuple[OperationIntent, ...]: ...
+
+    def prepare_oldest_eligible_delete(
+        self,
+        *,
+        monotonic_now_ns: int,
+        boot_id: str,
+    ) -> UUID | None: ...
 
     def reconcile_intent(
         self,
@@ -208,11 +218,43 @@ class DurableRootedFinalizationFilesystem(RootedFilesystem):
 
     def unlink(self, relative_path: str) -> None:
         path = self._safe_path(relative_path)
-        try:
-            path.unlink()
-        except FileNotFoundError:
+        if os.name == "nt":
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return
+            _fsync_directory(path.parent)
             return
-        _fsync_directory(path.parent)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        directory_descriptor = os.open(path.parent, flags)
+        try:
+            root_device = os.lstat(self.root).st_dev
+            directory_information = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_information.st_mode)
+                or directory_information.st_dev != root_device
+            ):
+                raise FinalizationRefused("managed directory identity changed before unlink")
+            try:
+                member = os.stat(
+                    path.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.fsync(directory_descriptor)
+                return
+            if not stat.S_ISREG(member.st_mode) or member.st_dev != root_device:
+                raise FinalizationRefused("managed unlink target is not a bound regular file")
+            os.unlink(path.name, dir_fd=directory_descriptor)
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
 
     def iter_files(self, directory: str, *, limit: int) -> tuple[tuple[str, ...], int, bool]:
         if directory not in {"pending", "clips", "protected", "quarantine"}:
@@ -314,8 +356,11 @@ class DurableRootedFinalizationFilesystem(RootedFilesystem):
         directory = self._safe_directory(parts[0])
         path = directory / parts[1]
         try:
-            if stat.S_ISLNK(os.lstat(path).st_mode):
+            information = os.lstat(path)
+            if stat.S_ISLNK(information.st_mode):
                 raise FinalizationRefused("managed file is a symbolic link")
+            if information.st_dev != os.lstat(self.root).st_dev:
+                raise FinalizationRefused("managed file is on a different device")
         except FileNotFoundError:
             pass
         return path
@@ -328,6 +373,8 @@ class DurableRootedFinalizationFilesystem(RootedFilesystem):
             directory_information.st_mode
         ):
             raise FinalizationRefused("managed directory is not a real directory")
+        if directory_information.st_dev != os.lstat(self.root).st_dev:
+            raise FinalizationRefused("managed directory is on a different device")
         if directory.resolve(strict=True).parent != self.root:
             raise FinalizationRefused("managed directory escapes recording root")
         return directory
@@ -349,6 +396,11 @@ class RecorderClipFinalizer:
         self._monotonic_ns = monotonic_ns
         self._limits = limits or FinalizerLimits()
         self._metadata_coordinator = ClipMetadataCoordinator(
+            catalog=catalog,
+            filesystem=filesystem,
+            monotonic_ns=monotonic_ns,
+        )
+        self._storage_reclaimer = StorageReclaimer(
             catalog=catalog,
             filesystem=filesystem,
             monotonic_ns=monotonic_ns,
@@ -448,6 +500,11 @@ class RecorderClipFinalizer:
         """Persist threshold hysteresis without touching clip rows."""
 
         self._catalog.store_retention_threshold_latch(latch)
+
+    def reclaim_storage_once(self, *, boot_id: str, allow_new: bool) -> ReclamationStep:
+        """Replay or delete one pair; the caller must reobserve before repeating."""
+
+        return self._storage_reclaimer.run_one(boot_id=boot_id, allow_new=allow_new)
 
     def metadata_reconciliation_candidates(
         self,

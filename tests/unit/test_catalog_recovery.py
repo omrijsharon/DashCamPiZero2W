@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -217,6 +218,52 @@ def test_unprotect_and_delete_are_replay_safe_after_each_half_operation(
         assert catalog.get_clip(clip.clip_id).lifecycle is ClipLifecycle.DELETED
         assert not (root / Path(unprotected.video_path)).exists()
         assert not (root / Path(unprotected.sidecar_path)).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory fsync semantics")
+def test_path_adapter_replays_delete_after_unlink_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    filesystem = RootedFilesystem(root)
+    database = tmp_path / "catalog.sqlite3"
+    clip = _clip(1)
+    _write_pair(root, clip)
+    real_fsync = os.fsync
+    fail_once = True
+
+    def injected_fsync(descriptor: int) -> None:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OSError("injected directory fsync failure")
+        real_fsync(descriptor)
+
+    with ClipCatalog(database) as catalog:
+        catalog.register_clip(clip)
+        intent_id = catalog.prepare_delete(
+            clip.clip_id,
+            monotonic_now_ns=10,
+            boot_id="boot-a",
+        )
+        monkeypatch.setattr(os, "fsync", injected_fsync)
+
+        with pytest.raises(OSError, match="directory fsync"):
+            catalog.reconcile_intent(
+                intent_id,
+                filesystem,
+                monotonic_now_ns=11,
+            )
+        assert catalog.get_clip(clip.clip_id).lifecycle is ClipLifecycle.DELETING
+
+        report = catalog.reconcile_startup(
+            root,
+            monotonic_now_ns=12,
+            boot_id="boot-b",
+        )
+        assert report.actions_attempted == 1
+        assert catalog.get_clip(clip.clip_id).lifecycle is ClipLifecycle.DELETED
 
 
 def test_startup_marks_orphaned_catalog_pair_but_never_deletes_unknown_files(

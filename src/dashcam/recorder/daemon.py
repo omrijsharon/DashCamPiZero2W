@@ -414,7 +414,7 @@ class RecorderDaemon:
                 detail="storage preflight failed",
             )
         result = check_task.result()
-        if not result.ready:
+        if not result.ready and not result.recoverable_reserve_exhaustion:
             reasons = ",".join(reason.value for reason in result.reasons) or "NOT_READY"
             return await self._storage_fault(
                 config=config,
@@ -482,14 +482,14 @@ class RecorderDaemon:
                 timeout=self._limits.startup_timeout_s,
             )
         except asyncio.CancelledError:
-            self._cancel_without_waiting(start_task)
+            await self._cancel_task(start_task)
             self.request_stop()
             self._publish(RecorderState.STOPPING)
             self._shutdown_notification()
             await self._stop_runtime(None)
             raise
         if not done:
-            self._cancel_without_waiting(start_task)
+            await self._cancel_task(start_task)
             self._publish(
                 RecorderState.FAULTED,
                 reason=RecorderReason.STARTUP_TIMEOUT,

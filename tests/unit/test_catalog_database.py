@@ -159,6 +159,65 @@ def _finalizing_fixture() -> tuple[CatalogClip, PairPaths, bytes]:
     return clip, paths, sidecar.to_canonical_json()
 
 
+def test_oldest_delete_uses_exact_boot_epoch_for_active_lease(tmp_path: Path) -> None:
+    full_boot_id = "12345678-1234-5678-9234-567812345678"
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(_clip(1), catalog_now_ns=1)
+        catalog.register_clip(_clip(2), catalog_now_ns=2)
+        catalog.acquire_download_lease(
+            UUID(int=1),
+            holder="download",
+            monotonic_now_ns=10,
+            duration_ns=1_000,
+            boot_id=full_boot_id,
+        )
+
+        intent_id = catalog.prepare_oldest_eligible_delete(
+            monotonic_now_ns=11,
+            boot_id=full_boot_id,
+        )
+
+        assert intent_id is not None
+        assert catalog.list_pending_delete_intents(limit=1)[0].clip_id == UUID(int=2)
+
+
+def test_previous_boot_lease_does_not_mask_oldest_clip(tmp_path: Path) -> None:
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(_clip(1), catalog_now_ns=1)
+        catalog.register_clip(_clip(2), catalog_now_ns=2)
+        catalog.acquire_download_lease(
+            UUID(int=1),
+            holder="download",
+            monotonic_now_ns=10,
+            duration_ns=1_000,
+            boot_id="previous-boot",
+        )
+
+        catalog.prepare_oldest_eligible_delete(
+            monotonic_now_ns=11,
+            boot_id="current-boot",
+        )
+
+        assert catalog.list_pending_delete_intents(limit=1)[0].clip_id == UUID(int=1)
+
+
+def test_delete_refuses_unprotected_row_whose_pair_is_in_protected_directory(
+    tmp_path: Path,
+) -> None:
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(
+            _clip(1, protected=False, directory="protected"),
+            catalog_now_ns=1,
+        )
+
+        with pytest.raises(CatalogConflictError, match="clips/ pairs"):
+            catalog.prepare_delete(
+                UUID(int=1),
+                monotonic_now_ns=2,
+                boot_id="current-boot",
+            )
+
+
 def test_migrations_are_explicit_versioned_and_reopen_cleanly(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
 

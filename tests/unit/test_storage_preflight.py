@@ -265,6 +265,9 @@ def test_capacity_free_and_reserve_must_be_sane_before_probe() -> None:
     assert small_result.reasons == (PreflightReason.INSUFFICIENT_CAPACITY,)
     assert exhausted_result.state is StorageState.EMERGENCY
     assert exhausted_result.reasons == (PreflightReason.RESERVE_EXHAUSTED,)
+    assert exhausted_result.recoverable_reserve_exhaustion
+    assert not invalid_result.recoverable_reserve_exhaustion
+    assert not small_result.recoverable_reserve_exhaustion
 
 
 @pytest.mark.parametrize("fail_at", ["create", "write", "short_write", "fsync", "close", "unlink"])

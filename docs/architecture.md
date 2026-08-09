@@ -37,7 +37,7 @@ Phone-preview transport remains open.
 | Burned-in overlay | Use the recorder-owned native NV12/DMABUF fixed-luma-region renderer before hardware encoding; reject stock `textoverlay` and `gdkpixbufoverlay` | Installed `textoverlay` delivered about 10.4 fps and stock fixed-region composition about 18.3 fps. The native path passed exact-Pi dynamic GPS state, stored-pixel, shared stable-anchor time-model, clip-boundary, and recovery qualification at about 30.006 actual packet fps with zero live drops/restarts/renderer failures. The separate Section C1 paired resource matrix remains open; evidence: `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md` and `docs/test-reports/2026-08-09-milestone9-functional-overlay-live.md` |
 | Preview camera path | Select a secondary 640x360 NV12 stream from the same `libcamerasrc`; request 30 fps and drop to 15 fps only after a bounded leaky queue | Dual-stream test retained the 1080p30 recording caps and one camera owner |
 | USB audio device identifier and AAC path | Select USB `08bb:2902` plus product/physical path; shared-pipeline-clock 48 kHz mono S16LE through `alsasrc`/bounded queue/`audioresample`/`voaacenc` 128 kbit/s/`aacparse`; production defaults retain bounded three-slot immutable-generation loss isolation and restoration | Ten integrated A/V clips passed IDR, independent decode, exact-zero boundaries, and 4.000–64.333 ms stream-edge skew. The final two-cycle logical loss/restoration run passed audio truth `[true,false,true,false,true]`, IDR-first hardware decode, 71.958–84.291 ms A/V skew, unchanged drops, and zero restart. Release `0.1.0.dev0-09a6dd3b374d3952` then passed ordinary startup without the microphone and finalized truthful video-only media. Physical hot-unplug/replug is not a current acceptance requirement. Evidence: `docs/test-reports/2026-07-27-milestone7-audio-live.md`, `docs/test-reports/2026-07-28-milestone7-production-restoration-live.md`, `docs/test-reports/2026-07-28-milestone7-absent-startup-live.md` |
-| GPS baud, NMEA reliability, UTC anchoring, clip telemetry, and wall-clock ownership | Select receive-only 115200-baud NMEA from the FlyFishRC M10 Mini on PL011; accept only checksum/parse-valid RMC/ZDA UTC through configured plausibility/continuity policy; coalesce RMC/GGA by receiver epoch into a bounded 10 Hz, three-minute monotonic history and half-open per-clip windows; retain stock `systemd-timesyncd` as the sole Linux wall-clock owner while all media timing remains pipeline/monotonic; reconcile provisional sidecars/names through a schema-4 durable intent and bounded same-boot UUID backlog | The production UART, no-GPS, anchor, sidecar, clock-step, late-lock reconciliation, and exact-exFAT collision gates passed. Release `0.1.0.dev0-7fd1e73debb731b6` retained exactly 600 unique samples in a full clip and 431 in its shutdown successor. Release `0.1.0.dev0-6f943f3a4edf7117` reconciled two no-GPS clips from one later trusted anchor while preserving UUIDs, truthful empty historical navigation, full hardware/AAC decode, and zero drops/restarts. A controlled +120-second wall-clock step left all sequence-390 video/audio PTS and DTS strictly increasing. Evidence: `docs/test-reports/2026-07-28-milestone8-gps-uart-live.md`, `docs/test-reports/2026-07-28-milestone8-no-gps-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-anchor-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-sidecar-live.md`, `docs/test-reports/2026-07-28-milestone8-clock-step-live.md`, and `docs/test-reports/2026-07-28-milestone8-reconciliation-live.md` |
+| GPS baud, NMEA reliability, UTC anchoring, clip telemetry, and wall-clock ownership | Select receive-only 115200-baud NMEA from the FlyFishRC M10 Mini on PL011; accept only checksum/parse-valid RMC/ZDA UTC through configured plausibility/continuity policy; coalesce RMC/GGA by receiver epoch into a bounded 10 Hz, three-minute monotonic history and half-open per-clip windows; retain stock `systemd-timesyncd` as the sole Linux wall-clock owner while all media timing remains pipeline/monotonic; finalize directly with canonical metadata when a trusted anchor already exists, otherwise reconcile provisional sidecars/names through a schema-4 durable intent and bounded same-boot UUID backlog | The production UART, no-GPS, anchor, sidecar, clock-step, late-lock reconciliation, and exact-exFAT collision gates passed. Release `0.1.0.dev0-7fd1e73debb731b6` retained exactly 600 unique samples in a full clip and 431 in its shutdown successor. Release `0.1.0.dev0-6f943f3a4edf7117` reconciled two no-GPS clips from one later trusted anchor while preserving UUIDs, truthful empty historical navigation, full hardware/AAC decode, and zero drops/restarts. Source commit `864bbef` later proved direct first-`FINALIZE` canonical GPS pairs for sequences 65/66 while preserving the late-lock path, but its resource candidate was rejected before matrix work. A controlled +120-second wall-clock step left all sequence-390 video/audio PTS and DTS strictly increasing. Evidence: `docs/test-reports/2026-07-28-milestone8-gps-uart-live.md`, `docs/test-reports/2026-07-28-milestone8-no-gps-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-anchor-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-sidecar-live.md`, `docs/test-reports/2026-07-28-milestone8-clock-step-live.md`, `docs/test-reports/2026-07-28-milestone8-reconciliation-live.md`, and `docs/test-reports/2026-08-09-milestone9-direct-anchor-finalization-rejected.md` |
 | exFAT tooling, layout and provisioner | Select the exact-card SSH-first 6 GiB ext4 p2 plus UUID-mounted exFAT `DASHCAM` p3 contract | Authorized Stage A/B completed on CID `fe34325344000000200000031a0192d1`; storage preflight, bounded fsck, throughput, and recorder finalization passed. Any different card or destructive layout change requires a new exact preflight and authorization |
 | Phone preview transport | Open | Requires phone/browser latency and resource measurements in Milestone 11 |
 
@@ -297,10 +297,13 @@ Phone-preview transport remains open.
   absolute screen (best p95 102.9872% with one rollover timestamp-gap drop).
   Exact traces place the remaining burst in the durable GPS-sidecar
   provisional-to-canonical reconciliation worker, not the GPS-window snapshot.
-  Both candidates were rolled back to dormant `5f95`; next design work must
-  avoid the redundant reconciliation transaction when a trusted anchor already
-  exists while preserving late-lock recovery and catalog durability. Evidence:
-  `docs/test-reports/2026-08-09-milestone9-rollover-optimization-rejected.md`.
+  Both candidates were rolled back to dormant `5f95`. Source commit `864bbef`
+  then implemented direct anchored finalization while retaining late-lock
+  recovery and catalog durability. Its candidate screen improved same-boot p95
+  by 3.0028996 percentage points but still had p95 102.9846293% and two drops,
+  so it too was rolled back before screen 2 or the formal matrix. Evidence:
+  `docs/test-reports/2026-08-09-milestone9-rollover-optimization-rejected.md`
+  and `docs/test-reports/2026-08-09-milestone9-direct-anchor-finalization-rejected.md`.
 - Comparative acceptance is fixed before the integrated run: paired arms use
   one warm-up plus at least ten one-minute clips and at least 1 Hz samples.
   Each clip must deliver at least 29.9 fps; drops/restarts may not increase;
@@ -340,11 +343,14 @@ interfaces:
   configured plausibility/continuity tracker, and its accepted monotonic/UTC
   anchor, provenance, uncertainty, and counters feed privacy-safe status.
   A bounded receiver-epoch-coalesced navigation history feeds half-open,
-  monotonic clip windows at no more than 600 samples per minute. Once a trusted
-  anchor exists, the schema-4 reconciliation worker projects eligible clip and
-  sample times into UTC/local time, atomically replaces canonical sidecars,
-  and no-replace renames provisional pairs under durable catalog intents while
-  preserving their stable UUIDs. The approved image keeps stock
+  monotonic clip windows at no more than 600 samples per minute. If a trusted
+  anchor exists at finalization, the recorder writes the canonical anchored
+  pair through its ordinary durable `FINALIZE` intent; otherwise the schema-4
+  reconciliation worker later projects eligible provisional clip and sample
+  times into UTC/local time, atomically replaces canonical sidecars, and
+  no-replace renames pairs while preserving stable UUIDs. The direct-anchor
+  candidate established this functional path but remains resource-rejected.
+  The approved image keeps stock
   `systemd-timesyncd` as its sole Linux wall-clock owner;
   the recorder neither disciplines wall time nor derives PTS/DTS from it. A
   controlled +120-second wall-clock step during production recording left

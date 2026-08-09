@@ -109,9 +109,43 @@
   Exact rollback restored dormant accepted `5f95`, zero restarts, exact config,
   and `throttled=0x0`. Profiling identifies the GPS-sidecar durable worker at
   61--76% CPU for about 1.5 seconds during rollover; GPS-window snapshotting is
-  only about 0.2 ms. Preserve all durability/collision checks and pursue a
-  direct already-anchored finalization path before adding buffering. Evidence:
+  only about 0.2 ms. Preserve all durability/collision checks; the direct
+  already-anchored finalization path was subsequently implemented and screened
+  as recorded below. Evidence:
   `docs/test-reports/2026-08-09-milestone9-rollover-optimization-rejected.md`.
+- The direct already-anchored finalization implementation from pushed source
+  commit `864bbef` is functionally correct but rejected as a Milestone 9
+  resource candidate. Hash-closed release `0.1.0.dev0-b3d3a3e42919950b`
+  (manifest `323443e1efb508728fa9557569c37aa376504932500a71af775cc4a05afebab7`,
+  `SHA256SUMS` `72f335bd3f495df7e547833e295ecd63545f787a298927286c4b37efc7b342c9`,
+  wheel `21cbb0801699acf997a38f2487af2e557476dba7aa5c2b4ebda77706c04a9e5f)
+  passed exact-version apply and idempotent reapply with zero package changes
+  and no service starts. Its Pi-local proof established sequences 65/66 as
+  canonical at their first `FINALIZE`, `pair_reconciled=true`, exactly two
+  complete `FINALIZE` intents, and zero `RECONCILE_NAME` intents; the
+  privacy-safe proof SHA-256 is
+  `ed01e3383b08f5154ae1c6e0bc37af6e1bb26856de17a1ee66c533c560c38a8e`.
+  A separate privacy-safe sidecar proof SHA-256 is
+  `959889eedc2c475bd73d8c2053ddf21622399f0f149077748a326a30f990f919`:
+  retention orders 211/212 (sequences 65/66) are GPS-anchored/time-valid with
+  GPS anchors, civil start/end times, and 438/422 samples, without exporting
+  coordinates. On the same boot, the 5f95 control had mean/p95/max CPU
+  93.5873995%/105.9875290%/151.9813232%, 2,101 encoded frames, and four drops
+  (GPS valid at sample start then stale), while candidate screen 1 had
+  92.4680983%/102.9846293%/149.9806537%, 2,104 encoded frames, and two drops
+  (GPS valid at start and end). Both had zero restarts, renderer/sync failures,
+  and throttling. The 3.0028996 percentage-point same-boot p95 reduction meets
+  the relative threshold, but absolute p95 remains above 98% and drops are
+  nonzero; the candidate's sampled encoded rate was also only 28.0389 fps,
+  below the 29.9 fps screening floor. Do not run screen 2 or the formal matrix;
+  do not mark any Milestone
+  9 resource, exit, or milestone gate passed. Exact rollback restored 5f95,
+  managed config SHA-256
+  `1276363286475bccf85e70332ec893846e3fe3572e8184991843400ac4d6c4b8`,
+  dormant units, `NRestarts=0`, and `throttled=0x0`; the candidate release
+  directory was safely removed while its bundle remains
+  at `/var/lib/dashcam/m9-direct-anchor-bundle-864bbef`. Evidence:
+  `docs/test-reports/2026-08-09-milestone9-direct-anchor-finalization-rejected.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

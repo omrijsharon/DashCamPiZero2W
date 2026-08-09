@@ -52,6 +52,13 @@ WORKER_REFUSAL_RE: Final = re.compile(
     rb"REFUSED: H_(HARNESS|OS|UNICODE|ZIP|VALUE|ASSERT|ATTRIBUTE|KEY|RUNTIME|TYPE|"
     rb"EXCEPTION)_F([a-z][a-z0-9_]*)_L([1-9][0-9]{0,3})\n"
 )
+CRASH_CELL_REFUSAL_RE: Final = re.compile(
+    rb"REFUSED: H_CRASH_CELL operation=(FINALIZE|PROTECT|UNPROTECT|DELETE) "
+    rb"cutpoint=(AFTER_INTENT|AFTER_MEMBER1|AFTER_MEMBER2|AFTER_COMPLETE) "
+    rb"returncode=(-?[0-9]{1,3}) stdout_bytes=([0-9]{1,3}) "
+    rb"stdout_sha256=([0-9a-f]{64}) stderr_bytes=([0-9]{1,3}) "
+    rb"stderr_sha256=([0-9a-f]{64}) failed=([01]{4})\n"
+)
 MAX_REVIEWED_RUN_LINE: Final = 4096
 WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "worker",
@@ -151,6 +158,28 @@ REQUIRED_EXECUTABLES: Final = (
 
 class HarnessError(RuntimeError):
     """A safety, identity, evidence, or bound check refused the run."""
+
+
+class CrashCellContractError(HarnessError):
+    """One crash child returned bounded evidence that missed its closed contract."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        cutpoint: str,
+        returncode: int,
+        stdout: bytes,
+        stderr: bytes,
+        failed_mask: str,
+    ) -> None:
+        super().__init__("crash-cell did not terminate at the exact SIGKILL cutpoint")
+        self.operation = operation
+        self.cutpoint = cutpoint
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.failed_mask = failed_mask
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,7 +645,62 @@ def _safe_worker_refusal_detail(stderr: bytes) -> str:
         line = int(match.group(3))
         if line in _reviewed_function_lines().get(function, frozenset()):
             return stderr[:-1].decode("ascii")
+    crash_match = CRASH_CELL_REFUSAL_RE.fullmatch(stderr)
+    if crash_match is not None:
+        returncode_token = crash_match.group(3).decode("ascii")
+        stdout_bytes_token = crash_match.group(4).decode("ascii")
+        stderr_bytes_token = crash_match.group(6).decode("ascii")
+        returncode = int(returncode_token)
+        stdout_bytes = int(stdout_bytes_token)
+        stdout_sha256 = crash_match.group(5).decode("ascii")
+        stderr_bytes = int(stderr_bytes_token)
+        stderr_sha256 = crash_match.group(7).decode("ascii")
+        failed_mask = crash_match.group(8)
+        empty_sha256 = _sha256(b"")
+        expected_mask_prefix = bytes(
+            (
+                ord("1") if returncode != -SIGKILL_NUMBER else ord("0"),
+                ord("1") if stdout_bytes > 512 else ord("0"),
+                ord("1") if stderr_bytes != 0 else ord("0"),
+            )
+        )
+        if (
+            -255 <= returncode <= 255
+            and stdout_bytes <= 513
+            and stderr_bytes <= 513
+            and returncode_token == str(returncode)
+            and stdout_bytes_token == str(stdout_bytes)
+            and stderr_bytes_token == str(stderr_bytes)
+            and (stdout_bytes != 0 or stdout_sha256 == empty_sha256)
+            and (stderr_bytes != 0 or stderr_sha256 == empty_sha256)
+            and failed_mask[:3] == expected_mask_prefix
+            and failed_mask != b"0000"
+        ):
+            return stderr[:-1].decode("ascii")
     return f"worker-stderr-sha256={_sha256(stderr)},bytes={len(stderr)}"
+
+
+def _crash_cell_refusal_line(error: CrashCellContractError) -> bytes:
+    if (
+        error.operation not in CRASH_OPERATIONS
+        or error.cutpoint not in CRASH_CUTPOINTS
+        or isinstance(error.returncode, bool)
+        or not isinstance(error.returncode, int)
+        or not -255 <= error.returncode <= 255
+        or len(error.stdout) > 513
+        or len(error.stderr) > 513
+        or re.fullmatch(r"[01]{4}", error.failed_mask) is None
+        or error.failed_mask == "0000"
+    ):
+        raise HarnessError("crash-cell diagnostic fields differ from their bounds")
+    return (
+        "REFUSED: H_CRASH_CELL "
+        f"operation={error.operation} cutpoint={error.cutpoint} "
+        f"returncode={error.returncode} "
+        f"stdout_bytes={len(error.stdout)} stdout_sha256={_sha256(error.stdout)} "
+        f"stderr_bytes={len(error.stderr)} stderr_sha256={_sha256(error.stderr)} "
+        f"failed={error.failed_mask}\n"
+    ).encode("ascii")
 
 
 def _worker_exception_category(error: Exception) -> str:
@@ -1626,13 +1710,24 @@ def _run_crash_subprocess(
             process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
-    if (
-        returncode != -SIGKILL_NUMBER
-        or len(stdout) > 512
-        or stderr
-        or CRASH_INTENT_LINE_RE.fullmatch(stdout) is None
-    ):
-        raise HarnessError("crash-cell did not terminate at the exact SIGKILL cutpoint")
+    failed_mask = "".join(
+        "1" if failed else "0"
+        for failed in (
+            returncode != -SIGKILL_NUMBER,
+            len(stdout) > 512,
+            bool(stderr),
+            CRASH_INTENT_LINE_RE.fullmatch(stdout) is None,
+        )
+    )
+    if failed_mask != "0000":
+        raise CrashCellContractError(
+            operation=operation,
+            cutpoint=cutpoint,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            failed_mask=failed_mask,
+        )
     return UUID(stdout.decode("ascii").strip())
 
 
@@ -1827,6 +1922,7 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
             monotonic_now_ns=100,
             duration_ns=300 * 1_000_000_000,
             boot_id="m10-loop-boot",
+            max_active_leases=32,
         )
         unmanaged = _fixture_clip(42, managed=False)
         _materialize_clip(root, unmanaged)
@@ -2862,7 +2958,12 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
 
 
 def _emit_worker_refusal(error: Exception) -> int:
-    _write_all(sys.stderr.fileno(), _worker_refusal_line(error))
+    line = (
+        _crash_cell_refusal_line(error)
+        if isinstance(error, CrashCellContractError)
+        else _worker_refusal_line(error)
+    )
+    _write_all(sys.stderr.fileno(), line)
     return 2
 
 

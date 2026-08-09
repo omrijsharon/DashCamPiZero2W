@@ -604,11 +604,17 @@ def test_crash_subprocess_timeout_kills_and_joins_exact_child(
 
 
 @pytest.mark.parametrize(
-    ("returncode", "stdout", "stderr"),
+    ("returncode", "stdout", "stderr", "expected_mask"),
     [
-        (0, b"12345678-1234-4abc-8def-1234567890ab\n", b""),
-        (-9, b"not-a-uuid\n", b""),
-        (-9, b"12345678-1234-4abc-8def-1234567890ab\n", b"REFUSED: private\n"),
+        (0, b"12345678-1234-4abc-8def-1234567890ab\n", b"", "1000"),
+        (-9, b"not-a-uuid\n", b"", "0001"),
+        (
+            -9,
+            b"12345678-1234-4abc-8def-1234567890ab\n",
+            b"REFUSED: private\n",
+            "0010",
+        ),
+        (-9, b"x" * 514, b"", "0101"),
     ],
 )
 def test_crash_subprocess_rejects_non_sigkill_malformed_or_stderr(
@@ -617,6 +623,7 @@ def test_crash_subprocess_rejects_non_sigkill_malformed_or_stderr(
     returncode: int,
     stdout: bytes,
     stderr: bytes,
+    expected_mask: str,
 ) -> None:
     class Process:
         def __init__(self) -> None:
@@ -640,7 +647,7 @@ def test_crash_subprocess_rejects_non_sigkill_malformed_or_stderr(
         lambda work, operation, cutpoint: ("cell", 180, work / "catalog.sqlite3"),
     )
     monkeypatch.setattr(harness.subprocess, "Popen", lambda *_args, **_kwargs: Process())
-    with pytest.raises(harness.HarnessError, match="exact SIGKILL"):
+    with pytest.raises(harness.CrashCellContractError, match="exact SIGKILL") as captured:
         harness._run_crash_subprocess(
             bundle=tmp_path,
             work=tmp_path,
@@ -649,6 +656,130 @@ def test_crash_subprocess_rejects_non_sigkill_malformed_or_stderr(
             operation="PROTECT",
             cutpoint="AFTER_COMPLETE",
         )
+    error = captured.value
+    assert error.operation == "PROTECT"
+    assert error.cutpoint == "AFTER_COMPLETE"
+    assert error.returncode == returncode
+    assert error.failed_mask == expected_mask
+    assert len(error.stdout) <= 513
+    assert len(error.stderr) <= 513
+
+
+def test_crash_cell_refusal_is_digest_only_and_parent_revalidates_it() -> None:
+    private_stdout = b"12345678-1234-4abc-8def-1234567890ab\n"
+    private_stderr = b"/srv/dashcam SSID=private PSK=secret token=hidden\n"
+    error = harness.CrashCellContractError(
+        operation="DELETE",
+        cutpoint="AFTER_MEMBER2",
+        returncode=2,
+        stdout=private_stdout,
+        stderr=private_stderr,
+        failed_mask="1010",
+    )
+
+    line = harness._crash_cell_refusal_line(error)
+    detail = harness._safe_worker_refusal_detail(line)
+
+    assert detail == line[:-1].decode("ascii")
+    assert b"/srv" not in line
+    assert b"SSID" not in line
+    assert b"PSK" not in line
+    assert b"token" not in line
+    assert str(len(private_stdout)).encode("ascii") in line
+    assert hashlib.sha256(private_stdout).hexdigest().encode("ascii") in line
+    assert str(len(private_stderr)).encode("ascii") in line
+    assert hashlib.sha256(private_stderr).hexdigest().encode("ascii") in line
+    assert b"operation=DELETE" in line
+    assert b"cutpoint=AFTER_MEMBER2" in line
+    assert b"returncode=2" in line
+    assert b"failed=1010" in line
+
+
+@pytest.mark.parametrize(
+    "mutated",
+    [
+        b"REFUSED: H_CRASH_CELL operation=FOREIGN cutpoint=AFTER_MEMBER2 "
+        b"returncode=2 stdout_bytes=0 stdout_sha256="
+        + hashlib.sha256(b"").hexdigest().encode("ascii")
+        + b" stderr_bytes=0 stderr_sha256="
+        + hashlib.sha256(b"").hexdigest().encode("ascii")
+        + b" failed=1000\n",
+        b"REFUSED: H_CRASH_CELL operation=DELETE cutpoint=AFTER_MEMBER2 "
+        b"returncode=999 stdout_bytes=0 stdout_sha256="
+        + hashlib.sha256(b"").hexdigest().encode("ascii")
+        + b" stderr_bytes=0 stderr_sha256="
+        + hashlib.sha256(b"").hexdigest().encode("ascii")
+        + b" failed=1000\n",
+        b"REFUSED: H_CRASH_CELL operation=DELETE cutpoint=AFTER_MEMBER2 "
+        b"returncode=2 stdout_bytes=0 stdout_sha256="
+        + hashlib.sha256(b"").hexdigest().encode("ascii")
+        + b" stderr_bytes=0 stderr_sha256="
+        + hashlib.sha256(b"").hexdigest().encode("ascii")
+        + b" failed=0000\n",
+    ],
+)
+def test_parent_rejects_forged_crash_cell_diagnostic(mutated: bytes) -> None:
+    detail = harness._safe_worker_refusal_detail(mutated)
+
+    assert detail == (
+        "worker-stderr-sha256=" + hashlib.sha256(mutated).hexdigest() + f",bytes={len(mutated)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (b"failed=1000", b"failed=0001"),
+        (b"returncode=2", b"returncode=-0"),
+        (b"stdout_bytes=0", b"stdout_bytes=00"),
+        (b"stderr_bytes=0", b"stderr_bytes=00"),
+    ],
+)
+def test_parent_recomputes_predicates_and_rejects_noncanonical_numbers(
+    original: bytes,
+    replacement: bytes,
+) -> None:
+    valid = harness._crash_cell_refusal_line(
+        harness.CrashCellContractError(
+            operation="DELETE",
+            cutpoint="AFTER_COMPLETE",
+            returncode=2,
+            stdout=b"",
+            stderr=b"",
+            failed_mask="1000",
+        )
+    )
+    mutated = valid.replace(original, replacement, 1)
+    assert mutated != valid
+
+    detail = harness._safe_worker_refusal_detail(mutated)
+
+    assert detail == (
+        "worker-stderr-sha256=" + hashlib.sha256(mutated).hexdigest() + f",bytes={len(mutated)}"
+    )
+
+
+def test_worker_emits_the_closed_crash_cell_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[bytes] = []
+    error = harness.CrashCellContractError(
+        operation="FINALIZE",
+        cutpoint="AFTER_INTENT",
+        returncode=1,
+        stdout=b"",
+        stderr=b"private child detail",
+        failed_mask="1011",
+    )
+    monkeypatch.setattr(
+        harness,
+        "_write_all",
+        lambda _descriptor, payload: captured.append(payload),
+    )
+
+    assert harness._emit_worker_refusal(error) == 2
+    assert captured == [harness._crash_cell_refusal_line(error)]
+    assert b"private child detail" not in captured[0]
 
 
 @pytest.mark.parametrize(

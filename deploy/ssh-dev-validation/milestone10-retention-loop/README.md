@@ -103,3 +103,10 @@ explicit deferred gates, even when every component matrix in this harness
 passes. The complete worker, including all sixteen bounded crash subprocesses
 and their recovery checks, remains under the parent's 900-second timeout and
 exact cleanup barrier.
+
+If a crash subprocess misses its closed contract, the worker reports only its
+allow-listed operation and cutpoint, numeric return code, bounded captured
+stdout/stderr byte counts and SHA-256 values, and a four-bit failure mask. The
+mask order is return code, stdout bound, empty stderr, canonical intent UUID;
+`1` identifies a failed predicate. Raw child output, paths, and intent IDs are
+never forwarded.

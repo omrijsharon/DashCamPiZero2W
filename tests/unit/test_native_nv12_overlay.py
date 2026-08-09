@@ -140,9 +140,7 @@ class FakeGiMemory:
         self.fd_memory = True
         self.fd = fd
         self.sizes: tuple[int, ...] = (
-            (2_073_600, 0, 2_073_600)
-            if plane == 0
-            else (1_036_800, 2_073_600, 3_110_400)
+            (2_073_600, 0, 2_073_600) if plane == 0 else (1_036_800, 2_073_600, 3_110_400)
         )
 
     def get_sizes(self) -> tuple[int, ...]:
@@ -225,10 +223,12 @@ class FakeGiBuffer:
 class FakeGiPad:
     def __init__(self) -> None:
         self.caps: FakeGiCaps | None = FakeGiCaps()
+        self.caps_reads = 0
         self.probe_type: object | None = None
         self.probe_callback: object | None = None
 
     def get_current_caps(self) -> FakeGiCaps | None:
+        self.caps_reads += 1
         return self.caps
 
     def add_probe(self, probe_type: object, callback: object) -> int:
@@ -261,20 +261,51 @@ class FakeGstVideo:
         return buffer.video_meta
 
 
-class FakeProbeInfo:
-    def __init__(self, buffer: FakeGiBuffer) -> None:
-        self.buffer = buffer
-
-    def get_buffer(self) -> FakeGiBuffer:
-        return self.buffer
-
-
 class FakeGst:
     class PadProbeType:
-        BUFFER = object()
+        BUFFER = 1
+        EVENT_DOWNSTREAM = 2
 
     class PadProbeReturn:
         OK = object()
+
+    class EventType:
+        CAPS = 10
+        STREAM_START = 11
+        FLUSH_START = 12
+        FLUSH_STOP = 13
+
+
+class FakeGiEvent:
+    def __init__(self, event_type: int, caps: FakeGiCaps | None = None) -> None:
+        self.type = event_type
+        self.caps = caps
+
+    def parse_caps(self) -> FakeGiCaps:
+        assert self.caps is not None
+        return self.caps
+
+
+class FakeProbeInfo:
+    def __init__(
+        self,
+        buffer: FakeGiBuffer | None = None,
+        *,
+        event: FakeGiEvent | None = None,
+    ) -> None:
+        self.buffer = buffer
+        self.event = event
+        self.type = (
+            FakeGst.PadProbeType.EVENT_DOWNSTREAM
+            if event is not None
+            else FakeGst.PadProbeType.BUFFER
+        )
+
+    def get_buffer(self) -> FakeGiBuffer | None:
+        return self.buffer
+
+    def get_event(self) -> FakeGiEvent | None:
+        return self.event
 
 
 def mutate_fake_gi_contract(case: str, pad: FakeGiPad, buffer: FakeGiBuffer) -> None:
@@ -568,14 +599,8 @@ def test_silent_overlay_is_true_passthrough_without_validation_or_mapping() -> N
 def test_probe_skips_all_gi_extraction_when_disabled_or_already_isolated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Enum:
-        OK = object()
-
-    class Gst:
-        PadProbeReturn = Enum
-
     core, _ = core_and_access()
-    renderer = GstDmabufOverlayRenderer(Gst(), object(), object(), core=core)
+    renderer = GstDmabufOverlayRenderer(FakeGst(), object(), object(), core=core)
     extractions = 0
 
     def forbidden_extraction(*_args: object) -> int:
@@ -589,9 +614,9 @@ def test_probe_skips_all_gi_extraction_when_disabled_or_already_isolated(
         forbidden_extraction,
     )
     core.set_text(None)
-    assert renderer._probe(object(), object()) is Enum.OK
+    assert renderer._probe(object(), FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
     core.isolate("already isolated")
-    assert renderer._probe(object(), object()) is Enum.OK
+    assert renderer._probe(object(), FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
 
     assert extractions == 0
     snapshot = core.snapshot()
@@ -623,13 +648,6 @@ def test_fused_probe_validates_live_gi_contract_and_renders() -> None:
 @pytest.mark.parametrize(
     "case",
     [
-        "caps_count",
-        "caps_features",
-        "caps_media_type",
-        "width",
-        "height",
-        "format",
-        "framerate",
         "buffer_size",
         "memory_count",
         "writable",
@@ -682,7 +700,50 @@ def test_fused_probe_refuses_every_live_gi_contract_drift_before_access(case: st
     assert access.syncs == []
 
 
-def test_fused_probe_revalidates_mutated_same_objects_before_second_frame_access() -> None:
+@pytest.mark.parametrize(
+    "case",
+    [
+        "caps_count",
+        "caps_features",
+        "caps_media_type",
+        "width",
+        "height",
+        "format",
+        "framerate",
+    ],
+)
+def test_serialized_caps_event_refuses_every_caps_drift_before_buffer_access(
+    case: str,
+) -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    buffer = FakeGiBuffer()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+    mutate_fake_gi_contract(case, pad, buffer)
+    assert pad.caps is not None
+
+    event = FakeGiEvent(FakeGst.EventType.CAPS, pad.caps)
+    assert renderer._probe(pad, FakeProbeInfo(event=event)) is FakeGst.PadProbeReturn.OK
+    assert core.snapshot().frames_seen == 0
+    assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
+
+    snapshot = core.snapshot()
+    assert snapshot.state == "ISOLATED"
+    assert snapshot.frames_seen == snapshot.frames_passthrough == 1
+    assert snapshot.contract_mismatches == 1
+    assert access.identity_calls == []
+    assert access.duplicates == []
+    assert access.syncs == []
+
+
+def test_fused_probe_revalidates_mutated_buffer_objects_before_second_frame_access() -> None:
     core, access = core_and_access()
     core.set_text("REC")
     pad = FakeGiPad()
@@ -698,8 +759,7 @@ def test_fused_probe_revalidates_mutated_same_objects_before_second_frame_access
     assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
     identity_calls = list(access.identity_calls)
     syncs = list(access.syncs)
-    assert pad.caps is not None
-    pad.caps.structure.values["format"] = "I420"
+    buffer.size += 1
 
     assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
 
@@ -711,6 +771,154 @@ def test_fused_probe_revalidates_mutated_same_objects_before_second_frame_access
     assert snapshot.contract_mismatches == 1
     assert access.identity_calls == identity_calls
     assert access.syncs == syncs
+
+
+def test_serialized_caps_cache_avoids_per_buffer_pad_caps_queries() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+    assert pad.caps_reads == 1
+
+    assert renderer._probe(pad, FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
+    assert renderer._probe(pad, FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
+
+    assert pad.caps_reads == 1
+    assert core.snapshot().frames_rendered == 2
+    assert len(access.identity_calls) >= 2
+
+
+def test_stream_start_requires_a_new_valid_caps_event_before_rendering() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+
+    stream_start = FakeGiEvent(FakeGst.EventType.STREAM_START)
+    assert renderer._probe(pad, FakeProbeInfo(event=stream_start)) is FakeGst.PadProbeReturn.OK
+    assert renderer._probe(pad, FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
+
+    snapshot = core.snapshot()
+    assert snapshot.state == "ISOLATED"
+    assert snapshot.contract_mismatches == 1
+    assert access.identity_calls == []
+
+
+def test_stream_start_then_valid_caps_event_restores_contract_before_first_buffer() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+    assert pad.caps is not None
+
+    assert (
+        renderer._probe(
+            pad,
+            FakeProbeInfo(event=FakeGiEvent(FakeGst.EventType.STREAM_START)),
+        )
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert (
+        renderer._probe(
+            pad,
+            FakeProbeInfo(event=FakeGiEvent(FakeGst.EventType.CAPS, pad.caps)),
+        )
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert renderer._probe(pad, FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
+
+    assert core.snapshot().state == "ACTIVE"
+    assert access.duplicates == [(10, 1010)]
+
+
+def test_attach_without_current_caps_waits_for_serialized_caps_before_rendering() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    pad.caps = None
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer.attach(FakeGiCamera(pad))
+    assert pad.probe_callback is not None
+    callback = cast(Any, pad.probe_callback)
+    negotiated_caps = FakeGiCaps()
+
+    assert (
+        callback(
+            object(),
+            FakeProbeInfo(event=FakeGiEvent(FakeGst.EventType.STREAM_START)),
+        )
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert (
+        callback(
+            object(),
+            FakeProbeInfo(event=FakeGiEvent(FakeGst.EventType.CAPS, negotiated_caps)),
+        )
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert callback(object(), FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
+
+    assert pad.caps_reads == 1
+    assert core.snapshot().state == "ACTIVE"
+    assert access.duplicates == [(10, 1010)]
+
+
+def test_invalid_caps_event_can_be_replaced_before_any_buffer_is_touched() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+    invalid_caps = FakeGiCaps()
+    invalid_caps.structure.values["format"] = "I420"
+
+    assert (
+        renderer._probe(
+            pad,
+            FakeProbeInfo(event=FakeGiEvent(FakeGst.EventType.CAPS, invalid_caps)),
+        )
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert (
+        renderer._probe(
+            pad,
+            FakeProbeInfo(event=FakeGiEvent(FakeGst.EventType.CAPS, FakeGiCaps())),
+        )
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert renderer._probe(pad, FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
+
+    assert core.snapshot().state == "ACTIVE"
+    assert core.snapshot().contract_mismatches == 0
+    assert access.duplicates == [(10, 1010)]
 
 
 def test_attach_owns_extractor_when_callback_uses_a_distinct_pad_wrapper() -> None:
@@ -725,13 +933,12 @@ def test_attach_owns_extractor_when_callback_uses_a_distinct_pad_wrapper() -> No
     )
     renderer.attach(FakeGiCamera(attached_pad))
 
-    assert attached_pad.probe_type is FakeGst.PadProbeType.BUFFER
+    assert attached_pad.probe_type == (
+        FakeGst.PadProbeType.BUFFER | FakeGst.PadProbeType.EVENT_DOWNSTREAM
+    )
     assert attached_pad.probe_callback is not None
     probe_callback = cast(Any, attached_pad.probe_callback)
-    assert (
-        probe_callback(object(), FakeProbeInfo(FakeGiBuffer()))
-        is FakeGst.PadProbeReturn.OK
-    )
+    assert probe_callback(object(), FakeProbeInfo(FakeGiBuffer())) is FakeGst.PadProbeReturn.OK
     assert core.snapshot().state == "ACTIVE"
     assert access.duplicates == [(10, 1010)]
 

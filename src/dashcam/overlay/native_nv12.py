@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from functools import partial
 from threading import Condition, Lock
-from typing import Final, Protocol, SupportsInt, cast
+from typing import Any, Final, Protocol, SupportsInt, cast
 
 from dashcam.overlay.formatting import OVERLAY_1080P_LAYOUT, OverlayLayout
 
@@ -112,9 +112,7 @@ def _validate_caps_values(
 
 def _validate_buffer_values(size: int, memory_count: int, all_memory_writable: bool) -> None:
     if size != NV12_BUFFER_SIZE or memory_count != 2 or all_memory_writable:
-        raise NativeOverlayContractError(
-            "overlay buffer size, plane count, or writability differs"
-        )
+        raise NativeOverlayContractError("overlay buffer size, plane count, or writability differs")
 
 
 def _validate_memory_values(
@@ -145,9 +143,7 @@ def _validate_memory_values(
             "overlay requires two matching bounded libcameraallocator DMABUF memories"
         )
     if y_fd < 0 or y_fd != uv_fd:
-        raise NativeOverlayContractError(
-            "overlay NV12 planes do not share one valid DMABUF fd"
-        )
+        raise NativeOverlayContractError("overlay NV12 planes do not share one valid DMABUF fd")
     if (
         y_size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
         or y_offset != NV12_Y_OFFSET
@@ -422,12 +418,10 @@ def render_luma_bitmap(
                         continue
                     target_x = glyph_x + source_x * horizontal_scale
                     for repeat_y in range(vertical_scale):
-                        start = (
-                            (target_y + repeat_y) * layout.region_width_px + target_x
+                        start = (target_y + repeat_y) * layout.region_width_px + target_x
+                        bitmap[start : start + horizontal_scale] = (
+                            bytes([OVERLAY_FOREGROUND_LUMA]) * horizontal_scale
                         )
-                        bitmap[start : start + horizontal_scale] = bytes(
-                            [OVERLAY_FOREGROUND_LUMA]
-                        ) * horizontal_scale
     return bytes(bitmap)
 
 
@@ -467,10 +461,7 @@ class SystemDmabufAccess:
             fd,
             length,
             flags=vars(mmap_module)["MAP_SHARED"],
-            prot=(
-                vars(mmap_module)["PROT_READ"]
-                | vars(mmap_module)["PROT_WRITE"]
-            ),
+            prot=(vars(mmap_module)["PROT_READ"] | vars(mmap_module)["PROT_WRITE"]),
         )
 
     def sync(self, fd: int, flags: int) -> None:
@@ -548,9 +539,7 @@ class NativeNv12OverlayCore:
         self._render_latency_last_ns: int | None = None
         self._render_latency_max_ns = 0
         self._render_latency_total_ns = 0
-        self._render_latency_bucket_counts = [0] * (
-            len(_LATENCY_BUCKET_BOUNDS_NS) + 1
-        )
+        self._render_latency_bucket_counts = [0] * (len(_LATENCY_BUCKET_BOUNDS_NS) + 1)
         self._last_error: str | None = None
 
     def _record_latency(self, started_ns: int) -> None:
@@ -604,11 +593,7 @@ class NativeNv12OverlayCore:
         """Return the cheap streaming-path gate before any GI introspection."""
 
         with self._lock:
-            return (
-                not self._closed
-                and not self._isolated
-                and self._bitmap_rows is not None
-            )
+            return not self._closed and not self._isolated and self._bitmap_rows is not None
 
     def note_passthrough_frame(self) -> None:
         """Account for one frame skipped by the cheap disabled/isolated gate."""
@@ -658,9 +643,7 @@ class NativeNv12OverlayCore:
             mapped = self._access.map_shared(duplicate, NV12_BUFFER_SIZE)
             with self._lock:
                 if identity in self._mappings:
-                    raise NativeOverlayContractError(
-                        "native overlay concurrent mapping creation"
-                    )
+                    raise NativeOverlayContractError("native overlay concurrent mapping creation")
                 self._mappings[identity] = (duplicate, mapped)
                 self._mappings_created += 1
             return duplicate, mapped
@@ -725,9 +708,7 @@ class NativeNv12OverlayCore:
                 or isinstance(identity[1], bool)
                 or identity[1] < 0
             ):
-                raise NativeOverlayContractError(
-                    "native overlay DMABUF identity is invalid"
-                )
+                raise NativeOverlayContractError("native overlay DMABUF identity is invalid")
             duplicate, mapped = self._mapping(source_fd, identity)
         except Exception as error:
             self._latch_failure(
@@ -873,41 +854,35 @@ def _int_member(target: object, name: str) -> int:
     return int(cast(SupportsInt, value))
 
 
-def _extract_validated_dmabuf_fd(
-    get_current_caps: Callable[[], object | None],
-    is_dmabuf: Callable[[object], object],
-    is_fd_memory: Callable[[object], object],
-    get_fd: Callable[[object], object],
-    get_video_meta: Callable[[object], object | None],
-    buffer: object,
-) -> int:
-    """Validate one live GI frame without allocating a mirrored object graph."""
+def _validate_gst_caps(caps: object) -> None:
+    """Validate one serialized CAPS event or attach-time sticky snapshot."""
 
-    caps = get_current_caps()
-    if caps is None:
-        raise NativeOverlayContractError("native overlay source caps are unavailable")
-    caps_size = int(
-        cast(SupportsInt, cast(Callable[[], object], _member(caps, "get_size"))())
-    )
+    caps_size = int(cast(SupportsInt, cast(Callable[[], object], _member(caps, "get_size"))()))
     if caps_size != 1:
         raise NativeOverlayContractError("native overlay caps structure count differs")
     structure = cast(Callable[[int], object], _member(caps, "get_structure"))(0)
     features = cast(Callable[[int], object], _member(caps, "get_features"))(0)
     get_value = cast(Callable[[str], object], _member(structure, "get_value"))
-    media_type = str(cast(Callable[[], object], _member(structure, "get_name"))())
-    feature_text = str(cast(Callable[[], object], _member(features, "to_string"))())
     _validate_caps_values(
-        feature_text,
-        media_type,
+        str(cast(Callable[[], object], _member(features, "to_string"))()),
+        str(cast(Callable[[], object], _member(structure, "get_name"))()),
         int(cast(SupportsInt, get_value("width"))),
         int(cast(SupportsInt, get_value("height"))),
         str(get_value("format")),
         str(get_value("framerate")),
     )
 
-    memory_count = int(
-        cast(SupportsInt, cast(Callable[[], object], _member(buffer, "n_memory"))())
-    )
+
+def _extract_validated_dmabuf_fd(
+    is_dmabuf: Callable[[object], object],
+    is_fd_memory: Callable[[object], object],
+    get_fd: Callable[[object], object],
+    get_video_meta: Callable[[object], object | None],
+    buffer: object,
+) -> int:
+    """Validate every live buffer allocation and video-meta field, returning its fd."""
+
+    memory_count = int(cast(SupportsInt, cast(Callable[[], object], _member(buffer, "n_memory"))()))
     if memory_count != 2:
         raise NativeOverlayContractError("native overlay buffer memory count differs")
     buffer_size = int(
@@ -999,10 +974,18 @@ class GstDmabufOverlayRenderer:
         self._gstvideo = gstvideo
         self._core = core or NativeNv12OverlayCore()
         self._probe_return = _member(_member(gst, "PadProbeReturn"), "OK")
+        probe_types = _member(gst, "PadProbeType")
+        self._buffer_probe_type = _member(probe_types, "BUFFER")
+        self._event_downstream_probe_type = _member(probe_types, "EVENT_DOWNSTREAM")
+        event_types = _member(gst, "EventType")
+        self._caps_event_type = _member(event_types, "CAPS")
+        self._stream_start_event_type = _member(event_types, "STREAM_START")
         self._pad: object | None = None
         self._probe_id: object | None = None
         self._bound_extract_pad: object | None = None
         self._extract_frame: Callable[[object], int] | None = None
+        self._caps_validated = False
+        self._caps_error: BaseException | None = None
         self._condition = Condition()
         self._callbacks_active = 0
         self._closing = False
@@ -1018,7 +1001,9 @@ class GstDmabufOverlayRenderer:
         if pad is None:
             raise NativeOverlayContractError("camera has no source pad for native overlay")
         self._bind_extractors(pad)
-        probe_type = _member(_member(self._gst, "PadProbeType"), "BUFFER")
+        probe_type = cast(Any, self._buffer_probe_type) | cast(
+            Any, self._event_downstream_probe_type
+        )
         probe_id = cast(
             Callable[[object, Callable[..., object]], object],
             _member(pad, "add_probe"),
@@ -1033,10 +1018,7 @@ class GstDmabufOverlayRenderer:
             if pad is not self._bound_extract_pad:
                 raise NativeOverlayContractError("native overlay callback pad identity changed")
             return
-        get_current_caps = cast(
-            Callable[[], object | None],
-            _member(pad, "get_current_caps"),
-        )
+        get_current_caps = cast(Callable[[], object | None], _member(pad, "get_current_caps"))
         is_dmabuf = cast(
             Callable[[object], object],
             _member(self._gstallocators, "is_dmabuf_memory"),
@@ -1055,13 +1037,41 @@ class GstDmabufOverlayRenderer:
         )
         self._extract_frame = partial(
             _extract_validated_dmabuf_fd,
-            get_current_caps,
             is_dmabuf,
             is_fd_memory,
             get_fd,
             get_video_meta,
         )
+        caps = get_current_caps()
+        if caps is not None:
+            _validate_gst_caps(caps)
+            self._caps_validated = True
         self._bound_extract_pad = pad
+
+    def _handle_downstream_event(self, info: object) -> None:
+        # CAPS events and buffers are serialized on this one source pad.  Cache
+        # only the stream-level scalar contract; every buffer still validates
+        # writability, both GstMemory descriptors, fds, sizes and GstVideoMeta.
+        # STREAM_START invalidates an attach-time sticky snapshot until the new
+        # stream's CAPS event arrives.  Any renegotiation likewise emits CAPS
+        # before buffers under the GStreamer pad-event contract.
+        event = cast(Callable[[], object | None], _member(info, "get_event"))()
+        if event is None:
+            raise NativeOverlayContractError("native overlay event probe received no event")
+        event_type = _member(event, "type")
+        if event_type == self._caps_event_type:
+            try:
+                caps = cast(Callable[[], object], _member(event, "parse_caps"))()
+                _validate_gst_caps(caps)
+            except Exception as error:
+                self._caps_validated = False
+                self._caps_error = error
+            else:
+                self._caps_validated = True
+                self._caps_error = None
+        elif event_type == self._stream_start_event_type:
+            self._caps_validated = False
+            self._caps_error = None
 
     def _probe(self, pad: object, info: object) -> object:
         probe_return = self._probe_return
@@ -1070,17 +1080,27 @@ class GstDmabufOverlayRenderer:
                 return probe_return
             self._callbacks_active += 1
         try:
+            probe_type = _member(info, "type")
+            if bool(cast(Any, probe_type) & cast(Any, self._event_downstream_probe_type)):
+                self._handle_downstream_event(info)
+                return probe_return
+            if not bool(cast(Any, probe_type) & cast(Any, self._buffer_probe_type)):
+                raise NativeOverlayContractError("native overlay probe type is unsupported")
             if not self._core.requires_frame_inspection():
                 self._core.note_passthrough_frame()
                 return probe_return
+            if self._caps_error is not None:
+                raise self._caps_error
+            if not self._caps_validated:
+                raise NativeOverlayContractError(
+                    "native overlay has no serialized validated CAPS event"
+                )
             buffer = cast(
                 Callable[[], object | None],
                 _member(info, "get_buffer"),
             )()
             if buffer is None:
-                raise NativeOverlayContractError(
-                    "native overlay buffer probe received no buffer"
-                )
+                raise NativeOverlayContractError("native overlay buffer probe received no buffer")
             extract_frame = self._extract_frame
             if extract_frame is None:
                 raise NativeOverlayContractError("native overlay extractor binding is incomplete")
@@ -1105,11 +1125,7 @@ class GstDmabufOverlayRenderer:
     def close(self, timeout_s: float = 2.0) -> None:
         """Detach first, then close mappings only after every callback exits."""
 
-        if (
-            isinstance(timeout_s, bool)
-            or not isinstance(timeout_s, int | float)
-            or timeout_s <= 0
-        ):
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int | float) or timeout_s <= 0:
             raise NativeOverlayContractError("native overlay close timeout is invalid")
         with self._condition:
             if self._closed:
@@ -1129,9 +1145,7 @@ class GstDmabufOverlayRenderer:
             while self._callbacks_active:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise NativeOverlayContractError(
-                        "native overlay callback shutdown timed out"
-                    )
+                    raise NativeOverlayContractError("native overlay callback shutdown timed out")
                 self._condition.wait(remaining)
             self._closed = True
         self._core.close()

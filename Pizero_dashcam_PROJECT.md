@@ -1524,6 +1524,13 @@ not close Phase 4: the prespecified Section C1 paired ten-clip resource matrix
 and exit gate remain open. Evidence:
 `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md` and
 `docs/test-reports/2026-08-09-milestone9-functional-overlay-live.md`.
+Later serialized-CAPS and canonical-sidecar memoization candidates improved
+the open-sky diagnostics but still failed the strict pre-matrix screen; the
+best had p95 102.9872% and one rollover timestamp-gap drop. Exact profiling
+localized the remaining burst to durable provisional-to-canonical GPS-sidecar
+reconciliation. The Pi was rolled back to accepted dormant `5f95`; Section C1
+and Phase 4 remain open. Evidence:
+`docs/test-reports/2026-08-09-milestone9-rollover-optimization-rejected.md`.
 
 ### Phase 4 — Overlay
 

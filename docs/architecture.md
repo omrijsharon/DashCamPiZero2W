@@ -292,6 +292,15 @@ Phone-preview transport remains open.
   post-warm-up observation. It was rolled back to `5f95`; the source remains
   rejected Git evidence rather than the installed release. See
   `docs/test-reports/2026-08-09-milestone9-fused-validation-rejected.md`.
+  Later serialized-CAPS and frozen-sidecar canonical-byte-cache candidates
+  reduced steady renderer and rollover work but still failed the pre-matrix
+  absolute screen (best p95 102.9872% with one rollover timestamp-gap drop).
+  Exact traces place the remaining burst in the durable GPS-sidecar
+  provisional-to-canonical reconciliation worker, not the GPS-window snapshot.
+  Both candidates were rolled back to dormant `5f95`; next design work must
+  avoid the redundant reconciliation transaction when a trusted anchor already
+  exists while preserving late-lock recovery and catalog durability. Evidence:
+  `docs/test-reports/2026-08-09-milestone9-rollover-optimization-rejected.md`.
 - Comparative acceptance is fixed before the integrated run: paired arms use
   one warm-up plus at least ten one-minute clips and at least 1 Hz samples.
   Each clip must deliver at least 29.9 fps; drops/restarts may not increase;

@@ -96,6 +96,22 @@
   installed directory was recoverably removed; its bundle, Git commit, and
   privacy-safe evidence remain. Evidence:
   `docs/test-reports/2026-08-09-milestone9-fused-validation-rejected.md`.
+- Two later bounded optimizations also remain rejected Git evidence. Serialized
+  stream-CAPS caching from Git `3ff2a03` retained every per-buffer
+  memory/video-meta/FD check but screened at p95 107.9664% with two
+  encoder-input-PTS-gap drops. Frozen-sidecar canonical-byte memoization from
+  Git `80a7832` (release `0.1.0.dev0-909a35988e8b708e`, manifest
+  `e79c4ff1074660d18a3288144a8e84695537a6be5ed85a36dfe114adc7bb75b6`,
+  `SHA256SUMS` `b31df21f5bd5959c1836b48c834262f55d885c9d60b7d2915bf5a1afa99df567`,
+  wheel `c9b7a5d970f83187e911406e4b3143035f6973f03b010740827415539d1b2608`)
+  improved the sole screen to p95 102.9872% but still had one exact
+  61.48-second rollover gap. Candidate two and the formal matrix were not run.
+  Exact rollback restored dormant accepted `5f95`, zero restarts, exact config,
+  and `throttled=0x0`. Profiling identifies the GPS-sidecar durable worker at
+  61--76% CPU for about 1.5 seconds during rollover; GPS-window snapshotting is
+  only about 0.2 ms. Preserve all durability/collision checks and pursue a
+  direct already-anchored finalization path before adding buffering. Evidence:
+  `docs/test-reports/2026-08-09-milestone9-rollover-optimization-rejected.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

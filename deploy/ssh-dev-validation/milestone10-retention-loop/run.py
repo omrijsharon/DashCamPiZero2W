@@ -88,6 +88,9 @@ WORKER_TIMEOUT_S: Final = 900
 EXFAT_IMAGE_BYTES: Final = 480 * 1024**2
 EXT4_IMAGE_BYTES: Final = 64 * 1024**2
 MAX_FILLER_BYTES: Final = 256 * 1024**2
+MAX_FILLER_ALLOCATION_CHUNK_BYTES: Final = 16 * 1024**2
+MAX_FILLER_ALLOCATION_STEPS: Final = 64
+MIN_FILLER_EMERGENCY_GUARD_BYTES: Final = 2 * 1024**2
 ROOT_PRESERVED_FREE_BYTES: Final = 2 * 1024**3
 ROOT_BOUNDED_OVERHEAD_BYTES: Final = 32 * 1024**2
 EXPECTED_ROOT_SOURCE: Final = "/dev/mmcblk0p2"
@@ -457,6 +460,10 @@ def validate_result_evidence(result: Mapping[str, object]) -> None:
         matrices["B"].get("one_pair_per_observation") is True,
         matrices["B"].get("repeated_cycle_count") == 3,
         matrices["B"].get("high_water_stop_bounded") is True,
+        0
+        < cast(int, matrices["B"].get("filler_allocation_steps", 0))
+        <= MAX_FILLER_ALLOCATION_STEPS,
+        0 < cast(int, matrices["B"].get("filler_bytes", 0)) <= MAX_FILLER_BYTES,
         matrices["C"].get("protected_excluded") is True,
         matrices["C"].get("active_lease_excluded") is True,
         matrices["C"].get("pending_mutation_excluded") is True,
@@ -1057,6 +1064,60 @@ def _stat_space(path: Path) -> tuple[int, int]:
     return value.f_blocks * value.f_frsize, value.f_bavail * value.f_frsize
 
 
+def _filler_allocation_increment(
+    *,
+    free_bytes: int,
+    start_bytes: int,
+    emergency_bytes: int,
+    allocation_unit_bytes: int,
+    filler_size_bytes: int,
+) -> int:
+    values = (
+        free_bytes,
+        start_bytes,
+        emergency_bytes,
+        allocation_unit_bytes,
+        filler_size_bytes,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        raise HarnessError("filler allocation inputs are invalid")
+    if (
+        not emergency_bytes < start_bytes <= free_bytes
+        or allocation_unit_bytes <= 0
+        or filler_size_bytes > MAX_FILLER_BYTES
+    ):
+        raise HarnessError("filler allocation thresholds or bounds differ")
+    guard = max(MIN_FILLER_EMERGENCY_GUARD_BYTES, allocation_unit_bytes * 2)
+    target_free = ((start_bytes - 1) // allocation_unit_bytes) * allocation_unit_bytes
+    if target_free <= emergency_bytes + guard:
+        raise HarnessError("filler threshold band cannot preserve the emergency guard")
+    required = free_bytes - target_free
+    remaining = MAX_FILLER_BYTES - filler_size_bytes
+    increment = min(required, remaining, MAX_FILLER_ALLOCATION_CHUNK_BYTES)
+    increment -= increment % allocation_unit_bytes
+    if increment <= 0 or free_bytes - increment <= emergency_bytes + guard:
+        raise HarnessError("filler allocation cannot make safe bounded progress")
+    return increment
+
+
+def _validate_filler_allocation_observation(
+    *,
+    previous_free_bytes: int,
+    free_bytes: int,
+    requested_increment_bytes: int,
+    allocation_unit_bytes: int,
+    emergency_bytes: int,
+) -> None:
+    guard = max(MIN_FILLER_EMERGENCY_GUARD_BYTES, allocation_unit_bytes * 2)
+    observed_drop = previous_free_bytes - free_bytes
+    if (
+        observed_drop <= 0
+        or observed_drop > requested_increment_bytes + allocation_unit_bytes
+        or free_bytes <= emergency_bytes + guard
+    ):
+        raise HarnessError("filler allocation made unsafe free-space progress")
+
+
 def _load_commit_source(archive: Path, expected_members: Mapping[str, object]) -> dict[str, str]:
     for name in tuple(sys.modules):
         if name == "dashcam" or name.startswith("dashcam."):
@@ -1295,6 +1356,7 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
     from dashcam.storage.intents import PairPaths
     from dashcam.storage.naming import finalized_unsynced_clip_pair, provisional_clip_pair
     from dashcam.storage.reclaimer import StorageReclaimer
+    from dashcam.storage.retention import StorageThresholds
 
     filesystem = RootedFilesystem(root)
     unknown = {
@@ -1374,40 +1436,85 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
         deleted: list[str] = []
         observations = 0
         capacity, free = _stat_space(root)
-        start = (capacity * 15 + 99) // 100
-        high = (capacity * 20 + 99) // 100
+        thresholds = StorageThresholds(15, 20, 64 * 1024**2, 32 * 1024**2).resolve(capacity)
+        start = thresholds.start_deletion_below_bytes
+        high = thresholds.stop_deletion_at_bytes
+        emergency = thresholds.emergency_below_bytes
+        space_facts = os.statvfs(root)  # type: ignore[attr-defined]
+        allocation_unit = max(
+            space_facts.f_bsize,
+            space_facts.f_frsize,
+            root.stat().st_blksize,  # type: ignore[attr-defined]
+        )
         filler = root / "windows-camera-roll.bin"
         filler_size = 0
+        filler_steps = 0
         cycle_counts: list[int] = []
-        for _cycle in range(3):
-            with filler.open("ab", buffering=0) as stream:
+        filler_descriptor = os.open(
+            filler,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o640,
+        )
+        try:
+            for _cycle in range(3):
                 while free >= start:
-                    if filler_size + 1024**2 > MAX_FILLER_BYTES:
-                        raise HarnessError("filler reached its hard space bound")
-                    stream.write(b"\xa5" * 1024**2)
-                    filler_size += 1024**2
+                    if filler_steps >= MAX_FILLER_ALLOCATION_STEPS:
+                        raise HarnessError("filler allocation step bound reached")
+                    increment = _filler_allocation_increment(
+                        free_bytes=free,
+                        start_bytes=start,
+                        emergency_bytes=emergency,
+                        allocation_unit_bytes=allocation_unit,
+                        filler_size_bytes=filler_size,
+                    )
+                    previous_free = free
+                    os.posix_fallocate(  # type: ignore[attr-defined]
+                        filler_descriptor, filler_size, increment
+                    )
+                    filler_size += increment
+                    filler_steps += 1
+                    allocated = os.fstat(filler_descriptor)
+                    if (
+                        allocated.st_size != filler_size
+                        or allocated.st_nlink != 1
+                        or allocated.st_blocks * 512 < filler_size  # type: ignore[attr-defined]
+                    ):
+                        raise HarnessError("filler extent is sparse or has invalid identity")
                     capacity_now, free = _stat_space(root)
                     if capacity_now != capacity:
                         raise HarnessError("fixture capacity drifted while filling")
-                os.fsync(stream.fileno())
-            cycle_deleted = 0
-            while True:
-                capacity_now, free = _stat_space(root)
-                observations += 1
-                if capacity_now != capacity:
-                    raise HarnessError("fixture capacity drifted during reclamation")
-                if free >= high:
-                    break
-                if cycle_deleted >= MAX_RECLAIM_STEPS or len(deleted) >= MAX_RECLAIM_STEPS:
-                    raise HarnessError("reclamation step bound reached")
-                step = reclaimer.run_one(boot_id="m10-loop-boot", allow_new=True)
-                if not step.deleted or step.clip_id is None or step.actions_attempted > 2:
-                    raise HarnessError("one-pair reclamation step differs")
-                deleted.append(str(step.clip_id))
-                cycle_deleted += 1
-            if cycle_deleted == 0:
-                raise HarnessError("repeated low/high cycle made no bounded progress")
-            cycle_counts.append(cycle_deleted)
+                    _validate_filler_allocation_observation(
+                        previous_free_bytes=previous_free,
+                        free_bytes=free,
+                        requested_increment_bytes=increment,
+                        allocation_unit_bytes=allocation_unit,
+                        emergency_bytes=emergency,
+                    )
+                os.fsync(filler_descriptor)
+                cycle_deleted = 0
+                while True:
+                    capacity_now, free = _stat_space(root)
+                    observations += 1
+                    if capacity_now != capacity:
+                        raise HarnessError("fixture capacity drifted during reclamation")
+                    if free >= high:
+                        break
+                    if cycle_deleted >= MAX_RECLAIM_STEPS or len(deleted) >= MAX_RECLAIM_STEPS:
+                        raise HarnessError("reclamation step bound reached")
+                    step = reclaimer.run_one(boot_id="m10-loop-boot", allow_new=True)
+                    if not step.deleted or step.clip_id is None or step.actions_attempted > 2:
+                        raise HarnessError("one-pair reclamation step differs")
+                    deleted.append(str(step.clip_id))
+                    cycle_deleted += 1
+                if cycle_deleted == 0:
+                    raise HarnessError("repeated low/high cycle made no bounded progress")
+                cycle_counts.append(cycle_deleted)
+        finally:
+            os.close(filler_descriptor)
         expected = [str(clip.clip_id) for clip in eligible[: len(deleted)]]
         if deleted != expected:
             raise HarnessError("reclamation was not exact oldest-first")
@@ -1440,6 +1547,7 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
             "repeated_cycle_count": len(cycle_counts),
             "high_water_stop_bounded": free >= high,
             "filler_bytes": filler_size,
+            "filler_allocation_steps": filler_steps,
         },
         {
             "passed": True,

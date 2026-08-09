@@ -116,6 +116,8 @@ def _result() -> dict[str, object]:
                 "one_pair_per_observation": True,
                 "repeated_cycle_count": 3,
                 "high_water_stop_bounded": True,
+                "filler_allocation_steps": 12,
+                "filler_bytes": 160 * 1024**2,
             },
             "C": {
                 "passed": True,
@@ -417,6 +419,77 @@ def test_root_postcleanup_requires_same_identity_and_two_gibibyte_reserve() -> N
         harness.validate_root_backing_poststate(before, drifted)
 
 
+def test_filler_allocation_increment_is_aligned_bounded_and_emergency_safe() -> None:
+    mib = 1024**2
+    increment = harness._filler_allocation_increment(
+        free_bytes=150 * mib,
+        start_bytes=72 * mib,
+        emergency_bytes=64 * mib,
+        allocation_unit_bytes=4096,
+        filler_size_bytes=0,
+    )
+    assert increment == 16 * mib
+    assert increment % 4096 == 0
+    assert 150 * mib - increment > 64 * mib
+
+    boundary = harness._filler_allocation_increment(
+        free_bytes=72 * mib,
+        start_bytes=72 * mib,
+        emergency_bytes=64 * mib,
+        allocation_unit_bytes=4096,
+        filler_size_bytes=16 * mib,
+    )
+    assert boundary == 4096
+    assert 72 * mib - boundary > 64 * mib
+
+
+def test_filler_allocation_increment_refuses_exhaustion_and_unsafe_threshold_band() -> None:
+    mib = 1024**2
+    with pytest.raises(harness.HarnessError, match="progress"):
+        harness._filler_allocation_increment(
+            free_bytes=72 * mib,
+            start_bytes=72 * mib,
+            emergency_bytes=64 * mib,
+            allocation_unit_bytes=4096,
+            filler_size_bytes=harness.MAX_FILLER_BYTES,
+        )
+    with pytest.raises(harness.HarnessError, match="emergency guard"):
+        harness._filler_allocation_increment(
+            free_bytes=72 * mib,
+            start_bytes=72 * mib,
+            emergency_bytes=71 * mib,
+            allocation_unit_bytes=mib,
+            filler_size_bytes=0,
+        )
+
+
+def test_filler_observation_allows_one_unit_rounding_and_rejects_drift_or_emergency() -> None:
+    mib = 1024**2
+    harness._validate_filler_allocation_observation(
+        previous_free_bytes=100 * mib,
+        free_bytes=83 * mib,
+        requested_increment_bytes=16 * mib,
+        allocation_unit_bytes=mib,
+        emergency_bytes=32 * mib,
+    )
+    with pytest.raises(harness.HarnessError, match="unsafe"):
+        harness._validate_filler_allocation_observation(
+            previous_free_bytes=100 * mib,
+            free_bytes=83 * mib - 1,
+            requested_increment_bytes=16 * mib,
+            allocation_unit_bytes=mib,
+            emergency_bytes=32 * mib,
+        )
+    with pytest.raises(harness.HarnessError, match="unsafe"):
+        harness._validate_filler_allocation_observation(
+            previous_free_bytes=35 * mib,
+            free_bytes=34 * mib,
+            requested_increment_bytes=mib,
+            allocation_unit_bytes=mib,
+            emergency_bytes=32 * mib,
+        )
+
+
 def test_freeze_bundle_removes_exact_partial_directory_on_verify_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -633,6 +706,9 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "MAX_FILLER_BYTES" in source
     assert "MAX_RECLAIM_STEPS" in source
     assert "os.posix_fallocate" in source
+    assert source.count("os.posix_fallocate") == 2
+    assert "stream.write" not in source
+    assert "allocated.st_blocks * 512 < filler_size" in source
     assert "allocated.st_blocks * 512 < size" in source
     assert 'provisional_clip_pair(boot_id="m10loop", sequence=44)' in source
     assert 'finalized_unsynced_clip_pair(boot_id="m10loop", sequence=44)' in source

@@ -15,6 +15,7 @@ from dashcam.metadata.reconcile import (
     parse_sidecar_bytes,
     parse_sidecar_mapping,
     plan_post_anchor_reconciliation,
+    project_anchored_sidecar,
 )
 from dashcam.metadata.schema import (
     AudioSummary,
@@ -180,6 +181,43 @@ def test_late_gps_anchor_projects_backward_and_creates_recoverable_pair_intent()
     )
     assert len(interrupted.actions) == 1
     assert not interrupted.complete
+
+
+def test_direct_anchor_projection_is_canonical_and_preserves_stable_identity() -> None:
+    sidecar = replace(
+        _unsynced_sidecar(),
+        video_file="boot-876543214321-000123.mp4",
+        metadata_file="boot-876543214321-000123.json",
+    )
+    anchor = _gps_anchor(
+        monotonic_ns=sidecar.start_monotonic_ns + 500_000_000,
+        utc=datetime(2026, 7, 23, 18, 27, 0, 500_999, tzinfo=UTC),
+    )
+
+    anchored = project_anchored_sidecar(
+        sidecar,
+        anchor=anchor,
+        gps_time_state=GpsTimeState.GPS_TIME_VALID,
+        system_clock_state=SystemClockState.UNSET,
+    )
+
+    assert anchored.clip_id == sidecar.clip_id
+    assert anchored.boot_id == sidecar.boot_id
+    assert anchored.sequence == sidecar.sequence
+    assert anchored.video_file == "20260723T182700.000Z_876543214321_s000123.mp4"
+    assert anchored.metadata_file == "20260723T182700.000Z_876543214321_s000123.json"
+    assert anchored.start_utc == datetime(2026, 7, 23, 18, 27, tzinfo=UTC)
+    assert anchored.end_utc == datetime(2026, 7, 23, 18, 28, tzinfo=UTC)
+    assert anchored.start_local == datetime(2026, 7, 23, 21, 27, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    assert anchored.timestamp_quality is TimestampQuality.GPS_ANCHORED
+    assert anchored.time_anchor == replace(
+        anchor,
+        utc=datetime(2026, 7, 23, 18, 27, 0, 500_000, tzinfo=UTC),
+    )
+    assert anchored.gps.samples[0].utc == datetime(2026, 7, 23, 18, 27, 1, tzinfo=UTC)
+    assert anchored.gps.samples[0].timestamp_quality is TimestampQuality.GPS_ANCHORED
+    assert anchored.gps.first_fix_utc == anchored.gps.samples[0].utc
+    assert parse_sidecar_bytes(anchored.to_canonical_json()) == anchored
 
 
 @pytest.mark.parametrize(

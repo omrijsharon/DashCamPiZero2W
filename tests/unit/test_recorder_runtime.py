@@ -67,7 +67,13 @@ from dashcam.recorder.runtime import (
     next_pending_sequence,
     read_short_boot_id,
 )
-from dashcam.state import GpsState, GpsTimeState, StorageState, SystemClockState
+from dashcam.state import (
+    GpsState,
+    GpsTimeState,
+    StorageState,
+    SystemClockState,
+    TimestampQuality,
+)
 from dashcam.storage.preflight import (
     MountFacts,
     PreflightReason,
@@ -319,6 +325,7 @@ class FakeFinalizer:
         default_factory=list
     )
     metadata_attempts: int = 0
+    metadata_candidate_scans: int = 0
 
     def reconcile_pending(self) -> FinalizationRecoveryReport:
         self.reconciled += 1
@@ -339,6 +346,7 @@ class FakeFinalizer:
         after_order: int = -1,
         after_clip_id: UUID | None = None,
     ) -> tuple[MetadataReconciliationCandidate, ...]:
+        self.metadata_candidate_scans += 1
         reconciled = {item[0] for item in self.metadata_reconciliations}
         cursor_id = UUID(int=0) if after_clip_id is None else after_clip_id
         candidates = sorted(
@@ -347,6 +355,7 @@ class FakeFinalizer:
                 for _name, value, retention_order in self.calls
                 if isinstance(value, ClipSidecar)
                 and (sidecar := value).boot_id == expected_boot_id
+                and sidecar.timestamp_quality is TimestampQuality.MONOTONIC_ONLY
                 and sidecar.clip_id not in reconciled
             ),
             key=lambda candidate: (candidate.retention_order, str(candidate.clip_id)),
@@ -385,7 +394,10 @@ class FakeFinalizer:
         gps_time_state: GpsTimeState,
         system_clock_state: SystemClockState,
     ) -> object:
-        assert gps_time_state is GpsTimeState.GPS_TIME_VALID
+        assert gps_time_state in {
+            GpsTimeState.GPS_TIME_VALID,
+            GpsTimeState.GPS_TIME_STALE,
+        }
         assert system_clock_state is SystemClockState.UNSET
         self.metadata_attempts += 1
         if self.metadata_error is not None:
@@ -416,9 +428,11 @@ class FakeGpsService:
     telemetry_issues: tuple[TelemetryWindowIssue, ...] = ()
     telemetry_error: BaseException | None = None
     telemetry_requests: list[tuple[int, int, int]] = field(default_factory=list)
+    snapshot_reads: int = 0
 
     @property
     def snapshot(self) -> GpsSnapshot:
+        self.snapshot_reads += 1
         return self.current_snapshot
 
     def telemetry_window(
@@ -1007,7 +1021,13 @@ def test_finalized_sidecar_captures_one_bounded_half_open_gps_window() -> None:
     run_async(scenario)
 
 
-def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> None:
+@pytest.mark.parametrize(
+    "gps_time_state",
+    [GpsTimeState.GPS_TIME_VALID, GpsTimeState.GPS_TIME_STALE],
+)
+def test_trusted_gps_anchor_finalizes_canonical_sidecar_without_reconciliation(
+    gps_time_state: GpsTimeState,
+) -> None:
     async def scenario() -> None:
         backend = FakeBackend()
         finalizer = FakeFinalizer()
@@ -1015,7 +1035,7 @@ def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> No
             current_snapshot=GpsSnapshot(
                 state=GpsState.NAVIGATION_VALID,
                 connected=True,
-                gps_time_state=GpsTimeState.GPS_TIME_VALID,
+                gps_time_state=gps_time_state,
                 time_anchor=UtcAnchor(
                     monotonic_ns=500_000_000,
                     utc=datetime(2026, 7, 28, 16, 0, tzinfo=UTC),
@@ -1023,9 +1043,12 @@ def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> No
                     uncertainty_ns=250_000_000,
                     provenance="NMEA:GNRMC:active-valid:complete-utc",
                 ),
-            )
+            ),
+            telemetry_samples=(
+                GpsTelemetrySample(500_001_000, 32.1, 34.8, satellites=9),
+            ),
         )
-        boot_uuid = UUID("12345678-1234-5678-9234-567812345678")
+        boot_uuid = UUID("abcdef12-3456-4789-9234-567812345678")
         runtime = GStreamerRecorderRuntime(
             config_path=Path("/etc/dashcam/config.toml"),
             identity_path=Path("/etc/dashcam/storage-volume.env"),
@@ -1038,6 +1061,120 @@ def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> No
             monotonic_ns=lambda: 1_000,
             gps_service_factory=RecordingGpsFactory(gps),
         )
+        config = replace(
+            default_config(),
+            overlay=replace(default_config().overlay, enabled=False),
+        )
+        await runtime.check(config)
+        await runtime.start(config)
+        gps.snapshot_reads = 0
+        await backend.finalized.put(
+            FinalizedFragment(
+                Path("/srv/dashcam/pending/boot-abcdef123456-000000.partial.mp4"),
+                0,
+                1_000_000_000,
+            )
+        )
+        await asyncio.wait_for(finalizer.completed.wait(), timeout=1)
+        for sequence in range(1, 5):
+            await backend.finalized.put(
+                FinalizedFragment(
+                    Path(
+                        "/srv/dashcam/pending/boot-abcdef123456-"
+                        f"{sequence:06d}.partial.mp4"
+                    ),
+                    sequence,
+                    (sequence + 1) * 1_000_000_000,
+                )
+            )
+        await asyncio.wait_for(backend.finalized.join(), timeout=1)
+        sidecar = cast(ClipSidecar, finalizer.calls[0][1])
+        assert sidecar.boot_id == boot_uuid
+        assert sidecar.video_file == (
+            "20260728T155959.500Z_abcdef123456_s000000.mp4"
+        )
+        assert sidecar.metadata_file == (
+            "20260728T155959.500Z_abcdef123456_s000000.json"
+        )
+        assert sidecar.start_utc == datetime(
+            2026, 7, 28, 15, 59, 59, 500_000, tzinfo=UTC
+        )
+        assert sidecar.end_utc == datetime(
+            2026, 7, 28, 16, 0, 0, 500_000, tzinfo=UTC
+        )
+        assert sidecar.start_local is not None
+        assert sidecar.start_local.isoformat() == "2026-07-28T18:59:59.500000+03:00"
+        assert sidecar.timestamp_quality is TimestampQuality.GPS_ANCHORED
+        assert sidecar.gps_time_state is gps_time_state
+        assert sidecar.time_anchor is not None
+        assert sidecar.time_anchor.source is TimeAnchorSource.GPS
+        assert sidecar.time_anchor.monotonic_ns == 500_000_000
+        assert sidecar.time_anchor.utc == datetime(2026, 7, 28, 16, 0, tzinfo=UTC)
+        assert sidecar.gps.first_fix_utc == datetime(
+            2026, 7, 28, 16, 0, tzinfo=UTC
+        )
+        assert sidecar.gps.samples[0].utc == sidecar.gps.first_fix_utc
+        assert sidecar.gps.samples[0].timestamp_quality is TimestampQuality.GPS_ANCHORED
+        assert parse_sidecar_bytes(sidecar.to_canonical_json()) == sidecar
+        assert len(finalizer.calls) == 5
+        direct_sidecars = [cast(ClipSidecar, item[1]) for item in finalizer.calls]
+        assert len({item.clip_id for item in direct_sidecars}) == 5
+        assert all(
+            item.timestamp_quality is TimestampQuality.GPS_ANCHORED
+            for item in direct_sidecars
+        )
+        assert finalizer.metadata_reconciliations == []
+        assert finalizer.metadata_attempts == 0
+        # Exactly one coherent immutable snapshot is read per fragment close;
+        # the projection never mixes anchor and state from different reads.
+        assert gps.snapshot_reads == 5
+        assert runtime.runtime_snapshot()["metadata_reconciliation"] == {
+            "completed": 0,
+            "failures": 0,
+            "last_error": None,
+            "backlog": 0,
+            "overflows": 0,
+            "retrying": 0,
+            "parked": 0,
+        }
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_incoherent_close_anchor_falls_back_to_provisional_then_late_reconciles() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer()
+        anchor = UtcAnchor(
+            monotonic_ns=500_000_000,
+            utc=datetime(2026, 7, 28, 16, 0, tzinfo=UTC),
+            source=AnchorSource.GPS_RMC_VALID,
+            uncertainty_ns=250_000_000,
+            provenance="NMEA:GNRMC:active-valid:complete-utc",
+        )
+        gps = FakeGpsService(
+            current_snapshot=GpsSnapshot(
+                state=GpsState.RECEIVING_INVALID,
+                connected=True,
+                gps_time_state=GpsTimeState.UNSYNCED,
+                time_anchor=anchor,
+            )
+        )
+        boot_uuid = UUID("abcdef12-3456-4789-9234-567812345678")
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: boot_uuid,
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            monotonic_ns=lambda: 1_000,
+            gps_service_factory=RecordingGpsFactory(gps),
+            limits=RuntimeLimits(metadata_reconciliation_interval_s=120),
+        )
         config = default_config()
         await runtime.check(config)
         await runtime.start(config)
@@ -1048,25 +1185,42 @@ def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> No
                 1_000_000_000,
             )
         )
-        while (
-            cast(
-                int,
-                cast(
-                    dict[str, object],
-                    runtime.runtime_snapshot()["metadata_reconciliation"],
-                )["completed"],
-            )
-            == 0
-        ):
+        await asyncio.wait_for(backend.finalized.join(), timeout=1)
+        while runtime._metadata_reconciliation_wakeup.is_set():
             await asyncio.sleep(0)
 
-        clip_id, anchor, observed_boot = finalizer.metadata_reconciliations[0]
-        sidecar = cast(ClipSidecar, finalizer.calls[0][1])
-        assert clip_id == sidecar.clip_id
-        assert observed_boot == boot_uuid
-        assert anchor.source is TimeAnchorSource.GPS
-        assert anchor.monotonic_ns == 500_000_000
-        assert anchor.utc == datetime(2026, 7, 28, 16, 0, tzinfo=UTC)
+        provisional = cast(ClipSidecar, finalizer.calls[0][1])
+        assert provisional.timestamp_quality is TimestampQuality.MONOTONIC_ONLY
+        assert provisional.video_file == "boot-abcdef123456-000000.mp4"
+        assert runtime.runtime_snapshot()["metadata_reconciliation"] == {
+            "completed": 0,
+            "failures": 0,
+            "last_error": None,
+            "backlog": 1,
+            "overflows": 0,
+            "retrying": 0,
+            "parked": 0,
+        }
+        assert finalizer.metadata_candidate_scans == 0
+        assert finalizer.metadata_attempts == 0
+        assert finalizer.metadata_reconciliations == []
+
+        gps.current_snapshot = GpsSnapshot(
+            state=GpsState.NAVIGATION_VALID,
+            connected=True,
+            gps_time_state=GpsTimeState.GPS_TIME_VALID,
+            time_anchor=anchor,
+        )
+        runtime._metadata_reconciliation_wakeup.set()
+        while cast(
+            dict[str, object],
+            runtime.runtime_snapshot()["metadata_reconciliation"],
+        )["completed"] == 0:
+            await asyncio.sleep(0)
+
+        assert finalizer.metadata_reconciliations[0][0] == provisional.clip_id
+        assert finalizer.metadata_candidate_scans == 1
+        assert finalizer.metadata_attempts == 1
         assert runtime.runtime_snapshot()["metadata_reconciliation"] == {
             "completed": 1,
             "failures": 0,
@@ -1081,12 +1235,18 @@ def test_trusted_gps_anchor_triggers_stable_uuid_metadata_reconciliation() -> No
     run_async(scenario)
 
 
-def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog() -> None:
+@pytest.mark.parametrize(
+    "gps_time_state",
+    [GpsTimeState.GPS_TIME_VALID, GpsTimeState.GPS_TIME_STALE],
+)
+def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog(
+    gps_time_state: GpsTimeState,
+) -> None:
     async def scenario() -> None:
         backend = FakeBackend()
         finalizer = FakeFinalizer()
         gps = FakeGpsService()
-        boot_uuid = UUID("12345678-1234-5678-9234-567812345678")
+        boot_uuid = UUID("abcdef12-3456-4789-9234-567812345678")
         runtime = GStreamerRecorderRuntime(
             config_path=Path("/etc/dashcam/config.toml"),
             identity_path=Path("/etc/dashcam/storage-volume.env"),
@@ -1126,7 +1286,7 @@ def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog() -> None:
         gps.current_snapshot = GpsSnapshot(
             state=GpsState.NAVIGATION_VALID,
             connected=True,
-            gps_time_state=GpsTimeState.GPS_TIME_VALID,
+            gps_time_state=gps_time_state,
             time_anchor=UtcAnchor(
                 monotonic_ns=500_000_000,
                 utc=datetime(2026, 7, 28, 16, 0, tzinfo=UTC),
@@ -1157,26 +1317,18 @@ def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog() -> None:
                 2_000_000_000,
             )
         )
-        while (
-            cast(
-                int,
-                cast(
-                    dict[str, object],
-                    runtime.runtime_snapshot()["metadata_reconciliation"],
-                )["completed"],
-            )
-            < 2
-        ):
+        while len(finalizer.calls) < 2:
             await asyncio.sleep(0)
 
         second_sidecar = cast(ClipSidecar, finalizer.calls[1][1])
         assert [item[0] for item in finalizer.metadata_reconciliations] == [
             first_sidecar.clip_id,
-            second_sidecar.clip_id,
         ]
+        assert second_sidecar.timestamp_quality is TimestampQuality.GPS_ANCHORED
+        assert second_sidecar.clip_id != first_sidecar.clip_id
         assert all(item[2] == boot_uuid for item in finalizer.metadata_reconciliations)
         assert runtime.runtime_snapshot()["metadata_reconciliation"] == {
-            "completed": 2,
+            "completed": 1,
             "failures": 0,
             "last_error": None,
             "backlog": 0,

@@ -254,6 +254,22 @@ def _unsynced_sidecar() -> ClipSidecar:
     )
 
 
+def _gps_sidecar() -> ClipSidecar:
+    return replace(
+        _sidecar(),
+        gps_time_state=GpsTimeState.GPS_TIME_VALID,
+        system_clock_state=SystemClockState.UNSET,
+        timestamp_quality=TimestampQuality.GPS_ANCHORED,
+        time_anchor=TimeAnchor(
+            source=TimeAnchorSource.GPS,
+            monotonic_ns=10_000,
+            utc=START_UTC,
+            uncertainty_ns=250_000_000,
+            provenance="NMEA:GNRMC:active-valid:complete-utc",
+        ),
+    )
+
+
 def _root(tmp_path: Path) -> Path:
     root = tmp_path / "recording"
     for directory in ("pending", "clips", "protected", "quarantine"):
@@ -281,6 +297,14 @@ def _finalize(finalizer: RecorderClipFinalizer) -> FinalizationOutcome:
     return finalizer.finalize(
         provisional_video_name=SOURCE_NAME,
         sidecar=_sidecar(),
+        retention_order=10_000,
+    )
+
+
+def _finalize_gps(finalizer: RecorderClipFinalizer) -> FinalizationOutcome:
+    return finalizer.finalize(
+        provisional_video_name=SOURCE_NAME,
+        sidecar=_gps_sidecar(),
         retention_order=10_000,
     )
 
@@ -389,6 +413,22 @@ def test_case_insensitive_target_collision_refuses_before_intent(tmp_path: Path)
     assert not filesystem.exists(f"pending/{STAGED_SIDECAR}")
 
 
+def test_direct_gps_anchored_collision_refuses_before_any_mutation(tmp_path: Path) -> None:
+    finalizer, catalog, filesystem, events = _components(tmp_path)
+    collision = filesystem.root / "clips" / TARGET_SIDECAR.upper()
+    collision.write_bytes(b"existing canonical evidence")
+
+    with pytest.raises(FinalizationRefused, match="case-insensitive"):
+        _finalize_gps(finalizer)
+
+    assert catalog.clips == {}
+    assert catalog.intents == {}
+    assert events == []
+    assert filesystem.exists(f"pending/{SOURCE_NAME}")
+    assert not filesystem.exists(f"pending/{STAGED_SIDECAR}")
+    assert collision.read_bytes() == b"existing canonical evidence"
+
+
 def test_catalog_commit_failure_leaves_durable_pending_pair_and_retry_converges(
     tmp_path: Path,
 ) -> None:
@@ -434,6 +474,31 @@ def test_crash_after_video_move_resumes_only_sidecar_move(tmp_path: Path) -> Non
     assert outcome.complete
     assert outcome.actions_attempted == 1
     assert filesystem.exists(f"clips/{TARGET_SIDECAR}")
+
+
+def test_direct_gps_anchored_one_member_crash_replays_same_canonical_pair(
+    tmp_path: Path,
+) -> None:
+    finalizer, catalog, filesystem, _events = _components(tmp_path)
+    filesystem.fail_after_move = 1
+
+    with pytest.raises(InjectedCrash, match="after rename"):
+        _finalize_gps(finalizer)
+    intent_id = catalog.list_pending_intents(limit=1)[0].intent_id
+    assert filesystem.exists(f"clips/{TARGET_VIDEO}")
+    assert filesystem.exists(f"pending/{STAGED_SIDECAR}")
+    staged = filesystem.read_bytes(f"pending/{STAGED_SIDECAR}", maximum_bytes=1_048_576)
+    assert parse_sidecar_bytes(staged) == _gps_sidecar()
+
+    outcome = _finalize_gps(finalizer)
+
+    assert outcome.complete
+    assert outcome.resumed
+    assert outcome.intent_id == intent_id
+    assert outcome.actions_attempted == 1
+    durable = filesystem.read_bytes(f"clips/{TARGET_SIDECAR}", maximum_bytes=1_048_576)
+    assert parse_sidecar_bytes(durable) == _gps_sidecar()
+    assert catalog.get_clip(CLIP_ID).pair_reconciled
 
 
 def test_crash_after_both_moves_completes_catalog_without_another_move(tmp_path: Path) -> None:

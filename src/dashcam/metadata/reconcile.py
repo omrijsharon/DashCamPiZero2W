@@ -252,13 +252,64 @@ def plan_post_anchor_reconciliation(
     ):
         raise MetadataReconciliationError("created_monotonic_ns must be a non-negative integer")
 
-    parsed_source = parse_clip_filename(sidecar.video_file)
+    reconciled = project_anchored_sidecar(
+        sidecar,
+        anchor=anchor,
+        existing_names=existing_names,
+        gps_time_state=gps_time_state,
+        system_clock_state=system_clock_state,
+    )
+    if reconciled is sidecar:
+        return MetadataReconciliationPlan(sidecar, None, True)
+
+    try:
+        intent = OperationIntent(
+            intent_id=intent_id,
+            clip_id=sidecar.clip_id,
+            kind=IntentKind.RECONCILE_NAME,
+            created_monotonic_ns=created_monotonic_ns,
+            paths=PairPaths(
+                video_source=f"{directory}/{sidecar.video_file}",
+                sidecar_source=f"{directory}/{sidecar.metadata_file}",
+                video_target=f"{directory}/{reconciled.video_file}",
+                sidecar_target=f"{directory}/{reconciled.metadata_file}",
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise MetadataReconciliationError(f"invalid reconciliation intent: {exc}") from exc
+    return MetadataReconciliationPlan(reconciled, intent, False)
+
+
+def project_anchored_sidecar(
+    sidecar: ClipSidecar,
+    *,
+    anchor: TimeAnchor,
+    existing_names: Set[str] = frozenset(),
+    gps_time_state: GpsTimeState | None = None,
+    system_clock_state: SystemClockState | None = None,
+) -> ClipSidecar:
+    """Project a trusted anchor into one immutable canonical sidecar.
+
+    This is the pure conversion shared by direct close-time finalization and
+    durable late-lock reconciliation.  It deliberately performs no filesystem
+    work; the caller's existing transaction remains responsible for collision
+    refusal, no-replace moves, and replay.
+    """
+
+    if not isinstance(sidecar, ClipSidecar):
+        raise MetadataReconciliationError("sidecar must be a ClipSidecar")
+    if not isinstance(anchor, TimeAnchor):
+        raise MetadataReconciliationError("anchor must be a TimeAnchor")
+    try:
+        parsed_source = parse_clip_filename(sidecar.video_file)
+    except ClipNameError as exc:
+        raise MetadataReconciliationError("clip filename identity is invalid") from exc
     if parsed_source.boot_id != sidecar.boot_id.hex[:12]:
         raise MetadataReconciliationError(
             "filename boot token does not match the sidecar boot UUID"
         )
     if not parsed_source.provisional:
-        return MetadataReconciliationPlan(sidecar, None, True)
+        return sidecar
 
     quality = _quality_for_anchor(anchor)
     resolved_gps_state, resolved_system_state = _resolved_clock_states(
@@ -267,8 +318,9 @@ def plan_post_anchor_reconciliation(
         gps_time_state=gps_time_state,
         system_clock_state=system_clock_state,
     )
-    start_utc = _project_utc(anchor, sidecar.start_monotonic_ns)
-    end_utc = _project_utc(anchor, sidecar.end_monotonic_ns)
+    canonical_anchor = replace(anchor, utc=_canonical_millisecond(anchor.utc))
+    start_utc = _canonical_millisecond(_project_utc(anchor, sidecar.start_monotonic_ns))
+    end_utc = _canonical_millisecond(_project_utc(anchor, sidecar.end_monotonic_ns))
     local_outcome = to_local_time(start_utc, sidecar.timezone)
     if not local_outcome.ok or local_outcome.local is None:
         error = local_outcome.error.value if local_outcome.error is not None else "UNKNOWN"
@@ -287,7 +339,7 @@ def plan_post_anchor_reconciliation(
     samples = tuple(
         replace(
             sample,
-            utc=_project_utc(anchor, sample.monotonic_ns),
+            utc=_canonical_millisecond(_project_utc(anchor, sample.monotonic_ns)),
             timestamp_quality=quality,
         )
         for sample in sidecar.gps.samples
@@ -309,29 +361,13 @@ def plan_post_anchor_reconciliation(
         gps_time_state=resolved_gps_state,
         system_clock_state=resolved_system_state,
         timestamp_quality=quality,
-        time_anchor=anchor,
+        time_anchor=canonical_anchor,
         start_local=local_outcome.local.datetime,
         gps=replace(sidecar.gps, first_fix_utc=first_fix_utc, samples=samples),
     )
     if reconciled.clip_id != sidecar.clip_id:
-        raise MetadataReconciliationError("reconciliation changed the stable clip UUID")
-
-    try:
-        intent = OperationIntent(
-            intent_id=intent_id,
-            clip_id=sidecar.clip_id,
-            kind=IntentKind.RECONCILE_NAME,
-            created_monotonic_ns=created_monotonic_ns,
-            paths=PairPaths(
-                video_source=f"{directory}/{sidecar.video_file}",
-                sidecar_source=f"{directory}/{sidecar.metadata_file}",
-                video_target=f"{directory}/{target_pair.video_name}",
-                sidecar_target=f"{directory}/{target_pair.metadata_name}",
-            ),
-        )
-    except (TypeError, ValueError) as exc:
-        raise MetadataReconciliationError(f"invalid reconciliation intent: {exc}") from exc
-    return MetadataReconciliationPlan(reconciled, intent, False)
+        raise MetadataReconciliationError("anchor projection changed the stable clip UUID")
+    return reconciled
 
 
 def _parse_anchor(value: object) -> TimeAnchor | None:
@@ -560,3 +596,7 @@ def _project_utc(anchor: TimeAnchor, monotonic_ns: int) -> datetime:
         return anchor.utc + timedelta(seconds=seconds, microseconds=nanoseconds // 1_000)
     except OverflowError as exc:
         raise MetadataReconciliationError("anchor projection exceeds datetime range") from exc
+
+
+def _canonical_millisecond(value: datetime) -> datetime:
+    return value.replace(microsecond=(value.microsecond // 1_000) * 1_000)

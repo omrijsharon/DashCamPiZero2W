@@ -32,6 +32,7 @@ from dashcam.gps.telemetry import (
     GpsTelemetryWindow,
 )
 from dashcam.metadata.coordinator import MetadataReconciliationRefused
+from dashcam.metadata.reconcile import project_anchored_sidecar
 from dashcam.metadata.schema import (
     MAX_GPS_SAMPLES,
     AudioSummary,
@@ -1123,6 +1124,36 @@ class GStreamerRecorderRuntime:
         )
         return GpsSummary(bool(samples), None, samples), warnings
 
+    def _project_close_time_anchor(self, sidecar: ClipSidecar) -> ClipSidecar:
+        """Best-effort close-time projection through the shared strict model."""
+
+        service = self._gps_service
+        if service is None:
+            return sidecar
+        try:
+            snapshot = service.snapshot
+            if not isinstance(snapshot, GpsSnapshot) or snapshot.time_anchor is None:
+                return sidecar
+            accepted = snapshot.time_anchor
+            anchor = TimeAnchor(
+                source=TimeAnchorSource.GPS,
+                monotonic_ns=accepted.monotonic_ns,
+                utc=accepted.utc,
+                uncertainty_ns=accepted.uncertainty_ns,
+                provenance=accepted.provenance,
+            )
+            return project_anchored_sidecar(
+                sidecar,
+                anchor=anchor,
+                gps_time_state=snapshot.gps_time_state,
+                system_clock_state=SystemClockState.UNSET,
+            )
+        except Exception:
+            # GPS metadata is optional to media durability.  Any invalid or
+            # unprojectable observation retains the established provisional
+            # path so a later accepted anchor can reconcile it recoverably.
+            return sidecar
+
     def _gps_task_finished(self, task: asyncio.Task[None]) -> None:
         """Consume optional-task completion without perturbing media supervision."""
 
@@ -1819,6 +1850,7 @@ class GStreamerRecorderRuntime:
                 software_version=get_version(),
                 warnings=warnings,
             )
+            sidecar = self._project_close_time_anchor(sidecar)
             retention_order = await asyncio.to_thread(finalizer.next_retention_order)
             await self._durable_worker(
                 finalizer.finalize,
@@ -1827,11 +1859,12 @@ class GStreamerRecorderRuntime:
                 retention_order=retention_order,
                 deadline_detail="clip finalization exceeded its deadline",
             )
-            if len(self._metadata_reconciliation_hints) < _MAX_METADATA_TRACKED:
-                self._metadata_reconciliation_hints.add(sidecar.clip_id)
-            else:
-                self._metadata_reconciliation_overflows += 1
-            self._metadata_reconciliation_wakeup.set()
+            if sidecar.timestamp_quality is TimestampQuality.MONOTONIC_ONLY:
+                if len(self._metadata_reconciliation_hints) < _MAX_METADATA_TRACKED:
+                    self._metadata_reconciliation_hints.add(sidecar.clip_id)
+                else:
+                    self._metadata_reconciliation_overflows += 1
+                self._metadata_reconciliation_wakeup.set()
             if explicit_start_running_ns is None:
                 self._next_fragment_start_running_ns = fragment.running_time_ns
             stable_duration_ns = max(config.video.clip_duration_s - 1, 1) * 1_000_000_000
@@ -1887,7 +1920,7 @@ class GStreamerRecorderRuntime:
             return
         snapshot = service.snapshot
         accepted = snapshot.time_anchor
-        if accepted is None:
+        if accepted is None or snapshot.gps_time_state is GpsTimeState.UNSYNCED:
             return
         anchor = TimeAnchor(
             source=TimeAnchorSource.GPS,

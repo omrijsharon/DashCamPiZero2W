@@ -418,6 +418,71 @@ def test_crash_fixture_mount_refuses_active_or_non_owned_source(
         )
 
 
+def test_mount_options_add_nodiscard_only_for_ext4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = Path("/dev/loop7")
+    image = Path("/var/tmp/private-fixture.img")
+    target = Path("/var/tmp/private-mount")
+    commands: list[tuple[str, ...]] = []
+    current_filesystem = ""
+
+    monkeypatch.setattr(harness, "_require_owned_loop", lambda _loop, _image: None)
+    monkeypatch.setattr(
+        harness,
+        "_run",
+        lambda command, **_kwargs: commands.append(tuple(command)),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_blkid",
+        lambda _loop: {
+            "DEVNAME": str(loop),
+            "UUID": "ABCD-1234",
+            "TYPE": current_filesystem,
+            "LABEL": "FIXTURE",
+        },
+    )
+    monkeypatch.setattr(
+        harness,
+        "_findmnt",
+        lambda _target: {
+            "source": str(loop),
+            "target": str(target),
+            "fstype": current_filesystem,
+            "uuid": "ABCD-1234",
+            "label": "FIXTURE",
+            "options": "rw",
+        },
+    )
+
+    current_filesystem = "exfat"
+    harness._mount_loop(loop, image, target, current_filesystem)
+    current_filesystem = "ext4"
+    harness._mount_loop(loop, image, target, current_filesystem)
+
+    assert commands == [
+        (
+            harness.MOUNT,
+            "-t",
+            "exfat",
+            "-o",
+            "rw,nosuid,nodev,noexec,noatime,uid=0,gid=0,fmask=0137,dmask=0027",
+            str(loop),
+            str(target),
+        ),
+        (
+            harness.MOUNT,
+            "-t",
+            "ext4",
+            "-o",
+            "rw,nosuid,nodev,noexec,noatime,nodiscard",
+            str(loop),
+            str(target),
+        ),
+    ]
+
+
 def test_crash_fixture_allocation_refusals_have_four_distinct_private_lines() -> None:
     metadata_cases = (
         SimpleNamespace(
@@ -1314,9 +1379,24 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
         '                "M10CAT",'
     )
     assert ext4_format in source
-    assert source.index(ext4_format) < source.index(
+    pre_mount_check = source.index(
         "_require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)"
-    ) < source.index("_mount_loop(ext4_loop, ext4_image, catalog_mount, \"ext4\")")
+    )
+    first_mount = source.index('_mount_loop(ext4_loop, ext4_image, catalog_mount, "ext4")')
+    first_post_mount_check = source.index(
+        "_require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)",
+        first_mount,
+    )
+    second_mount = source.index(
+        '_mount_loop(ext4_loop, ext4_image, catalog_mount, "ext4")',
+        first_mount + 1,
+    )
+    second_post_mount_check = source.index(
+        "_require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)",
+        second_mount,
+    )
+    assert source.index(ext4_format) < pre_mount_check < first_mount < first_post_mount_check
+    assert first_post_mount_check < second_mount < second_post_mount_check
     assert "stream.write" not in source
     assert "allocated.st_blocks * 512 < filler_size" in source
     assert "allocated.st_blocks * 512 < size" in source
@@ -1338,6 +1418,7 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "64 MiB loop-backed ext4" in readme
     assert "at least 2 GiB" in readme
     assert "`-E nodiscard`" in readme
+    assert "mounted with explicit `nodiscard`" in readme
     assert "production_release_tested=false" in readme
     assert "physical_power_loss_tested=false" in readme
     assert "m10_exit_gate_closed=false" in readme

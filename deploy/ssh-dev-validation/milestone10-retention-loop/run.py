@@ -1175,6 +1175,10 @@ def _mount_loop(loop: Path, image: Path, target: Path, filesystem: str) -> dict[
     options = "rw,nosuid,nodev,noexec,noatime"
     if filesystem == "exfat":
         options += ",uid=0,gid=0,fmask=0137,dmask=0027"
+    elif filesystem == "ext4":
+        options += ",nodiscard"
+    else:
+        raise HarnessError("disposable filesystem type differs")
     _run((MOUNT, "-t", filesystem, "-o", options, str(loop), str(target)))
     facts = _blkid(loop)
     row = _findmnt(target)
@@ -2545,6 +2549,8 @@ def _worker(arguments: argparse.Namespace) -> int:
         mounted_exfat = True
         ext4_facts = _mount_loop(ext4_loop, ext4_image, catalog_mount, "ext4")
         mounted_ext4 = True
+        _require_owned_loop(ext4_loop, ext4_image)
+        _require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)
         for directory in ("pending", "clips", "protected", "quarantine"):
             (RECORDING_ROOT / directory).mkdir(mode=0o750)
         provenance = _load_commit_source(
@@ -2584,6 +2590,8 @@ def _worker(arguments: argparse.Namespace) -> int:
         mounted_exfat = True
         ext4_facts_after = _mount_loop(ext4_loop, ext4_image, catalog_mount, "ext4")
         mounted_ext4 = True
+        _require_owned_loop(ext4_loop, ext4_image)
+        _require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)
         if exfat_facts_after != exfat_facts or ext4_facts_after != ext4_facts:
             raise HarnessError("filesystem identity drifted across fsck/remount")
         matrices["F"] = {

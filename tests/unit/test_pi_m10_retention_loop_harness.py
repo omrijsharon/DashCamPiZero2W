@@ -418,39 +418,64 @@ def test_crash_fixture_mount_refuses_active_or_non_owned_source(
         )
 
 
-def test_crash_fixture_mount_refusal_reports_only_its_exact_reviewed_line() -> None:
-    class InvalidImage:
-        @staticmethod
-        def stat() -> object:
-            return SimpleNamespace(
-                st_mode=stat.S_IFREG | 0o600,
-                st_nlink=2,
-                st_size=4096,
-                st_blocks=8,
+def test_crash_fixture_allocation_refusals_have_four_distinct_private_lines() -> None:
+    metadata_cases = (
+        SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_nlink=1,
+            st_size=4096,
+            st_blocks=8,
+        ),
+        SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=2,
+            st_size=4096,
+            st_blocks=8,
+        ),
+        SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=1,
+            st_size=4095,
+            st_blocks=8,
+        ),
+        SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=1,
+            st_size=4096,
+            st_blocks=7,
+        ),
+    )
+    lines: set[int] = set()
+    reviewed = harness._reviewed_function_lines()["validate_crash_fixture_mount"]
+
+    for metadata in metadata_cases:
+        image = SimpleNamespace(stat=lambda metadata=metadata: metadata)
+        try:
+            harness._validate_crash_fixture_mount(
+                Path("/private/catalog-mount"),
+                cast(Any, image),
+                expected_size=4096,
+                filesystem="ext4",
+                label="M10CAT",
             )
+        except harness.HarnessError as error:
+            payload = harness._worker_refusal_line(error)
+        else:
+            pytest.fail("invalid backing allocation unexpectedly passed")
 
-    try:
-        harness._validate_crash_fixture_mount(
-            Path("/private/catalog-mount"),
-            cast(Any, InvalidImage()),
-            expected_size=4096,
-            filesystem="ext4",
-            label="M10CAT",
-        )
-    except harness.HarnessError as error:
-        payload = harness._worker_refusal_line(error)
-    else:
-        pytest.fail("invalid backing allocation unexpectedly passed")
+        match = harness.WORKER_REFUSAL_RE.fullmatch(payload)
+        assert match is not None
+        assert match.group(1) == b"HARNESS"
+        assert match.group(2) == b"validate_crash_fixture_mount"
+        line = int(match.group(3))
+        assert line in reviewed
+        assert harness._safe_worker_refusal_detail(payload) == payload[:-1].decode("ascii")
+        assert b"private" not in payload
+        assert b"catalog" not in payload
+        assert b"M10CAT" not in payload
+        lines.add(line)
 
-    match = harness.WORKER_REFUSAL_RE.fullmatch(payload)
-    assert match is not None
-    assert match.group(1) == b"HARNESS"
-    assert match.group(2) == b"validate_crash_fixture_mount"
-    line = int(match.group(3))
-    assert line in harness._reviewed_function_lines()["validate_crash_fixture_mount"]
-    assert b"private" not in payload
-    assert b"catalog" not in payload
-    assert b"M10CAT" not in payload
+    assert len(lines) == 4
 
     forged = (
         f"REFUSED: H_HARNESS_Fvalidate_crash_fixture_mount_L"

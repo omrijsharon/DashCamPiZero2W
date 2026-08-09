@@ -1406,13 +1406,14 @@ def _validate_crash_fixture_mount(
     label: str,
 ) -> None:
     image_metadata = image.stat()
-    if (
-        not stat.S_ISREG(image_metadata.st_mode)
-        or image_metadata.st_nlink != 1
-        or image_metadata.st_size != expected_size
-        or image_metadata.st_blocks * 512 < expected_size  # type: ignore[attr-defined]
-    ):
-        raise HarnessError("crash-cell backing image allocation differs")
+    if not stat.S_ISREG(image_metadata.st_mode):
+        raise HarnessError("crash-cell backing image is not regular")
+    if image_metadata.st_nlink != 1:
+        raise HarnessError("crash-cell backing image link count differs")
+    if image_metadata.st_size != expected_size:
+        raise HarnessError("crash-cell backing image size differs")
+    if image_metadata.st_blocks * 512 < expected_size:  # type: ignore[attr-defined]
+        raise HarnessError("crash-cell backing image is not fully allocated")
     row = _findmnt(target)
     if row is None or not isinstance(row.get("source"), str):
         raise HarnessError("crash-cell fixture mount is absent")

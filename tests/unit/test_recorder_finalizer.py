@@ -13,6 +13,7 @@ from dashcam.catalog.filesystem import CatalogFilesystem
 from dashcam.catalog.models import (
     CatalogClip,
     ClipNotFoundError,
+    EventSource,
     IntentReconciliationResult,
 )
 from dashcam.metadata.reconcile import MetadataReconciliationPlan, parse_sidecar_bytes
@@ -151,6 +152,22 @@ class FakePromotionCatalog:
             for intent in self.list_pending_intents(limit=limit)
             if intent.kind is IntentKind.DELETE
         )
+
+    def list_pending_intents_by_kind(
+        self,
+        *,
+        kinds: tuple[IntentKind, ...],
+        limit: int,
+    ) -> tuple[OperationIntent, ...]:
+        values = sorted(
+            (
+                intent
+                for intent_id, intent in self.intents.items()
+                if intent_id not in self.complete and intent.kind in kinds
+            ),
+            key=lambda intent: (intent.created_monotonic_ns, str(intent.intent_id)),
+        )
+        return tuple(values[:limit])
 
     def prepare_oldest_eligible_delete(
         self,
@@ -571,3 +588,239 @@ def test_collision_scan_bound_refuses_without_registration(tmp_path: Path) -> No
         _finalize(finalizer)
 
     assert catalog.clips == {}
+
+
+def _protection_clip(number: int, *, protected: bool = False) -> CatalogClip:
+    directory = "protected" if protected else "clips"
+    return CatalogClip(
+        clip_id=UUID(int=number),
+        lifecycle=ClipLifecycle.FINALIZED,
+        video_path=f"{directory}/protection-{number}.mp4",
+        sidecar_path=f"{directory}/protection-{number}.json",
+        start_monotonic_ns=number * 100,
+        end_monotonic_ns=number * 100 + 50,
+        retention_order=number,
+        size_bytes=100,
+        protected=protected,
+        protection_reason="fixture" if protected else None,
+        pair_reconciled=True,
+        managed=True,
+    )
+
+
+def _write_protection_pair(root: Path, clip: CatalogClip) -> None:
+    (root / clip.video_path).write_bytes(b"video")
+    (root / clip.sidecar_path).write_bytes(b"sidecar")
+
+
+def _real_finalizer(
+    root: Path,
+    catalog: ClipCatalog,
+    filesystem: InstrumentedFilesystem,
+    *,
+    limits: FinalizerLimits | None = None,
+) -> RecorderClipFinalizer:
+    ticks = iter(range(1_000, 10_000))
+    return RecorderClipFinalizer(
+        catalog=catalog,
+        filesystem=filesystem,
+        monotonic_ns=lambda: next(ticks),
+        limits=limits,
+    )
+
+
+def test_protect_intent_replays_before_moves_and_across_one_member_crash(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    events: list[str] = []
+    filesystem = InstrumentedFilesystem(root, events)
+    clip = _protection_clip(1)
+    _write_protection_pair(root, clip)
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(clip, catalog_now_ns=1)
+        intent_id = catalog.prepare_protect(
+            clip.clip_id,
+            reason="event",
+            monotonic_now_ns=2,
+        )
+        assert intent_id is not None
+        assert filesystem.moves == 0
+        filesystem.fail_after_move = 1
+        finalizer = _real_finalizer(root, catalog, filesystem)
+
+        with pytest.raises(InjectedCrash, match="after rename"):
+            finalizer.reconcile_pending()
+        assert (
+            catalog.list_pending_intents_by_kind(kinds=(IntentKind.PROTECT,), limit=1)[0].intent_id
+            == intent_id
+        )
+        assert filesystem.moves == 1
+
+        report = finalizer.reconcile_pending()
+        recovered = catalog.get_clip(clip.clip_id)
+        assert report.completed == 1 and not report.more_work
+        assert recovered.protected and recovered.pair_reconciled
+        assert recovered.video_path.startswith("protected/")
+
+
+def test_protect_replay_completes_catalog_when_both_members_already_moved(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    filesystem = InstrumentedFilesystem(root, [])
+    clip = _protection_clip(1)
+    _write_protection_pair(root, clip)
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(clip, catalog_now_ns=1)
+        intent_id = catalog.prepare_protect(
+            clip.clip_id,
+            reason="event",
+            monotonic_now_ns=2,
+        )
+        assert intent_id is not None
+        intent = catalog.list_pending_intents_by_kind(kinds=(IntentKind.PROTECT,), limit=1)[0]
+        assert intent.paths.video_target is not None
+        assert intent.paths.sidecar_target is not None
+        filesystem.move(intent.paths.video_source, intent.paths.video_target)
+        filesystem.move(intent.paths.sidecar_source, intent.paths.sidecar_target)
+        moves = filesystem.moves
+
+        report = _real_finalizer(root, catalog, filesystem).reconcile_pending()
+
+        assert report.actions_attempted == 0 and report.completed == 1
+        assert filesystem.moves == moves
+        assert catalog.get_clip(clip.clip_id).pair_reconciled
+
+
+@pytest.mark.parametrize("initially_protected", [False, True])
+def test_protection_recovery_moves_opaque_sidecar_without_semantic_validation(
+    tmp_path: Path,
+    *,
+    initially_protected: bool,
+) -> None:
+    root = _root(tmp_path)
+    filesystem = InstrumentedFilesystem(root, [])
+    clip = _protection_clip(1, protected=initially_protected)
+    opaque_sidecar = b"\x00opaque catalog-owned sidecar bytes\xff"
+    (root / clip.video_path).write_bytes(b"video")
+    (root / clip.sidecar_path).write_bytes(opaque_sidecar)
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(clip, catalog_now_ns=1)
+        if initially_protected:
+            intent_id = catalog.prepare_unprotect(clip.clip_id, monotonic_now_ns=2)
+        else:
+            intent_id = catalog.prepare_protect(
+                clip.clip_id,
+                reason="event",
+                monotonic_now_ns=2,
+            )
+        assert intent_id is not None
+
+        report = _real_finalizer(root, catalog, filesystem).reconcile_pending()
+
+        recovered = catalog.get_clip(clip.clip_id)
+        assert report.completed == 1 and not report.more_work
+        assert recovered.protected is (not initially_protected)
+        assert (root / recovered.sidecar_path).read_bytes() == opaque_sidecar
+
+
+def test_protect_recovery_refuses_target_collision_without_mutation(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    filesystem = InstrumentedFilesystem(root, [])
+    clip = _protection_clip(1)
+    _write_protection_pair(root, clip)
+    collision = root / "protected" / "protection-1.mp4"
+    collision.write_bytes(b"foreign collision")
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(clip, catalog_now_ns=1)
+        intent_id = catalog.prepare_protect(
+            clip.clip_id,
+            reason="event",
+            monotonic_now_ns=2,
+        )
+        assert intent_id is not None
+
+        with pytest.raises(FinalizationRefused, match="SOURCE_TARGET_CONFLICT"):
+            _real_finalizer(root, catalog, filesystem).reconcile_pending()
+
+        assert filesystem.moves == 0
+        assert (root / clip.video_path).read_bytes() == b"video"
+        assert collision.read_bytes() == b"foreign collision"
+        assert not catalog.get_clip(clip.clip_id).pair_reconciled
+        assert catalog.list_pending_intents_by_kind(
+            kinds=(IntentKind.PROTECT,),
+            limit=1,
+        )
+
+
+def test_overlapping_event_unprotect_compensation_requires_follow_up_pass(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    filesystem = InstrumentedFilesystem(root, [])
+    previous = _protection_clip(1, protected=True)
+    current = _protection_clip(2)
+    _write_protection_pair(root, previous)
+    _write_protection_pair(root, current)
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(previous, catalog_now_ns=1)
+        catalog.register_clip(current, catalog_now_ns=2)
+        assert catalog.prepare_unprotect(previous.clip_id, monotonic_now_ns=10) is not None
+        catalog.trigger_event(
+            current.clip_id,
+            source=EventSource.API,
+            monotonic_now_ns=20,
+            previous_count=1,
+            next_count=0,
+        )
+        finalizer = _real_finalizer(root, catalog, filesystem)
+
+        first = finalizer.reconcile_pending()
+        intermediate = catalog.get_clip(previous.clip_id)
+        assert first.more_work
+        assert intermediate.protected and not intermediate.pair_reconciled
+        assert intermediate.video_path.startswith("clips/")
+        remaining = catalog.list_pending_intents_by_kind(kinds=(IntentKind.PROTECT,), limit=2)
+        assert tuple(intent.clip_id for intent in remaining) == (previous.clip_id,)
+
+        second = finalizer.reconcile_pending()
+        recovered = catalog.get_clip(previous.clip_id)
+        assert second.completed == 1 and not second.more_work
+        assert recovered.protected and recovered.pair_reconciled
+        assert recovered.video_path.startswith("protected/")
+
+
+def test_filtered_recovery_is_not_masked_by_delete_and_reports_truncation(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    filesystem = InstrumentedFilesystem(root, [])
+    delete_clip = _protection_clip(1)
+    first = _protection_clip(2)
+    second = _protection_clip(3)
+    for clip in (delete_clip, first, second):
+        _write_protection_pair(root, clip)
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        for clip in (delete_clip, first, second):
+            catalog.register_clip(clip, catalog_now_ns=clip.retention_order)
+        catalog.prepare_delete(delete_clip.clip_id, monotonic_now_ns=10, boot_id="boot-a")
+        catalog.prepare_protect(first.clip_id, reason="event", monotonic_now_ns=11)
+        catalog.prepare_protect(second.clip_id, reason="event", monotonic_now_ns=12)
+        finalizer = _real_finalizer(
+            root,
+            catalog,
+            filesystem,
+            limits=FinalizerLimits(max_pending_intents=1),
+        )
+
+        first_pass = finalizer.reconcile_pending()
+        assert first_pass.intents_examined == 1 and first_pass.more_work
+        assert catalog.get_clip(first.clip_id).pair_reconciled
+        assert catalog.get_clip(second.clip_id).video_path.startswith("clips/")
+        assert catalog.list_pending_delete_intents(limit=1)
+
+        second_pass = finalizer.reconcile_pending()
+        assert second_pass.intents_examined == 1 and not second_pass.more_work
+        assert catalog.get_clip(second.clip_id).pair_reconciled
+        assert catalog.list_pending_delete_intents(limit=1)

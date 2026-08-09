@@ -47,6 +47,12 @@ _MAX_PENDING_INTENTS: Final = 1_024
 _MAX_MONOTONIC_NS: Final = 9_223_372_036_854_775_807
 _AT_FDCWD: Final = -100
 _RENAME_NOREPLACE: Final = 1
+_RECOVERY_INTENT_KINDS: Final = (
+    IntentKind.FINALIZE,
+    IntentKind.RECONCILE_NAME,
+    IntentKind.PROTECT,
+    IntentKind.UNPROTECT,
+)
 
 
 class FinalizationError(RuntimeError):
@@ -93,6 +99,13 @@ class PairPromotionCatalog(Protocol):
     def list_pending_intents(self, *, limit: int) -> tuple[OperationIntent, ...]: ...
 
     def list_pending_delete_intents(self, *, limit: int) -> tuple[OperationIntent, ...]: ...
+
+    def list_pending_intents_by_kind(
+        self,
+        *,
+        kinds: tuple[IntentKind, ...],
+        limit: int,
+    ) -> tuple[OperationIntent, ...]: ...
 
     def prepare_oldest_eligible_delete(
         self,
@@ -165,7 +178,7 @@ class FinalizationOutcome:
 
 @dataclass(frozen=True, slots=True)
 class FinalizationRecoveryReport:
-    """Summary of one bounded pass over existing durable FINALIZE intents."""
+    """Summary of one bounded pass over recorder-managed durable intents."""
 
     intents_examined: int
     actions_attempted: int
@@ -547,7 +560,7 @@ class RecorderClipFinalizer:
         )
 
     def reconcile_pending(self) -> FinalizationRecoveryReport:
-        """Reconcile durable finalization/name intents within hard bounds."""
+        """Reconcile durable media/protection pair intents within hard bounds."""
 
         intents, truncated = self._pending_intents()
         examined = 0
@@ -555,12 +568,12 @@ class RecorderClipFinalizer:
         completed = 0
         incomplete = False
         for intent in intents:
-            if intent.kind not in {IntentKind.FINALIZE, IntentKind.RECONCILE_NAME}:
-                continue
             examined += 1
             if intent.kind is IntentKind.FINALIZE:
                 self._validate_durable_sidecar(intent)
             outcome = self._reconcile(intent, resumed=True)
+            if intent.kind is IntentKind.RECONCILE_NAME:
+                self._validate_durable_sidecar(intent)
             actions += outcome.actions_attempted
             completed += int(outcome.complete)
             incomplete = incomplete or not outcome.complete
@@ -568,11 +581,11 @@ class RecorderClipFinalizer:
             intents_examined=examined,
             actions_attempted=actions,
             completed=completed,
-            more_work=truncated or incomplete,
+            more_work=truncated or incomplete or self._has_pending_recovery_intent(),
         )
 
     def _reconcile(self, intent: OperationIntent, *, resumed: bool) -> FinalizationOutcome:
-        if intent.kind not in {IntentKind.FINALIZE, IntentKind.RECONCILE_NAME}:
+        if intent.kind not in _RECOVERY_INTENT_KINDS:
             raise FinalizationRefused(
                 "finalizer cannot execute this pair-intent kind"
             )
@@ -596,8 +609,19 @@ class RecorderClipFinalizer:
 
     def _pending_intents(self) -> tuple[tuple[OperationIntent, ...], bool]:
         limit = self._limits.max_pending_intents
-        values = self._catalog.list_pending_intents(limit=limit + 1)
+        values = self._catalog.list_pending_intents_by_kind(
+            kinds=_RECOVERY_INTENT_KINDS,
+            limit=limit + 1,
+        )
         return values[:limit], len(values) > limit
+
+    def _has_pending_recovery_intent(self) -> bool:
+        return bool(
+            self._catalog.list_pending_intents_by_kind(
+                kinds=_RECOVERY_INTENT_KINDS,
+                limit=1,
+            )
+        )
 
     def _find_registered_intent(
         self, intent_id: UUID, clip_id: UUID, paths: PairPaths

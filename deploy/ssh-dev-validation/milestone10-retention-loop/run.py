@@ -1330,6 +1330,24 @@ def _write_member(root: Path, relative: str, payload: bytes) -> None:
         os.close(descriptor)
 
 
+def _require_fully_allocated_image(image: Path, expected_size: int) -> None:
+    descriptor = os.open(
+        image,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        allocated = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(allocated.st_mode)
+            or allocated.st_nlink != 1
+            or allocated.st_size != expected_size
+            or allocated.st_blocks * 512 < expected_size  # type: ignore[attr-defined]
+        ):
+            raise HarnessError("formatted loop backing image is not fully allocated")
+    finally:
+        os.close(descriptor)
+
+
 def _fixture_clip(order: int, *, protected: bool = False, managed: bool = True) -> Any:
     from uuid import UUID
 
@@ -2503,8 +2521,25 @@ def _worker(arguments: argparse.Namespace) -> int:
         ext4_loop = _attach_loop(ext4_image)
         _require_owned_loop(exfat_loop, exfat_image)
         _run((MKFS_EXFAT, "-n", "M10LOOP", str(exfat_loop)), timeout=60)
+        _require_owned_loop(exfat_loop, exfat_image)
+        _require_fully_allocated_image(exfat_image, EXFAT_IMAGE_BYTES)
         _require_owned_loop(ext4_loop, ext4_image)
-        _run((MKFS_EXT4, "-F", "-m", "0", "-L", "M10CAT", str(ext4_loop)), timeout=60)
+        _run(
+            (
+                MKFS_EXT4,
+                "-F",
+                "-m",
+                "0",
+                "-E",
+                "nodiscard",
+                "-L",
+                "M10CAT",
+                str(ext4_loop),
+            ),
+            timeout=60,
+        )
+        _require_owned_loop(ext4_loop, ext4_image)
+        _require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)
         exfat_facts = _mount_loop(exfat_loop, exfat_image, RECORDING_ROOT, "exfat")
         mounted_exfat = True
         ext4_facts = _mount_loop(ext4_loop, ext4_image, catalog_mount, "ext4")

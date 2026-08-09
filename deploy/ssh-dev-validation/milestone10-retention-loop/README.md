@@ -58,7 +58,9 @@ preserved root free space. The same device/capacity identity and 2 GiB reserve
 are required again after every cleanup path and before result publication.
 Each image is fully allocated and fsynced before loop attachment, with exact
 size and allocated-block coverage verified and the remaining budget rechecked
-immediately before and after each allocation.
+immediately before and after each allocation. The ext4 formatter uses its
+documented `-E nodiscard` option, and both images must retain full allocated-
+block coverage immediately after formatting and before mounting.
 
 The worker makes `/` recursively private before unmounting the cloned
 production mount. Every destructive filesystem command accepts only a numbered

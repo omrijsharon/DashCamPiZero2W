@@ -880,6 +880,43 @@ def test_root_backing_preflight_budget_accepts_equality_and_refuses_one_byte_bel
     assert required == 2624 * 1024**2
 
 
+def test_formatted_image_must_remain_fully_allocated_after_mkfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[object] = []
+    blocks = 8
+
+    def opened(path: Path, flags: int) -> int:
+        observed.append((path, flags))
+        return 17
+
+    def metadata(_descriptor: int) -> object:
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=1,
+            st_size=4096,
+            st_blocks=blocks,
+        )
+
+    monkeypatch.setattr(harness.os, "open", opened)
+    monkeypatch.setattr(harness.os, "fstat", metadata)
+    monkeypatch.setattr(harness.os, "close", lambda descriptor: observed.append(descriptor))
+
+    harness._require_fully_allocated_image(Path("fixture.img"), 4096)
+    assert observed[-1] == 17
+    assert cast(tuple[Path, int], observed[0]) == (
+        Path("fixture.img"),
+        harness.os.O_RDONLY
+        | getattr(harness.os, "O_CLOEXEC", 0)
+        | getattr(harness.os, "O_NOFOLLOW", 0),
+    )
+
+    blocks = 7
+    with pytest.raises(harness.HarnessError, match="not fully allocated"):
+        harness._require_fully_allocated_image(Path("fixture.img"), 4096)
+    assert observed[-1] == 17
+
+
 def test_root_backing_budget_checks_identity_overflow_and_remaining_allocation() -> None:
     required = harness.required_root_free_bytes()
     wrong_source = harness.RootBackingObservation(
@@ -1246,6 +1283,15 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
         assert function in source
     assert "os.posix_fallocate" in source
     assert source.count("os.posix_fallocate") == 2
+    ext4_format = (
+        'MKFS_EXT4,\n                "-F",\n                "-m",\n                "0",\n'
+        '                "-E",\n                "nodiscard",\n                "-L",\n'
+        '                "M10CAT",'
+    )
+    assert ext4_format in source
+    assert source.index(ext4_format) < source.index(
+        "_require_fully_allocated_image(ext4_image, EXT4_IMAGE_BYTES)"
+    ) < source.index("_mount_loop(ext4_loop, ext4_image, catalog_mount, \"ext4\")")
     assert "stream.write" not in source
     assert "allocated.st_blocks * 512 < filler_size" in source
     assert "allocated.st_blocks * 512 < size" in source
@@ -1266,6 +1312,7 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "480 MiB loop-backed exFAT" in readme
     assert "64 MiB loop-backed ext4" in readme
     assert "at least 2 GiB" in readme
+    assert "`-E nodiscard`" in readme
     assert "production_release_tested=false" in readme
     assert "physical_power_loss_tested=false" in readme
     assert "m10_exit_gate_closed=false" in readme

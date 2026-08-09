@@ -1293,6 +1293,7 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
     from dashcam.catalog.models import CatalogClip
     from dashcam.state import ClipLifecycle
     from dashcam.storage.intents import PairPaths
+    from dashcam.storage.naming import finalized_unsynced_clip_pair, provisional_clip_pair
     from dashcam.storage.reclaimer import StorageReclaimer
 
     filesystem = RootedFilesystem(root)
@@ -1337,11 +1338,13 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
             is None
         ):
             raise HarnessError("pending mutation fixture was not created")
+        pending_pair = provisional_clip_pair(boot_id="m10loop", sequence=44)
+        final_pair = finalized_unsynced_clip_pair(boot_id="m10loop", sequence=44)
         finalizing = CatalogClip(
             clip_id=UUID(int=45),
             lifecycle=ClipLifecycle.FINALIZING,
-            video_path="pending/clip-0044.mp4",
-            sidecar_path="pending/clip-0044.json",
+            video_path=f"pending/{pending_pair.video_name}",
+            sidecar_path=f"pending/{pending_pair.metadata_name}",
             start_monotonic_ns=44 * 1_000_000_000,
             end_monotonic_ns=45 * 1_000_000_000,
             retention_order=44,
@@ -1357,8 +1360,8 @@ def _matrix_b_c(root: Path, catalog_path: Path) -> tuple[dict[str, object], dict
             promotion_paths=PairPaths(
                 finalizing.video_path,
                 finalizing.sidecar_path,
-                "clips/clip-0044.mp4",
-                "clips/clip-0044.json",
+                f"clips/{final_pair.video_name}",
+                f"clips/{final_pair.metadata_name}",
             ),
             monotonic_now_ns=45,
         )

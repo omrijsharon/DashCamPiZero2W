@@ -522,6 +522,9 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "MAX_RECLAIM_STEPS" in source
     assert "os.posix_fallocate" in source
     assert "allocated.st_blocks * 512 < size" in source
+    assert 'invalid[0].fault.value != "INVALID_OBSERVATION"' in source
+    assert 'failures[0].fault.value != "OBSERVATION_FAILED"' in source
+    assert source.count('[-1].fault.value != "OBSERVATION_STALE"') == 2
     parent_source = source[source.index("def _parent(") :]
     assert parent_source.index(
         "root_backing_before = _observe_root_backing()"

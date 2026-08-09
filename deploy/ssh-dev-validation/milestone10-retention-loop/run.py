@@ -1151,11 +1151,15 @@ def _matrix_a(
         or drift.fault.value != "IDENTITY_DRIFT"
         or capacity_drift.fault is None
         or capacity_drift.fault.value != "CAPACITY_DRIFT"
+        or invalid[0].fault is None
+        or invalid[0].fault.value != "INVALID_OBSERVATION"
         or invalid[-1].fault is None
-        or invalid[-1].fault.value != "INVALID_OBSERVATION"
+        or invalid[-1].fault.value != "OBSERVATION_STALE"
         or not invalid[-1].stop_required
+        or failures[0].fault is None
+        or failures[0].fault.value != "OBSERVATION_FAILED"
         or failures[-1].fault is None
-        or failures[-1].fault.value != "OBSERVATION_FAILED"
+        or failures[-1].fault.value != "OBSERVATION_STALE"
         or not failures[-1].stop_required
     ):
         raise HarnessError("fresh, drift, or invalid-observation containment differs")

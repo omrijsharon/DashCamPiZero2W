@@ -19,7 +19,7 @@ Group=dashcam
 # selected ALSA capture device and receive-only GPS UART.  The service still
 # owns both the camera and media mount; do not broaden these groups to web or
 # helper identities.
-SupplementaryGroups=audio video render dialout dashcam-storage
+SupplementaryGroups=audio video render dialout dashcam-storage dashcam-api
 WorkingDirectory=/var/lib/dashcam
 ExecStart=/opt/dashcam/current/venv/bin/python -m dashcam.daemon --config /etc/dashcam/config.toml --identity /etc/dashcam/storage-volume.env
 Restart=on-failure

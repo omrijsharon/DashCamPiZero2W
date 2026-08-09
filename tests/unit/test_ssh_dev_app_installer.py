@@ -238,6 +238,13 @@ def test_builder_pins_exact_uv_lock_tzdata_wheel_identity() -> None:
     )
 
 
+def test_builder_explicitly_refuses_retired_socket_activation_source() -> None:
+    builder = _load("app_builder_retired_socket", SOURCE / "prepare-bundle.py")
+    assert builder.__dict__["RETIRED_UNIT_SOURCES"] == (Path("systemd/dashcamd.socket"),)
+    assert not (ROOT / "systemd/dashcamd.socket").exists()
+    assert "dashcamd.socket" not in builder.__dict__["SOURCE_FILES"]
+
+
 def test_release_id_binds_config_and_all_closed_manifest_inputs(tmp_path: Path) -> None:
     _, first = _bundle(tmp_path / "first")
     _, second = _bundle(tmp_path / "second", config_suffix=b"\n# changed input\n")
@@ -587,6 +594,38 @@ def test_managed_config_uses_storage_group_and_release_tree_is_service_traversab
         assert marker.stat().st_mode & 0o777 == 0o644
     assert owners
     assert all(uid == 0 and gid == 0 for _, uid, gid, _ in owners)
+
+
+def test_installer_creates_api_group_once_and_then_is_idempotent() -> None:
+    installer = _load("app_installer_api_group", SOURCE / "install.py")
+
+    class Runner:
+        def __init__(self) -> None:
+            self.present = False
+            self.commands: list[tuple[str, ...]] = []
+
+        def run(
+            self,
+            command: list[str],
+            *,
+            accepted: frozenset[int] = frozenset({0}),
+        ) -> Any:
+            del accepted
+            self.commands.append(tuple(command))
+            if command[:3] == ["/usr/bin/getent", "group", "dashcam-api"]:
+                if self.present:
+                    return installer.CommandResult(0, "dashcam-api:x:991:\n", "")
+                return installer.CommandResult(2, "", "")
+            assert command == ["/usr/sbin/groupadd", "--system", "dashcam-api"]
+            self.present = True
+            return installer.CommandResult(0, "", "")
+
+    runner = Runner()
+    installer._ensure_api_group(runner)
+    installer._ensure_api_group(runner)
+
+    assert runner.present
+    assert runner.commands.count(("/usr/sbin/groupadd", "--system", "dashcam-api")) == 1
 
 
 class _SystemdRunner:
@@ -1354,7 +1393,7 @@ def test_units_and_installer_enable_without_starting_or_restarting_services() ->
         "Type=notify",
         "User=dashcam",
         "Group=dashcam",
-        "SupplementaryGroups=audio video render dialout dashcam-storage",
+        "SupplementaryGroups=audio video render dialout dashcam-storage dashcam-api",
         "ExecStart=/opt/dashcam/current/venv/bin/python -m dashcam.daemon "
         "--config /etc/dashcam/config.toml --identity /etc/dashcam/storage-volume.env",
         "Restart=on-failure",
@@ -1386,5 +1425,7 @@ def test_units_and_installer_enable_without_starting_or_restarting_services() ->
     assert "EXPECTED_CARD_CID" in installer
     assert '"rw" not in options.split' in installer
     assert "dashcamd.service" in installer
+    assert '"dashcamd.socket"' in installer
+    assert not (ROOT / "systemd/dashcamd.socket").exists()
     for name in ("dashcam-web.service", "dashcam-prepare-removal.service"):
         assert name in installer

@@ -81,6 +81,35 @@ class FakeRuntime:
 
 
 @dataclass
+class ControlRuntime(FakeRuntime):
+    control_start_error: Exception | None = None
+    lifecycle: list[str] = field(default_factory=list)
+    control_fault_callback: Callable[[str], None] | None = None
+
+    async def start(self, config: DashcamConfig) -> None:
+        self.lifecycle.append("runtime_start")
+        await super().start(config)
+
+    async def start_control_endpoint(
+        self,
+        status_provider: Callable[[], object],
+        fault_callback: Callable[[str], None],
+    ) -> None:
+        assert status_provider() is not None
+        self.control_fault_callback = fault_callback
+        self.lifecycle.append("control_start")
+        if self.control_start_error is not None:
+            raise self.control_start_error
+
+    async def stop_control_endpoint(self) -> None:
+        self.lifecycle.append("control_stop")
+
+    async def stop(self) -> None:
+        self.lifecycle.append("runtime_stop")
+        await super().stop()
+
+
+@dataclass
 class ProgressRuntime(FakeRuntime):
     progress_tokens: list[int | None] = field(default_factory=lambda: [0])
     progress_error: BaseException | None = None
@@ -1007,6 +1036,85 @@ def test_daemon_is_single_use() -> None:
 
         with pytest.raises(RuntimeError, match="single-use"):
             await daemon.run()
+
+    run_async(scenario)
+
+
+def test_control_starts_after_runtime_and_drains_before_runtime_stop() -> None:
+    async def scenario() -> None:
+        runtime = ControlRuntime()
+        daemon = RecorderDaemon(
+            config_path="config.toml",
+            runtime=runtime,
+            config_loader=lambda path: default_config(),
+            limits=fast_limits(),
+        )
+        task = asyncio.create_task(daemon.run())
+        while daemon.status.state is not RecorderState.RECORDING:
+            await asyncio.sleep(0)
+        daemon.request_stop()
+
+        result = await task
+
+        assert result.clean
+        assert runtime.lifecycle == [
+            "runtime_start",
+            "control_start",
+            "control_stop",
+            "runtime_stop",
+        ]
+
+    run_async(scenario)
+
+
+def test_control_bind_failure_is_truthful_degraded_and_camera_nonfatal() -> None:
+    async def scenario() -> None:
+        runtime = ControlRuntime(control_start_error=OSError("injected bind failure"))
+        daemon = RecorderDaemon(
+            config_path="config.toml",
+            runtime=runtime,
+            config_loader=lambda path: default_config(),
+            limits=fast_limits(),
+        )
+        task = asyncio.create_task(daemon.run())
+        while daemon.status.state is not RecorderState.DEGRADED:
+            await asyncio.sleep(0)
+        assert daemon.status.reason is RecorderReason.OPTIONAL_SUBSYSTEM
+        assert "control endpoint unavailable" in (daemon.status.detail or "")
+        while runtime.run_calls == 0:
+            await asyncio.sleep(0)
+        assert runtime.run_calls == 1
+        daemon.request_stop()
+
+        result = await task
+
+        assert result.clean
+        assert runtime.lifecycle[-2:] == ["control_stop", "runtime_stop"]
+
+    run_async(scenario)
+
+
+def test_post_start_control_fault_is_degraded_without_stopping_camera() -> None:
+    async def scenario() -> None:
+        runtime = ControlRuntime()
+        daemon = RecorderDaemon(
+            config_path="config.toml",
+            runtime=runtime,
+            config_loader=lambda path: default_config(),
+            limits=fast_limits(),
+        )
+        task = asyncio.create_task(daemon.run())
+        while runtime.control_fault_callback is None or runtime.run_calls == 0:
+            await asyncio.sleep(0)
+
+        runtime.control_fault_callback("injected serve failure")
+        assert daemon.status.state is RecorderState.DEGRADED
+        assert daemon.status.reason is RecorderReason.OPTIONAL_SUBSYSTEM
+        assert runtime.run_calls == 1
+        assert not task.done()
+
+        daemon.request_stop()
+        assert (await task).clean
 
     run_async(scenario)
 

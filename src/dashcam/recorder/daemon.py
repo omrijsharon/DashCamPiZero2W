@@ -246,7 +246,12 @@ class RecorderDaemon:
             except TimeoutError:
                 self._notify(self._notifier.watchdog)
                 self._snapshot()
-                if self.status.state is not RecorderState.RECORDING:
+                status = self.status
+                recording_active = status.state is RecorderState.RECORDING or (
+                    status.state is RecorderState.DEGRADED
+                    and status.reason is RecorderReason.OPTIONAL_SUBSYSTEM
+                )
+                if not recording_active:
                     baseline_token = None
                     baseline_epoch = None
                     continue
@@ -333,6 +338,7 @@ class RecorderDaemon:
         self,
         run_task: asyncio.Task[None] | None,
     ) -> tuple[RecorderReason | None, str | None]:
+        await self._stop_control_endpoint()
         stop_task = asyncio.create_task(self._runtime.stop(), name="recorder-runtime-stop")
         tasks: set[asyncio.Task[None]] = {stop_task}
         if run_task is not None:
@@ -347,6 +353,44 @@ class RecorderDaemon:
         if errors:
             return RecorderReason.SHUTDOWN_FAILED, _exception_detail(errors[0])
         return None, None
+
+    async def _start_control_endpoint(self) -> None:
+        starter = getattr(self._runtime, "start_control_endpoint", None)
+        if starter is None:
+            return
+        if not callable(starter):
+            raise TypeError("runtime control endpoint starter must be callable")
+        try:
+            await starter(
+                lambda: self.status.as_dict(),
+                self._control_endpoint_fault,
+            )
+            self._snapshot()
+        except Exception as error:
+            self._control_endpoint_fault(_exception_detail(error))
+
+    def _control_endpoint_fault(self, detail: str) -> None:
+        bounded = " ".join(str(detail).splitlines()).strip()[:400]
+        self._publish(
+            RecorderState.DEGRADED,
+            reason=RecorderReason.OPTIONAL_SUBSYSTEM,
+            detail=f"control endpoint unavailable: {bounded or 'unknown failure'}"[:512],
+        )
+
+    async def _stop_control_endpoint(self) -> None:
+        stopper = getattr(self._runtime, "stop_control_endpoint", None)
+        if stopper is None:
+            return
+        if not callable(stopper):
+            self._status_store.record_notification_failure()
+            return
+        try:
+            await stopper()
+        except Exception:
+            # The production endpoint has already stopped accepting and joined
+            # every handler before path cleanup can fail. Preserve camera
+            # shutdown even if final socket unlink observability reports a fault.
+            self._status_store.record_notification_failure()
 
     def _shutdown_notification(self) -> None:
         status = self.status
@@ -527,6 +571,7 @@ class RecorderDaemon:
             return await self._external_shutdown(run_task)
 
         self._publish(RecorderState.RECORDING)
+        await self._start_control_endpoint()
         self._notify(lambda: self._notifier.ready(self._format_status(self.status)))
 
         watchdog_interval = (

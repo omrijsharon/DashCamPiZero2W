@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +19,7 @@ from dashcam.catalog import (
     EventProtectionResult,
     EventSource,
 )
+from dashcam.catalog.database import DownloadLeaseCapacityReached
 from dashcam.config import (
     ConfigError,
     DashcamConfig,
@@ -101,10 +103,14 @@ class FakeCatalog:
         monotonic_now_ns: int,
         duration_ns: int,
         boot_id: str,
+        max_active_leases: int = 32,
     ) -> DownloadLease:
         clip = self.get_clip(clip_id)
         if clip.download_lease is not None:
             raise DownloadLeaseError("already leased")
+        active = sum(item.download_lease is not None for item in self.clips.values())
+        if active >= max_active_leases:
+            raise DownloadLeaseCapacityReached("global download lease limit reached")
         lease = DownloadLease.issue(
             holder=holder,
             monotonic_now_ns=monotonic_now_ns,
@@ -117,16 +123,27 @@ class FakeCatalog:
                 "holder": holder,
                 "duration_ns": duration_ns,
                 "boot_id": boot_id,
+                "max_active_leases": max_active_leases,
             }
         )
         return lease
 
-    def release_download_lease(self, clip_id: UUID, *, holder: str) -> None:
+    def release_download_lease(
+        self,
+        clip_id: UUID,
+        *,
+        holder: str,
+        monotonic_now_ns: int,
+    ) -> bool:
+        assert monotonic_now_ns >= 0
         clip = self.get_clip(clip_id)
+        if clip.download_lease is None:
+            return False
         if clip.download_lease is not None and clip.download_lease.holder != holder:
             raise DownloadLeaseError("wrong owner")
         self.clips[clip_id] = replace(clip, download_lease=None, lease_boot_id=None)
         self.releases.append((clip_id, holder))
+        return True
 
     def prepare_protect(self, clip_id: UUID, *, reason: str, monotonic_now_ns: int) -> UUID | None:
         clip = self.get_clip(clip_id)
@@ -323,6 +340,38 @@ def test_status_and_health_use_injected_snapshots_and_redact_secrets() -> None:
     assert "hidden" not in json.dumps(health)
 
 
+def test_cancelled_control_read_joins_native_catalog_worker() -> None:
+    class BlockingCatalog(FakeCatalog):
+        def __init__(self) -> None:
+            super().__init__((_clip(1),))
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def get_clip(self, clip_id: UUID) -> CatalogClip:
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            return super().get_clip(clip_id)
+
+    async def scenario() -> None:
+        catalog = BlockingCatalog()
+        task = asyncio.create_task(
+            _dispatcher(catalog=catalog).dispatch(
+                ControlCommand.GET_CLIP,
+                {"clip_id": str(UUID(int=1))},
+            )
+        )
+        while not catalog.entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        catalog.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -469,26 +518,108 @@ def test_download_lease_approves_catalog_pair_path_and_uses_opaque_authority() -
         },
     )
 
-    assert approval["approved_path"] == "/srv/dashcam/clips/clip-1.mp4"
+    assert approval["member"] == "video"
+    assert "approved_path" not in approval
     lease_id = cast(str, approval["lease_id"])
     assert len(lease_id) == 32
     assert catalog.acquisitions[0]["holder"] != "web-session"
     assert catalog.acquisitions[0]["duration_ns"] == 300_000_000_000
     assert "path" not in catalog.acquisitions[0]
 
+    restarted_dispatcher = _dispatcher(catalog=catalog)
     released = _run(
-        dispatcher,
+        restarted_dispatcher,
         ControlCommand.RELEASE_DOWNLOAD,
         {"clip_id": str(UUID(int=1)), "lease_id": lease_id},
     )
     repeated = _run(
-        dispatcher,
+        restarted_dispatcher,
         ControlCommand.RELEASE_DOWNLOAD,
         {"clip_id": str(UUID(int=1)), "lease_id": lease_id},
     )
     assert released["released"] is True
     assert repeated["released"] is False
     assert len(catalog.releases) == 1
+
+
+def test_download_path_is_read_only_after_the_lease_linearization_point() -> None:
+    class MovingCatalog(FakeCatalog):
+        def acquire_download_lease(
+            self,
+            clip_id: UUID,
+            *,
+            holder: str,
+            monotonic_now_ns: int,
+            duration_ns: int,
+            boot_id: str,
+            max_active_leases: int = 32,
+        ) -> DownloadLease:
+            clip = self.clips[clip_id]
+            self.clips[clip_id] = replace(
+                clip,
+                video_path="protected/moved.mp4",
+                sidecar_path="protected/moved.json",
+                protected=True,
+            )
+            return super().acquire_download_lease(
+                clip_id,
+                holder=holder,
+                monotonic_now_ns=monotonic_now_ns,
+                duration_ns=duration_ns,
+                boot_id=boot_id,
+                max_active_leases=max_active_leases,
+            )
+
+    catalog = MovingCatalog((_clip(1),))
+    approval = _run(
+        _dispatcher(catalog=catalog),
+        ControlCommand.ACQUIRE_DOWNLOAD,
+        {"clip_id": str(UUID(int=1)), "member": "video", "holder": "race"},
+    )
+
+    assert approval["member"] == "video"
+    assert "approved_path" not in approval
+
+
+def test_release_converges_deferred_event_move_once_and_replays_idempotently() -> None:
+    catalog = FakeCatalog((_clip(1),))
+    executed: list[UUID] = []
+
+    async def execute(intent_id: UUID) -> None:
+        executed.append(intent_id)
+        clip = catalog.clips[UUID(int=1)]
+        catalog.clips[clip.clip_id] = replace(
+            clip,
+            video_path="protected/clip-1.mp4",
+            sidecar_path="protected/clip-1.json",
+            pair_reconciled=True,
+        )
+
+    dispatcher = _dispatcher(catalog=catalog, intent_executor=execute)
+    approval = _run(
+        dispatcher,
+        ControlCommand.ACQUIRE_DOWNLOAD,
+        {"clip_id": str(UUID(int=1)), "member": "video", "holder": "event"},
+    )
+    # An event may durably protect the pair while its active lease defers the
+    # physical move and preserves the already-approved path.
+    catalog.clips[UUID(int=1)] = replace(
+        catalog.clips[UUID(int=1)],
+        protected=True,
+        protection_reason="event:deferred",
+    )
+
+    arguments = {
+        "clip_id": str(UUID(int=1)),
+        "lease_id": cast(str, approval["lease_id"]),
+    }
+    released = _run(dispatcher, ControlCommand.RELEASE_DOWNLOAD, arguments)
+    replayed = _run(dispatcher, ControlCommand.RELEASE_DOWNLOAD, arguments)
+
+    assert released["released"] is True
+    assert replayed["released"] is False
+    assert executed == [UUID(int=101)]
+    assert catalog.get_clip(UUID(int=1)).video_path == "protected/clip-1.mp4"
 
 
 def test_download_lease_uses_one_current_config_snapshot_per_acquisition() -> None:
@@ -914,5 +1045,6 @@ def test_dispatcher_integrates_real_atomic_config_and_catalog_contracts(
         str(UUID(int=2)),
         str(UUID(int=1)),
     ]
-    assert approved["approved_path"] == "/srv/dashcam/clips/clip-2.json"
+    assert approved["member"] == "metadata"
+    assert "approved_path" not in approved
     assert released["released"] is True

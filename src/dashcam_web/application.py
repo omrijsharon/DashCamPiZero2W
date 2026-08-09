@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final, cast
+from uuid import UUID, uuid4
 
 from dashcam.control.api import (
     API_PREFIX,
@@ -310,25 +311,13 @@ class WebApplication:
                 RecorderCommand.LIST_CLIPS,
                 {"limit": page.limit, "offset": page.offset, "protected": protected},
             )
-        elif clip_id is not None and method is HttpMethod.GET and path.endswith("/video"):
-            approval = self._recorder.acquire_download(
-                clip_id, member="video", holder=f"web-{session.token[:16]}"
-            )
-            return Response(
-                200,
-                None,
-                {"Content-Type": "video/mp4", "Cache-Control": "no-store"},
-                download=approval,
-            )
-        elif clip_id is not None and method is HttpMethod.GET and path.endswith("/metadata"):
-            approval = self._recorder.acquire_download(
-                clip_id, member="metadata", holder=f"web-{session.token[:16]}"
-            )
-            return Response(
-                200,
-                None,
-                {"Content-Type": "application/json", "Cache-Control": "no-store"},
-                download=approval,
+        elif clip_id is not None and method is HttpMethod.GET and path.endswith(
+            ("/video", "/metadata")
+        ):
+            return _error(
+                501,
+                ErrorCode.UNSUPPORTED_CONFIGURATION,
+                "Download delivery is not available in this release",
             )
         elif clip_id is not None:
             command = {
@@ -342,9 +331,21 @@ class WebApplication:
             result = self._recorder.call_for_clip(command, clip_id)
         elif method is HttpMethod.POST and path == f"{API_PREFIX}/event":
             payload = _parse_object(request.body)
-            if set(payload) - {"source"} or payload.get("source", "web") != "web":
+            if set(payload) - {"source", "event_id"} or payload.get("source", "web") != "web":
                 raise ValueError("invalid event")
-            result = self._recorder.call(RecorderCommand.EVENT, {"source": "web"})
+            raw_event_id = payload.get("event_id")
+            if raw_event_id is None:
+                event_id = uuid4()
+            elif isinstance(raw_event_id, str):
+                event_id = UUID(raw_event_id)
+                if str(event_id) != raw_event_id:
+                    raise ValueError("invalid event ID")
+            else:
+                raise ValueError("invalid event ID")
+            result = self._recorder.call(
+                RecorderCommand.EVENT,
+                {"source": "web", "event_id": str(event_id)},
+            )
         elif method is HttpMethod.POST and path == f"{API_PREFIX}/recorder/restart":
             result = self._recorder.call(RecorderCommand.RESTART)
         elif method is HttpMethod.POST and path == f"{API_PREFIX}/system/prepare-sd-removal":

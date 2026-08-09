@@ -49,7 +49,7 @@ def test_recorder_unit_has_bounded_notify_restart_and_privilege_contract() -> No
         "--config /etc/dashcam/config.toml --identity /etc/dashcam/storage-volume.env"
     ) in unit
     assert _directive_values(unit, "SupplementaryGroups") == [
-        "audio video render dialout dashcam-storage"
+        "audio video render dialout dashcam-storage dashcam-api"
     ]
     # systemd counts starts (including restart attempts) across the interval;
     # this is the finite failure latch for a repeatedly bad camera/encoder.
@@ -89,12 +89,14 @@ def test_web_unit_cannot_open_camera_audio_or_uart_groups() -> None:
     assert "StartLimitBurst=5" in unit
 
 
-def test_control_socket_is_group_restricted() -> None:
-    unit = _unit("dashcamd.socket")
-
-    assert "ListenStream=/run/dashcam/control.sock" in unit
-    assert "SocketGroup=dashcam-api" in unit
-    assert "SocketMode=0660" in unit
+def test_control_listener_is_recorder_owned_without_socket_activation() -> None:
+    assert not (SYSTEMD_ROOT / "dashcamd.socket").exists()
+    recorder = _unit("dashcamd.service")
+    web = _unit("dashcam-web.service")
+    assert "dashcam-api" in _directive_values(recorder, "SupplementaryGroups")[0]
+    assert "After=network.target dashcamd.service" in web
+    assert "dashcamd.socket" not in web
+    assert "Requires=dashcamd.service" not in web
 
 
 def test_prepare_removal_is_bounded_narrow_and_not_boot_enabled() -> None:

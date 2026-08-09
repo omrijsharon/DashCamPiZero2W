@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import stat
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from http import HTTPStatus
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Final, Protocol, cast
 from urllib.parse import parse_qsl
 
@@ -27,8 +26,6 @@ MAX_WSGI_PATH_CHARS: Final = 512
 MAX_WSGI_QUERY_CHARS: Final = 2_048
 MAX_WSGI_FIELD_CHARS: Final = 128
 DOWNLOAD_CHUNK_BYTES: Final = 64 * 1024
-_LOGICAL_RECORDING_ROOT: Final = PurePosixPath("/srv/dashcam")
-_ALLOWED_DOWNLOAD_DIRECTORIES: Final = frozenset({"clips", "protected"})
 _RFC1918_NETWORKS: Final = tuple(
     ipaddress.ip_network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
@@ -103,8 +100,7 @@ class WsgiAdapter:
         self.bind_address = validate_bind_address(bind_address)
         self._application = application
         self._recorder = recorder
-        self._recording_root = recording_root
-        self._stream_opener = stream_opener or _open_binary
+        del recording_root, stream_opener
 
     def __call__(
         self, environ: Mapping[str, object], start_response: StartResponse
@@ -141,54 +137,10 @@ class WsgiAdapter:
     ) -> Iterable[bytes]:
         approval = response.download
         assert approval is not None
-        stream: WsgiInput | None = None
-        try:
-            path = self._approved_file_path(approval, response.headers)
-            stream = self._stream_opener(path)
-            if not hasattr(stream, "read") or not hasattr(stream, "close"):
-                raise ValueError("download stream is invalid")
-            headers = _response_headers(response.headers)
-        except (OSError, TypeError, ValueError):
-            if stream is not None:
-                with suppress(Exception):
-                    stream.close()
-            self._release_download(approval)
-            return _json_error(start_response, 404, "Download unavailable")
-        download = _DownloadIterable(stream, approval, self._release_download)
-        try:
-            start_response(_status_line(response.status), headers)
-        except Exception:
-            download.close()
-            raise
-        return download
-
-    def _approved_file_path(self, approval: ApprovedDownload, headers: Mapping[str, str]) -> Path:
         if not isinstance(approval, ApprovedDownload):
-            raise ValueError("download approval is invalid")
-        content_type = headers.get("Content-Type", "")
-        expected_suffix = {"video/mp4": ".mp4", "application/json": ".json"}.get(content_type)
-        if expected_suffix is None:
-            raise ValueError("download content type is not allow-listed")
-        approved = approval.approved_path
-        if (
-            not approved.is_absolute()
-            or any(part in {"", ".", ".."} for part in approved.parts)
-            or approved.suffix != expected_suffix
-        ):
-            raise ValueError("approved path is malformed")
-        try:
-            relative = approved.relative_to(_LOGICAL_RECORDING_ROOT)
-        except ValueError as error:
-            raise ValueError("approved path is outside the recording root") from error
-        if (
-            len(relative.parts) != 2
-            or relative.parts[0] not in _ALLOWED_DOWNLOAD_DIRECTORIES
-            or relative.name in {"", ".", ".."}
-            or len(relative.name) > 255
-        ):
-            raise ValueError("approved path is not a clip pair member")
-        candidate = self._recording_root.joinpath(*relative.parts)
-        return _regular_nonsymlink_file(candidate, self._recording_root)
+            return _json_error(start_response, 500, "Internal server error")
+        self._release_download(approval)
+        return _json_error(start_response, 501, "Download delivery is not available")
 
     def _release_download(self, approval: ApprovedDownload) -> None:
         """Best-effort cleanup: release is attempted on every terminal path."""
@@ -368,31 +320,6 @@ def _status_line(status: int) -> str:
     except ValueError:
         phrase = "Unknown"
     return f"{status} {phrase}"
-
-
-def _regular_nonsymlink_file(candidate: Path, root: Path) -> Path:
-    try:
-        resolved_root = root.resolve(strict=True)
-        current = root
-        if current.is_symlink():
-            raise ValueError("recording root must not be a symlink")
-        relative = candidate.relative_to(root)
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("download path must not contain a symlink")
-        resolved_candidate = candidate.resolve(strict=True)
-        resolved_candidate.relative_to(resolved_root)
-        mode = resolved_candidate.stat(follow_symlinks=False).st_mode
-    except (OSError, ValueError) as error:
-        raise ValueError("approved download is unavailable") from error
-    if not stat.S_ISREG(mode):
-        raise ValueError("approved download is not a regular file")
-    return resolved_candidate
-
-
-def _open_binary(path: Path) -> WsgiInput:
-    return cast(WsgiInput, path.open("rb"))
 
 
 __all__ = [

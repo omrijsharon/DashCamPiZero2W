@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import stat
+import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -22,7 +23,7 @@ from dashcam.audio.linux import (
     AudioDiscoveryStatus,
     discover_capture_device,
 )
-from dashcam.catalog import ClipCatalog
+from dashcam.catalog import ClipCatalog, EventProtectionResult, EventSource
 from dashcam.catalog.database import RetentionThresholdLatch
 from dashcam.config import (
     AudioConfig,
@@ -207,6 +208,8 @@ class RuntimeBackend(Protocol):
 
     async def wait_for_first_fragment_opened(self) -> OpenedFragment: ...
 
+    async def next_opened_fragment(self) -> OpenedFragment: ...
+
     async def next_finalized_fragment(self) -> FinalizedFragment: ...
 
     def mark_finalized_fragment_processed(self) -> None: ...
@@ -232,6 +235,30 @@ class RuntimeFinalizer(Protocol):
         sidecar: ClipSidecar,
         retention_order: int,
     ) -> object: ...
+
+    def register_active_clip(
+        self,
+        *,
+        provisional_video_name: str,
+        clip_id: UUID,
+        start_monotonic_ns: int,
+        retention_order: int,
+    ) -> None: ...
+
+    def reconcile_orphaned_writing(self, *, limit: int) -> tuple[int, bool]: ...
+
+    def execute_intent(self, intent_id: UUID) -> object: ...
+
+    def trigger_event(
+        self,
+        current_clip_id: UUID,
+        *,
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int,
+        next_count: int,
+        event_id: UUID,
+    ) -> EventProtectionResult: ...
 
     def reconcile_pending(self) -> FinalizationRecoveryReport: ...
 
@@ -648,6 +675,7 @@ class GStreamerRecorderRuntime:
         self._backend_stop = asyncio.Event()
         self._backend_run_task: asyncio.Task[None] | None = None
         self._fragment_drain_task: asyncio.Task[None] | None = None
+        self._fragment_open_drain_task: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
         self._ownership_claimed = False
         self._start_attempted = False
@@ -693,6 +721,11 @@ class GStreamerRecorderRuntime:
         self._next_allocation_floor = 0
         self._next_finalize_sequence: int | None = None
         self._reordered_finalized: dict[int, FinalizedFragment] = {}
+        self._active_clip_lock = threading.Lock()
+        self._active_clip_id: UUID | None = None
+        self._opened_clip_identities: dict[int, tuple[UUID, str, int]] = {}
+        self._opened_identity_changed = asyncio.Event()
+        self._durable_mutation_lock = asyncio.Lock()
         self._metadata_reconciliations = 0
         self._metadata_reconciliation_failures = 0
         self._last_metadata_reconciliation_error: str | None = None
@@ -714,6 +747,56 @@ class GStreamerRecorderRuntime:
     @property
     def last_finalized_fragment(self) -> FinalizedFragment | None:
         return self._last_finalized
+
+    def current_clip_id(self) -> UUID | None:
+        """Return only an identity whose WRITING row is already durable."""
+
+        with self._active_clip_lock:
+            return self._active_clip_id
+
+    async def execute_control_intent(self, intent_id: UUID) -> None:
+        """Run one catalog-prepared pair mutation through the recorder worker."""
+
+        if not isinstance(intent_id, UUID):
+            raise TypeError("intent_id must be a UUID")
+        finalizer = self._finalizer
+        if finalizer is None:
+            raise RecorderFinalizationFault("recorder finalizer is unavailable")
+        await self._durable_worker(
+            finalizer.execute_intent,
+            intent_id,
+            deadline_detail="control pair mutation exceeded its deadline",
+        )
+
+    async def trigger_control_event(
+        self,
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int,
+        next_count: int,
+        event_id: UUID,
+    ) -> EventProtectionResult:
+        """Linearize event protection with fragment close and pair mutation."""
+
+        finalizer = self._finalizer
+        if finalizer is None:
+            raise RecorderFinalizationFault("recorder finalizer is unavailable")
+        async with self._durable_mutation_lock:
+            with self._active_clip_lock:
+                current_clip_id = self._active_clip_id
+            value = await self._run_durable_worker(
+                finalizer.trigger_event,
+                current_clip_id,
+                source=source,
+                monotonic_now_ns=monotonic_now_ns,
+                previous_count=previous_count,
+                next_count=next_count,
+                event_id=event_id,
+                deadline_detail="event protection transaction exceeded its deadline",
+            )
+        if not isinstance(value, EventProtectionResult):
+            raise PipelineFault("event protection returned invalid durable evidence")
+        return value
 
     def bind_lifecycle_observer(self, observer: RuntimeLifecycleObserver) -> None:
         """Bind the daemon's O(1) event sink before runtime startup."""
@@ -1789,6 +1872,93 @@ class GStreamerRecorderRuntime:
             return True
         return await asyncio.to_thread(monitor.note_write_error, error)
 
+    async def _register_opened_fragment(self, opened: OpenedFragment) -> None:
+        finalizer = self._finalizer
+        offset = self._pipeline_monotonic_offset_ns
+        if finalizer is None or offset is None:
+            raise PipelineFault("fragment open lacks its catalog or monotonic binding")
+        if len(self._opened_clip_identities) >= _MAX_REORDERED_CLOSURES + 1:
+            raise PipelineFault("active fragment identity buffer exceeded its bound")
+        if opened.sequence in self._opened_clip_identities:
+            raise PipelineFault("fragment-opened reported a duplicate sequence")
+        clip_id = uuid4()
+        start_monotonic_ns = offset + opened.running_time_ns
+        async with self._durable_mutation_lock:
+            retention_order = await asyncio.to_thread(finalizer.next_retention_order)
+            await self._run_durable_worker(
+                finalizer.register_active_clip,
+                provisional_video_name=opened.path.name,
+                clip_id=clip_id,
+                start_monotonic_ns=start_monotonic_ns,
+                retention_order=retention_order,
+                deadline_detail="active clip registration exceeded its deadline",
+            )
+            self._opened_clip_identities[opened.sequence] = (
+                clip_id,
+                opened.path.name,
+                retention_order,
+            )
+            self._opened_identity_changed.set()
+            with self._active_clip_lock:
+                self._active_clip_id = clip_id
+
+    async def _drain_opened(self, backend: RuntimeBackend) -> None:
+        while True:
+            opened = await backend.next_opened_fragment()
+            await self._register_opened_fragment(opened)
+
+    async def _await_opened_identity(self, sequence: int) -> tuple[UUID, str, int] | None:
+        value = self._opened_clip_identities.get(sequence)
+        if value is not None:
+            return value
+        self._opened_identity_changed.clear()
+        value = self._opened_clip_identities.get(sequence)
+        if value is not None:
+            return value
+        try:
+            await asyncio.wait_for(
+                self._opened_identity_changed.wait(),
+                timeout=self._limits.finalizer_timeout_s,
+            )
+        except TimeoutError:
+            return None
+        return self._opened_clip_identities.get(sequence)
+
+    async def _demote_unclosed_active_clips(self) -> None:
+        finalizer = self._finalizer
+        if finalizer is None or not self._opened_clip_identities:
+            return
+        async with self._durable_mutation_lock:
+            remaining = len(self._opened_clip_identities)
+            while remaining:
+                value = await self._run_durable_worker(
+                    finalizer.reconcile_orphaned_writing,
+                    limit=remaining,
+                    deadline_detail="active clip orphan reconciliation exceeded its deadline",
+                )
+                if not isinstance(value, tuple) or len(value) != 2:
+                    raise PipelineFault(
+                        "active clip orphan reconciliation returned invalid evidence"
+                    )
+                examined, more_work = value
+                if (
+                    isinstance(examined, bool)
+                    or not isinstance(examined, int)
+                    or examined < 0
+                    or not isinstance(more_work, bool)
+                ):
+                    raise PipelineFault(
+                        "active clip orphan reconciliation returned invalid evidence"
+                    )
+                if more_work and examined == 0:
+                    raise PipelineFault("active clip orphan reconciliation made no progress")
+                if not more_work:
+                    break
+                remaining -= examined
+            self._opened_clip_identities.clear()
+            with self._active_clip_lock:
+                self._active_clip_id = None
+
     async def _drain_finalized(self, backend: RuntimeBackend) -> None:
         while True:
             fragment = await backend.next_finalized_fragment()
@@ -1812,6 +1982,23 @@ class GStreamerRecorderRuntime:
                 backend.mark_finalized_fragment_processed()
 
     async def _durable_worker(
+        self,
+        callback: Callable[..., object],
+        *arguments: object,
+        deadline_detail: str,
+        **keywords: object,
+    ) -> object:
+        """Serialize every recorder-owned catalog/filesystem mutation."""
+
+        async with self._durable_mutation_lock:
+            return await self._run_durable_worker(
+                callback,
+                *arguments,
+                deadline_detail=deadline_detail,
+                **keywords,
+            )
+
+    async def _run_durable_worker(
         self,
         callback: Callable[..., object],
         *arguments: object,
@@ -1868,6 +2055,7 @@ class GStreamerRecorderRuntime:
             else self._next_fragment_start_running_ns
         )
         if finalizer is not None:
+            active_identity = await self._await_opened_identity(fragment.sequence)
             if (
                 config is None
                 or boot_uuid is None
@@ -1875,8 +2063,11 @@ class GStreamerRecorderRuntime:
                 or offset is None
                 or start_running_ns is None
                 or fragment.running_time_ns <= start_running_ns
+                or active_identity is None
+                or active_identity[1] != fragment.path.name
             ):
                 raise PipelineFault("fragment finalization timing contract is invalid")
+            clip_id = active_identity[0]
             duration_ns = fragment.running_time_ns - start_running_ns
             size_bytes = await asyncio.to_thread(finalizer.video_size, fragment.path.name)
             measured_bitrate = (size_bytes * 8_000_000_000) // duration_ns
@@ -1970,7 +2161,7 @@ class GStreamerRecorderRuntime:
             )
             sidecar = ClipSidecar(
                 schema_version=1,
-                clip_id=uuid4(),
+                clip_id=clip_id,
                 boot_id=boot_uuid,
                 sequence=fragment.sequence,
                 video_file=target_pair.video_name,
@@ -2013,14 +2204,19 @@ class GStreamerRecorderRuntime:
                 warnings=warnings,
             )
             sidecar = self._project_close_time_anchor(sidecar)
-            retention_order = await asyncio.to_thread(finalizer.next_retention_order)
-            await self._durable_worker(
-                finalizer.finalize,
-                provisional_video_name=fragment.path.name,
-                sidecar=sidecar,
-                retention_order=retention_order,
-                deadline_detail="clip finalization exceeded its deadline",
-            )
+            retention_order = active_identity[2]
+            async with self._durable_mutation_lock:
+                await self._run_durable_worker(
+                    finalizer.finalize,
+                    provisional_video_name=fragment.path.name,
+                    sidecar=sidecar,
+                    retention_order=retention_order,
+                    deadline_detail="clip finalization exceeded its deadline",
+                )
+                del self._opened_clip_identities[fragment.sequence]
+                with self._active_clip_lock:
+                    if self._active_clip_id == clip_id:
+                        self._active_clip_id = None
             if sidecar.timestamp_quality is TimestampQuality.MONOTONIC_ONLY:
                 if len(self._metadata_reconciliation_hints) < _MAX_METADATA_TRACKED:
                     self._metadata_reconciliation_hints.add(sidecar.clip_id)
@@ -2187,7 +2383,13 @@ class GStreamerRecorderRuntime:
 
     async def _cancel_background_tasks(self) -> None:
         tasks = tuple(
-            task for task in (self._backend_run_task, self._fragment_drain_task) if task is not None
+            task
+            for task in (
+                self._backend_run_task,
+                self._fragment_drain_task,
+                self._fragment_open_drain_task,
+            )
+            if task is not None
         )
         for task in tasks:
             if not task.done():
@@ -2196,6 +2398,7 @@ class GStreamerRecorderRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._backend_run_task = None
         self._fragment_drain_task = None
+        self._fragment_open_drain_task = None
 
     def _release_ownership(self) -> None:
         if self._ownership_claimed:
@@ -2330,10 +2533,6 @@ class GStreamerRecorderRuntime:
                 backend.run(self._backend_stop),
                 name="gstreamer-recorder-backend",
             )
-            self._fragment_drain_task = asyncio.create_task(
-                self._drain_finalized(backend),
-                name="gstreamer-fragment-events",
-            )
             opened_task = asyncio.create_task(
                 backend.wait_for_first_fragment_opened(),
                 name="gstreamer-first-fragment-open",
@@ -2364,6 +2563,17 @@ class GStreamerRecorderRuntime:
                 raise PipelineFault("pipeline running time exceeds the host monotonic clock")
             self._pipeline_monotonic_offset_ns = monotonic_now - opened.running_time_ns
             self._next_fragment_start_running_ns = opened.running_time_ns
+            if self._finalizer is not None:
+                await self._register_opened_fragment(opened)
+            self._fragment_drain_task = asyncio.create_task(
+                self._drain_finalized(backend),
+                name="gstreamer-fragment-events",
+            )
+            if self._finalizer is not None:
+                self._fragment_open_drain_task = asyncio.create_task(
+                    self._drain_opened(backend),
+                    name="gstreamer-fragment-open-events",
+                )
             self._counter_baseline = self._attempt_counters()
             observed_audio = self._attempt_audio_counters()
             self._audio_counter_baseline = (
@@ -2413,6 +2623,33 @@ class GStreamerRecorderRuntime:
                 raise RecorderStorageFault("READY storage evidence lacks a device identity")
             self._finalizer_device_id = device_id
             self._finalizer = self._finalizer_factory(recording_root, device_id)
+            for _ in range(self._limits.max_startup_reconciliation_passes):
+                orphan_value = await self._durable_worker(
+                    self._finalizer.reconcile_orphaned_writing,
+                    limit=self._limits.max_startup_reclamation_steps,
+                    deadline_detail="active clip orphan recovery exceeded its deadline",
+                )
+                if (
+                    not isinstance(orphan_value, tuple)
+                    or len(orphan_value) != 2
+                    or isinstance(orphan_value[0], bool)
+                    or not isinstance(orphan_value[0], int)
+                    or orphan_value[0] < 0
+                    or not isinstance(orphan_value[1], bool)
+                ):
+                    raise RecorderFinalizationFault(
+                        "active clip orphan recovery returned invalid evidence"
+                    )
+                if not orphan_value[1]:
+                    break
+                if orphan_value[0] == 0:
+                    raise RecorderFinalizationFault(
+                        "active clip orphan recovery made no bounded progress"
+                    )
+            else:
+                raise RecorderFinalizationFault(
+                    "active clip orphan recovery exceeded its bounded convergence passes"
+                )
             await self._initialize_storage_space_monitor(config, self._finalizer)
             status = None
             startup_steps_remaining = self._limits.max_startup_reclamation_steps
@@ -2522,6 +2759,8 @@ class GStreamerRecorderRuntime:
             supervised = {backend_task, external_stop}
             if self._fragment_drain_task is not None:
                 supervised.add(self._fragment_drain_task)
+            if self._fragment_open_drain_task is not None:
+                supervised.add(self._fragment_open_drain_task)
             if self._storage_space_task is not None:
                 supervised.add(self._storage_space_task)
             done, _ = await asyncio.wait(
@@ -2554,6 +2793,18 @@ class GStreamerRecorderRuntime:
                         f"fragment finalization failed: {_bounded_exception_detail(error)}"
                     ) from error
                 raise RecorderFinalizationFault("fragment finalizer exited unexpectedly")
+            if self._fragment_open_drain_task in done:
+                assert self._fragment_open_drain_task is not None
+                try:
+                    await self._fragment_open_drain_task
+                except BaseException as error:
+                    raise RecorderFinalizationFault(
+                        "fragment identity registration failed: "
+                        f"{_bounded_exception_detail(error)}"
+                    ) from error
+                raise RecorderFinalizationFault(
+                    "fragment identity registration exited unexpectedly"
+                )
             try:
                 await backend_task
             except BaseException as error:
@@ -2623,6 +2874,7 @@ class GStreamerRecorderRuntime:
         finally:
             self._roll_up_attempt_counters()
             await self._cancel_background_tasks()
+            await self._demote_unclosed_active_clips()
             self._backend = None
             self._counter_baseline = None
             self._drain_failure_observed = False

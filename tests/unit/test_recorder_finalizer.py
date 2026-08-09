@@ -8,11 +8,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from dashcam.catalog.database import ClipCatalog, RetentionThresholdLatch
+from dashcam.catalog.database import (
+    ActiveClipProtectionState,
+    ClipCatalog,
+    RetentionThresholdLatch,
+)
 from dashcam.catalog.filesystem import CatalogFilesystem
 from dashcam.catalog.models import (
     CatalogClip,
     ClipNotFoundError,
+    EventProtectionResult,
     EventSource,
     IntentReconciliationResult,
 )
@@ -109,7 +114,9 @@ class FakePromotionCatalog:
         *,
         promotion_paths: PairPaths,
         monotonic_now_ns: int,
+        expected_protection_revision: int | None = None,
     ) -> UUID:
+        del expected_protection_revision
         self.events.append("catalog-register")
         if self.fail_registration_once:
             self.fail_registration_once = False
@@ -128,6 +135,56 @@ class FakePromotionCatalog:
         self.clips[clip.clip_id] = clip
         self.intents[intent.intent_id] = intent
         return intent.intent_id
+
+    def register_writing_clip(self, clip: CatalogClip, *, monotonic_now_ns: int) -> None:
+        del monotonic_now_ns
+        if clip.clip_id in self.clips:
+            raise RuntimeError("duplicate clip")
+        self.clips[clip.clip_id] = clip
+
+    def active_closing_protection(
+        self,
+        clip_id: UUID,
+        *,
+        monotonic_now_ns: int,
+    ) -> ActiveClipProtectionState:
+        del monotonic_now_ns
+        clip = self.clips[clip_id]
+        return ActiveClipProtectionState(clip.protected, clip.protection_reason, 0)
+
+    def trigger_event(
+        self,
+        current_clip_id: UUID | None,
+        *,
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int = 2,
+        next_count: int = 1,
+        event_id: UUID | None = None,
+    ) -> EventProtectionResult:
+        del source, monotonic_now_ns, previous_count
+        if current_clip_id is None:
+            raise RuntimeError("new fake event requires a current clip")
+        return EventProtectionResult(
+            event_id=UUID(int=999) if event_id is None else event_id,
+            protected_clip_ids=(current_clip_id,),
+            missing_previous_count=0,
+            pending_next_count=next_count,
+            queued_intent_ids=(),
+        )
+
+    def list_writing_clips(self, *, limit: int) -> tuple[CatalogClip, ...]:
+        return tuple(
+            clip for clip in self.clips.values() if clip.lifecycle is ClipLifecycle.WRITING
+        )[:limit]
+
+    def mark_writing_clip_orphaned(self, clip_id: UUID, *, monotonic_now_ns: int) -> bool:
+        del monotonic_now_ns
+        clip = self.clips[clip_id]
+        if clip.lifecycle is not ClipLifecycle.WRITING:
+            return False
+        self.clips[clip_id] = replace(clip, lifecycle=ClipLifecycle.MISSING_SIDECAR)
+        return True
 
     def get_clip(self, clip_id: UUID) -> CatalogClip:
         try:
@@ -164,6 +221,29 @@ class FakePromotionCatalog:
                 intent
                 for intent_id, intent in self.intents.items()
                 if intent_id not in self.complete and intent.kind in kinds
+            ),
+            key=lambda intent: (intent.created_monotonic_ns, str(intent.intent_id)),
+        )
+        return tuple(values[:limit])
+
+    def get_pending_intent(self, intent_id: UUID) -> OperationIntent | None:
+        intent = self.intents.get(intent_id)
+        return None if intent_id in self.complete else intent
+
+    def list_pending_intents_for_clip(
+        self,
+        clip_id: UUID,
+        *,
+        kinds: tuple[IntentKind, ...],
+        limit: int,
+    ) -> tuple[OperationIntent, ...]:
+        values = sorted(
+            (
+                intent
+                for intent_id, intent in self.intents.items()
+                if intent_id not in self.complete
+                and intent.clip_id == clip_id
+                and intent.kind in kinds
             ),
             key=lambda intent: (intent.created_monotonic_ns, str(intent.intent_id)),
         )
@@ -389,6 +469,43 @@ def test_finalizer_persists_canonical_sidecar_and_intent_before_pair_moves(
     payload = filesystem.read_bytes(f"clips/{TARGET_SIDECAR}", maximum_bytes=1_048_576)
     assert parse_sidecar_bytes(payload) == _sidecar()
     assert ".partial" not in catalog.get_clip(CLIP_ID).video_path
+
+
+def test_active_event_clip_keeps_uuid_and_protected_sidecar_through_finalize(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    filesystem = InstrumentedFilesystem(root, [])
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        finalizer = _real_finalizer(root, catalog, filesystem)
+        finalizer.register_active_clip(
+            provisional_video_name=SOURCE_NAME,
+            clip_id=CLIP_ID,
+            start_monotonic_ns=10_000,
+            retention_order=10_000,
+        )
+        event = finalizer.trigger_event(
+            CLIP_ID,
+            source=EventSource.WEB,
+            monotonic_now_ns=2_000,
+            previous_count=0,
+            next_count=0,
+            event_id=UUID(int=900),
+        )
+
+        outcome = _finalize(finalizer)
+
+        durable = catalog.get_clip(CLIP_ID)
+        assert outcome.clip_id == CLIP_ID == durable.clip_id
+        assert durable.lifecycle is ClipLifecycle.FINALIZED
+        assert durable.protected and durable.pair_reconciled
+        assert durable.video_path.startswith("protected/")
+        payload = filesystem.read_bytes(durable.sidecar_path, maximum_bytes=1_048_576)
+        sidecar = parse_sidecar_bytes(payload)
+        assert sidecar.clip_id == CLIP_ID
+        assert sidecar.protected
+        assert sidecar.protection_reason == f"event:{event.event_id}:web"
+        assert catalog.list_pending_intents(limit=1) == ()
 
 
 def test_real_catalog_promotes_unsynced_clip_without_partial_target(tmp_path: Path) -> None:

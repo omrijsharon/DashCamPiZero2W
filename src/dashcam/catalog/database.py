@@ -232,6 +232,19 @@ class RetentionThresholdLatch:
             raise TypeError("reclaim_latched must be boolean")
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveClipProtectionState:
+    """Protection snapshot used to stage one active clip's closing sidecar."""
+
+    protected: bool
+    reason: str | None
+    revision: int
+
+
+class ActiveClipProtectionChanged(CatalogConflictError):
+    """The active clip's protection changed while its sidecar was staged."""
+
+
 class ClipCatalog:
     """Single-owner catalog API with transactional cross-process coordination."""
 
@@ -346,12 +359,148 @@ class ClipCatalog:
         with self._transaction():
             self._insert_clip_locked(clip, catalog_now_ns=catalog_now_ns)
 
+    def register_writing_clip(self, clip: CatalogClip, *, monotonic_now_ns: int) -> None:
+        """Durably bind one validated open fragment to its stable clip UUID."""
+
+        _validate_clip(clip)
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        video = PurePosixPath(clip.video_path)
+        sidecar = PurePosixPath(clip.sidecar_path)
+        if (
+            clip.lifecycle is not ClipLifecycle.WRITING
+            or video.parent.as_posix() != "pending"
+            or sidecar.parent.as_posix() != "pending"
+            or clip.end_monotonic_ns is not None
+            or clip.size_bytes != 0
+            or clip.protected
+            or clip.protection_reason is not None
+            or clip.pair_reconciled
+            or not clip.managed
+            or clip.download_lease is not None
+        ):
+            raise CatalogConflictError(
+                "active registration requires one unprotected managed pending WRITING clip"
+            )
+        try:
+            pair = ClipFilePair(video.name, sidecar.name)
+            parsed = parse_clip_filename(pair.video_name)
+        except ClipNameError as exc:
+            raise CatalogConflictError("active paths are not a safe provisional pair") from exc
+        if not parsed.partial:
+            raise CatalogConflictError("active video path must retain the partial suffix")
+        with self._transaction():
+            self._insert_clip_locked(clip, catalog_now_ns=monotonic_now_ns)
+
+    def active_closing_protection(
+        self,
+        clip_id: UUID,
+        *,
+        monotonic_now_ns: int,
+    ) -> ActiveClipProtectionState:
+        """Consume pending NEXT windows and return one linearizable close snapshot."""
+
+        _uuid(clip_id, "clip_id")
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        with self._transaction():
+            row = self._required_clip_row(clip_id)
+            if ClipLifecycle(str(row["lifecycle"])) is not ClipLifecycle.WRITING:
+                raise CatalogConflictError("only a WRITING clip can begin active finalization")
+            pending_events = self._connection.execute(
+                """
+                SELECT e.* FROM protection_events e
+                JOIN clips current ON current.clip_id = e.current_clip_id
+                WHERE e.remaining_next > 0
+                  AND e.current_clip_id <> ?
+                  AND current.retention_order < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM protection_event_targets t
+                      WHERE t.event_id = e.event_id AND t.clip_id = ?
+                  )
+                ORDER BY e.triggered_monotonic_ns, e.event_id
+                LIMIT ?
+                """,
+                (
+                    str(clip_id),
+                    int(row["retention_order"]),
+                    str(clip_id),
+                    MAX_PENDING_EVENT_WINDOWS,
+                ),
+            ).fetchall()
+            for event in pending_events:
+                event_id = UUID(str(event["event_id"]))
+                self._connection.execute(
+                    """
+                    INSERT INTO protection_event_targets (event_id, clip_id, role, ordinal)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        str(event_id),
+                        str(clip_id),
+                        EventTargetRole.NEXT.value,
+                        int(event["requested_next"]) - int(event["remaining_next"]) + 1,
+                    ),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE protection_events
+                    SET remaining_next = remaining_next - 1
+                    WHERE event_id = ? AND remaining_next > 0
+                    """,
+                    (str(event_id),),
+                )
+                self._protect_for_event_locked(
+                    clip_id,
+                    reason=f"event:{event_id}:pending-window",
+                    monotonic_now_ns=monotonic_now_ns,
+                )
+            refreshed = self._required_clip_row(clip_id)
+            return ActiveClipProtectionState(
+                bool(refreshed["protected"]),
+                cast(str | None, refreshed["protection_reason"]),
+                int(refreshed["protection_revision"]),
+            )
+
+    def list_writing_clips(self, *, limit: int) -> tuple[CatalogClip, ...]:
+        """Return a stable bounded startup view of unclosed active rows."""
+
+        _row_limit(limit, "limit")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM clips WHERE lifecycle = ?
+                ORDER BY retention_order, clip_id LIMIT ?
+                """,
+                (ClipLifecycle.WRITING.value, limit),
+            ).fetchall()
+        return tuple(_clip_from_row(row) for row in rows)
+
+    def mark_writing_clip_orphaned(self, clip_id: UUID, *, monotonic_now_ns: int) -> bool:
+        """Demote one interrupted active row without deleting either pending member."""
+
+        _uuid(clip_id, "clip_id")
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        with self._transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE clips SET lifecycle = ?, pair_reconciled = 0, updated_catalog_ns = ?
+                WHERE clip_id = ? AND lifecycle = ?
+                """,
+                (
+                    ClipLifecycle.MISSING_SIDECAR.value,
+                    monotonic_now_ns,
+                    str(clip_id),
+                    ClipLifecycle.WRITING.value,
+                ),
+            )
+            return cursor.rowcount == 1
+
     def register_finalizing_clip(
         self,
         clip: CatalogClip,
         *,
         promotion_paths: PairPaths,
         monotonic_now_ns: int,
+        expected_protection_revision: int | None = None,
     ) -> UUID:
         """Atomically register one durable pending-to-clips pair move.
 
@@ -406,8 +555,52 @@ class ClipCatalog:
                 "finalization targets must remove the partial suffix without "
                 "changing clip identity"
             )
+        if expected_protection_revision is not None:
+            _non_negative_integer(expected_protection_revision, "expected_protection_revision")
         with self._transaction():
-            self._insert_clip_locked(clip, catalog_now_ns=monotonic_now_ns)
+            existing = self._connection.execute(
+                "SELECT * FROM clips WHERE clip_id = ?",
+                (str(clip.clip_id),),
+            ).fetchone()
+            if existing is None:
+                if expected_protection_revision is not None:
+                    raise CatalogConflictError("active finalization lost its WRITING row")
+                self._insert_clip_locked(clip, catalog_now_ns=monotonic_now_ns)
+            else:
+                if expected_protection_revision is None:
+                    raise CatalogConflictError("finalizing clip identity is already registered")
+                if int(existing["protection_revision"]) != expected_protection_revision:
+                    raise ActiveClipProtectionChanged(
+                        "active clip protection changed while its sidecar was staged"
+                    )
+                if (
+                    ClipLifecycle(str(existing["lifecycle"])) is not ClipLifecycle.WRITING
+                    or str(existing["video_path"]) != clip.video_path
+                    or str(existing["sidecar_path"]) != clip.sidecar_path
+                    or int(existing["start_monotonic_ns"]) != clip.start_monotonic_ns
+                    or int(existing["retention_order"]) != clip.retention_order
+                    or bool(existing["protected"]) is not clip.protected
+                    or cast(str | None, existing["protection_reason"])
+                    != clip.protection_reason
+                    or not bool(existing["managed"])
+                    or bool(existing["pair_reconciled"])
+                ):
+                    raise CatalogConflictError(
+                        "active FINALIZE transition differs from its durable WRITING identity"
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE clips SET lifecycle = ?, end_monotonic_ns = ?, size_bytes = ?,
+                        updated_catalog_ns = ? WHERE clip_id = ?
+                    """,
+                    (
+                        ClipLifecycle.FINALIZING.value,
+                        clip.end_monotonic_ns,
+                        clip.size_bytes,
+                        monotonic_now_ns,
+                        str(clip.clip_id),
+                    ),
+                )
             intent = self._insert_intent_locked(
                 clip.clip_id,
                 kind=IntentKind.FINALIZE,
@@ -888,12 +1081,14 @@ class ClipCatalog:
 
     def trigger_event(
         self,
-        current_clip_id: UUID,
+        current_clip_id: UUID | None,
         *,
         source: EventSource,
         monotonic_now_ns: int,
         previous_count: int = 2,
         next_count: int = 1,
+        event_id: UUID | None = None,
+        require_current_writing: bool = False,
     ) -> EventProtectionResult:
         """Protect previous/current clips and persist a future-clip window."""
 
@@ -902,10 +1097,57 @@ class ClipCatalog:
         _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
         _bounded_count(previous_count, "previous_count")
         _bounded_count(next_count, "next_count")
-        event_id = uuid4()
+        if not isinstance(require_current_writing, bool):
+            raise TypeError("require_current_writing must be boolean")
+        if event_id is not None:
+            _uuid(event_id, "event_id")
+        event_id = uuid4() if event_id is None else event_id
         reason = f"event:{event_id}:{source.value}"
         with self._transaction():
+            existing_event = self._connection.execute(
+                "SELECT * FROM protection_events WHERE event_id = ?",
+                (str(event_id),),
+            ).fetchone()
+            if existing_event is not None:
+                if (
+                    EventSource(str(existing_event["source"])) is not source
+                    or int(existing_event["requested_previous"]) != previous_count
+                    or int(existing_event["requested_next"]) != next_count
+                ):
+                    raise CatalogConflictError("event ID was already used for another request")
+                target_rows = self._connection.execute(
+                    """
+                    SELECT * FROM protection_event_targets WHERE event_id = ?
+                    ORDER BY CASE role
+                        WHEN 'PREVIOUS' THEN 0 WHEN 'CURRENT' THEN 1 ELSE 2 END,
+                        ordinal, clip_id
+                    """,
+                    (str(event_id),),
+                ).fetchall()
+                target_ids = tuple(UUID(str(row["clip_id"])) for row in target_rows)
+                queued: list[UUID] = []
+                for target_id in target_ids:
+                    pending = self._pending_intent_row(target_id)
+                    if (
+                        pending is not None
+                        and IntentKind(str(pending["kind"])) is IntentKind.PROTECT
+                    ):
+                        queued.append(UUID(str(pending["intent_id"])))
+                return EventProtectionResult(
+                    event_id=event_id,
+                    protected_clip_ids=target_ids,
+                    missing_previous_count=int(existing_event["missing_previous"]),
+                    pending_next_count=int(existing_event["remaining_next"]),
+                    queued_intent_ids=tuple(queued),
+                )
+            if current_clip_id is None:
+                raise CatalogConflictError("new event requires a current clip")
             current = self._required_clip_row(current_clip_id)
+            if (
+                require_current_writing
+                and ClipLifecycle(str(current["lifecycle"])) is not ClipLifecycle.WRITING
+            ):
+                raise CatalogConflictError("new recorder event requires the active WRITING clip")
             if ClipLifecycle(str(current["lifecycle"])) in {
                 ClipLifecycle.DELETING,
                 ClipLifecycle.DELETED,
@@ -1152,6 +1394,54 @@ class ClipCatalog:
                 LIMIT ?
                 """,
                 (*tuple(kind.value for kind in kinds), limit),
+            ).fetchall()
+        return tuple(_intent_from_row(row) for row in rows)
+
+    def get_pending_intent(self, intent_id: UUID) -> OperationIntent | None:
+        """Return one exact pending intent without an unrelated-prefix scan."""
+
+        _uuid(intent_id, "intent_id")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM operation_intents
+                WHERE intent_id = ? AND status = 'PENDING'
+                """,
+                (str(intent_id),),
+            ).fetchone()
+        return None if row is None else _intent_from_row(row)
+
+    def list_pending_intents_for_clip(
+        self,
+        clip_id: UUID,
+        *,
+        kinds: tuple[IntentKind, ...],
+        limit: int,
+    ) -> tuple[OperationIntent, ...]:
+        """Return bounded pending kinds for one clip without prefix masking."""
+
+        _uuid(clip_id, "clip_id")
+        _row_limit(limit, "limit")
+        if (
+            not isinstance(kinds, tuple)
+            or not kinds
+            or len(kinds) > len(IntentKind)
+            or any(not isinstance(kind, IntentKind) for kind in kinds)
+            or len(set(kinds)) != len(kinds)
+        ):
+            raise ValueError("kinds must be a non-empty unique IntentKind tuple")
+        placeholders = ",".join("?" for _ in kinds)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM operation_intents
+                WHERE status = 'PENDING'
+                  AND clip_id = ?
+                  AND kind IN ({placeholders})
+                ORDER BY created_monotonic_ns, intent_id
+                LIMIT ?
+                """,
+                (str(clip_id), *tuple(kind.value for kind in kinds), limit),
             ).fetchall()
         return tuple(_intent_from_row(row) for row in rows)
 

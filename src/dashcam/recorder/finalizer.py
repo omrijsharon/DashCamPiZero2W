@@ -14,16 +14,22 @@ import stat
 import tempfile
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Final, Protocol
 from uuid import UUID
 
-from dashcam.catalog.database import RetentionThresholdLatch
+from dashcam.catalog.database import (
+    ActiveClipProtectionChanged,
+    ActiveClipProtectionState,
+    RetentionThresholdLatch,
+)
 from dashcam.catalog.filesystem import CatalogFilesystem, RootedFilesystem
 from dashcam.catalog.models import (
     CatalogClip,
     ClipNotFoundError,
+    EventProtectionResult,
+    EventSource,
     IntentReconciliationResult,
 )
 from dashcam.metadata.coordinator import (
@@ -77,7 +83,43 @@ class PairPromotionCatalog(Protocol):
         *,
         promotion_paths: PairPaths,
         monotonic_now_ns: int,
+        expected_protection_revision: int | None = None,
     ) -> UUID: ...
+
+    def register_writing_clip(
+        self,
+        clip: CatalogClip,
+        *,
+        monotonic_now_ns: int,
+    ) -> None: ...
+
+    def active_closing_protection(
+        self,
+        clip_id: UUID,
+        *,
+        monotonic_now_ns: int,
+    ) -> ActiveClipProtectionState: ...
+
+    def trigger_event(
+        self,
+        current_clip_id: UUID | None,
+        *,
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int = 2,
+        next_count: int = 1,
+        event_id: UUID | None = None,
+        require_current_writing: bool = False,
+    ) -> EventProtectionResult: ...
+
+    def list_writing_clips(self, *, limit: int) -> tuple[CatalogClip, ...]: ...
+
+    def mark_writing_clip_orphaned(
+        self,
+        clip_id: UUID,
+        *,
+        monotonic_now_ns: int,
+    ) -> bool: ...
 
     def get_clip(self, clip_id: UUID) -> CatalogClip: ...
 
@@ -102,6 +144,16 @@ class PairPromotionCatalog(Protocol):
 
     def list_pending_intents_by_kind(
         self,
+        *,
+        kinds: tuple[IntentKind, ...],
+        limit: int,
+    ) -> tuple[OperationIntent, ...]: ...
+
+    def get_pending_intent(self, intent_id: UUID) -> OperationIntent | None: ...
+
+    def list_pending_intents_for_clip(
+        self,
+        clip_id: UUID,
         *,
         kinds: tuple[IntentKind, ...],
         limit: int,
@@ -148,6 +200,7 @@ class FinalizerLimits:
     max_pending_intents: int = 64
     max_actions_per_intent: int = 2
     max_sidecar_bytes: int = MAX_SIDECAR_BYTES
+    max_protection_retries: int = 3
 
     def __post_init__(self) -> None:
         for name, value, maximum in (
@@ -155,6 +208,7 @@ class FinalizerLimits:
             ("max_pending_intents", self.max_pending_intents, _MAX_PENDING_INTENTS),
             ("max_actions_per_intent", self.max_actions_per_intent, 2),
             ("max_sidecar_bytes", self.max_sidecar_bytes, MAX_SIDECAR_BYTES),
+            ("max_protection_retries", self.max_protection_retries, 8),
         ):
             if (
                 isinstance(value, bool)
@@ -419,6 +473,51 @@ class RecorderClipFinalizer:
             monotonic_ns=monotonic_ns,
         )
 
+    def register_active_clip(
+        self,
+        *,
+        provisional_video_name: str,
+        clip_id: UUID,
+        start_monotonic_ns: int,
+        retention_order: int,
+    ) -> None:
+        """Persist an opened fragment's stable identity before it is exposed."""
+
+        source = _promotion_source(provisional_video_name)
+        parsed = parse_clip_filename(PurePosixPath(source).name)
+        if not parsed.partial:
+            raise FinalizationRefused("active fragment must use a provisional filename")
+        _non_negative(start_monotonic_ns, "start_monotonic_ns")
+        _non_negative(retention_order, "retention_order")
+        sidecar_source = source.removesuffix(".mp4") + ".json"
+        clip = CatalogClip(
+            clip_id=clip_id,
+            lifecycle=ClipLifecycle.WRITING,
+            video_path=source,
+            sidecar_path=sidecar_source,
+            start_monotonic_ns=start_monotonic_ns,
+            end_monotonic_ns=None,
+            retention_order=retention_order,
+            size_bytes=0,
+            protected=False,
+            protection_reason=None,
+            pair_reconciled=False,
+            managed=True,
+        )
+        self._catalog.register_writing_clip(clip, monotonic_now_ns=self._now())
+
+    def reconcile_orphaned_writing(self, *, limit: int) -> tuple[int, bool]:
+        """Boundedly demote prior-process WRITING rows without deleting partials."""
+
+        _positive_bound(limit, "limit")
+        values = self._catalog.list_writing_clips(limit=limit + 1)
+        for clip in values[:limit]:
+            self._catalog.mark_writing_clip_orphaned(
+                clip.clip_id,
+                monotonic_now_ns=self._now(),
+            )
+        return min(len(values), limit), len(values) > limit
+
     def finalize(
         self,
         *,
@@ -445,7 +544,8 @@ class RecorderClipFinalizer:
             raise FinalizationRefused("pending intent scan bound prevents unique registration")
 
         existing = self._get_clip_if_present(sidecar.clip_id)
-        if existing is not None:
+        active = existing is not None and existing.lifecycle is ClipLifecycle.WRITING
+        if existing is not None and not active:
             return self._completed_replay(existing, paths, expected_payload)
 
         pending_names = self._directory_names("pending")
@@ -466,29 +566,120 @@ class RecorderClipFinalizer:
         if size_bytes <= 0:
             raise FinalizationRefused("closed provisional MP4 is empty")
         self._filesystem.sync_file(paths.video_source)
-        self._ensure_pending_sidecar(paths.sidecar_source, sidecar, expected_payload)
-
-        clip = CatalogClip(
-            clip_id=sidecar.clip_id,
-            lifecycle=ClipLifecycle.FINALIZING,
-            video_path=paths.video_source,
-            sidecar_path=paths.sidecar_source,
-            start_monotonic_ns=sidecar.start_monotonic_ns,
-            end_monotonic_ns=sidecar.end_monotonic_ns,
-            retention_order=retention_order,
-            size_bytes=size_bytes,
-            protected=sidecar.protected,
-            protection_reason=sidecar.protection_reason,
-            pair_reconciled=False,
-            managed=True,
-        )
-        intent_id = self._catalog.register_finalizing_clip(
-            clip,
-            promotion_paths=paths,
-            monotonic_now_ns=self._now(),
-        )
+        attempts = self._limits.max_protection_retries if active else 1
+        intent_id: UUID | None = None
+        effective_sidecar = sidecar
+        for _ in range(attempts):
+            protection: ActiveClipProtectionState | None = None
+            if active:
+                protection = self._catalog.active_closing_protection(
+                    sidecar.clip_id,
+                    monotonic_now_ns=self._now(),
+                )
+                effective_sidecar = replace(
+                    sidecar,
+                    protected=protection.protected,
+                    protection_reason=protection.reason,
+                )
+            expected_payload = effective_sidecar.to_canonical_json()
+            self._ensure_pending_sidecar(
+                paths.sidecar_source,
+                effective_sidecar,
+                expected_payload,
+                replace_existing=active,
+            )
+            clip = CatalogClip(
+                clip_id=effective_sidecar.clip_id,
+                lifecycle=ClipLifecycle.FINALIZING,
+                video_path=paths.video_source,
+                sidecar_path=paths.sidecar_source,
+                start_monotonic_ns=effective_sidecar.start_monotonic_ns,
+                end_monotonic_ns=effective_sidecar.end_monotonic_ns,
+                retention_order=retention_order,
+                size_bytes=size_bytes,
+                protected=effective_sidecar.protected,
+                protection_reason=effective_sidecar.protection_reason,
+                pair_reconciled=False,
+                managed=True,
+            )
+            try:
+                intent_id = self._catalog.register_finalizing_clip(
+                    clip,
+                    promotion_paths=paths,
+                    monotonic_now_ns=self._now(),
+                    expected_protection_revision=(
+                        None if protection is None else protection.revision
+                    ),
+                )
+            except ActiveClipProtectionChanged:
+                continue
+            break
+        if intent_id is None:
+            raise FinalizationRefused(
+                "active clip protection did not stabilize within its retry bound"
+            )
         intent = self._find_registered_intent(intent_id, sidecar.clip_id, paths)
-        return self._reconcile(intent, resumed=False)
+        outcome = self._reconcile(intent, resumed=False)
+        if outcome.complete and effective_sidecar.protected:
+            return self._reconcile_clip_followups(outcome)
+        return outcome
+
+    def execute_intent(self, intent_id: UUID) -> FinalizationOutcome:
+        """Execute one recorder-authorized durable pair intent and its compensation."""
+
+        intent = self._catalog.get_pending_intent(intent_id)
+        if intent is None:
+            raise FinalizationRefused("control intent is not pending")
+        outcome = self._reconcile(intent, resumed=True)
+        return self._reconcile_clip_followups(outcome) if outcome.complete else outcome
+
+    def trigger_event(
+        self,
+        current_clip_id: UUID | None,
+        *,
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int,
+        next_count: int,
+        event_id: UUID,
+    ) -> EventProtectionResult:
+        """Commit one idempotent event and converge its immediately queued moves."""
+
+        event = self._catalog.trigger_event(
+            current_clip_id,
+            source=source,
+            monotonic_now_ns=monotonic_now_ns,
+            previous_count=previous_count,
+            next_count=next_count,
+            event_id=event_id,
+            require_current_writing=True,
+        )
+        for intent_id in event.queued_intent_ids:
+            outcome = self.execute_intent(intent_id)
+            if not outcome.complete:
+                raise FinalizationRefused("event protection intent did not converge")
+        return event
+
+    def _reconcile_clip_followups(
+        self,
+        initial: FinalizationOutcome,
+    ) -> FinalizationOutcome:
+        actions = initial.actions_attempted
+        for _ in range(2):
+            values = self._catalog.list_pending_intents_for_clip(
+                initial.clip_id,
+                kinds=(IntentKind.PROTECT, IntentKind.UNPROTECT),
+                limit=2,
+            )
+            if not values:
+                return replace(initial, actions_attempted=actions)
+            if len(values) != 1:
+                raise FinalizationRefused("clip has ambiguous protection follow-up intents")
+            followup = self._reconcile(values[0], resumed=True)
+            actions += followup.actions_attempted
+            if not followup.complete:
+                return replace(initial, actions_attempted=actions, complete=False)
+        raise FinalizationRefused("clip protection compensation exceeded its bound")
 
     def video_size(self, provisional_video_name: str) -> int:
         """Return the bounded regular-file size used to build honest metadata."""
@@ -626,14 +817,9 @@ class RecorderClipFinalizer:
     def _find_registered_intent(
         self, intent_id: UUID, clip_id: UUID, paths: PairPaths
     ) -> OperationIntent:
-        intents, truncated = self._pending_intents()
-        matches = tuple(intent for intent in intents if intent.intent_id == intent_id)
-        if len(matches) != 1:
-            qualifier = " within the bounded scan" if truncated else ""
-            raise FinalizationRefused(
-                f"catalog did not expose exactly one committed intent{qualifier}"
-            )
-        intent = matches[0]
+        intent = self._catalog.get_pending_intent(intent_id)
+        if intent is None:
+            raise FinalizationRefused("catalog did not expose the committed intent")
         if intent.clip_id != clip_id:
             raise FinalizationRefused("registered intent changed clip identity")
         self._validate_intent(intent, paths)
@@ -675,7 +861,12 @@ class RecorderClipFinalizer:
                 raise FinalizationRefused("durable sidecar differs from requested metadata")
 
     def _ensure_pending_sidecar(
-        self, relative_path: str, sidecar: ClipSidecar, expected_payload: bytes
+        self,
+        relative_path: str,
+        sidecar: ClipSidecar,
+        expected_payload: bytes,
+        *,
+        replace_existing: bool = False,
     ) -> None:
         if self._filesystem.exists(relative_path):
             try:
@@ -687,6 +878,21 @@ class RecorderClipFinalizer:
             except (OSError, SidecarParseError, ValueError) as exc:
                 raise FinalizationRefused("existing pending sidecar is not canonical") from exc
             if existing != expected_payload or parsed != sidecar:
+                if replace_existing:
+                    self._filesystem.replace_bytes_atomic(
+                        relative_path,
+                        expected_payload,
+                        maximum_bytes=self._limits.max_sidecar_bytes,
+                    )
+                    persisted = self._filesystem.read_bytes(
+                        relative_path,
+                        maximum_bytes=self._limits.max_sidecar_bytes,
+                    )
+                    if persisted != expected_payload:
+                        raise FinalizationRefused(
+                            "replacement pending sidecar failed canonical readback"
+                        )
+                    return
                 raise FinalizationRefused("existing pending sidecar has different identity")
             return
         self._filesystem.write_staged_sidecar(relative_path, sidecar)

@@ -15,6 +15,7 @@ import pytest
 from dashcam.audio.alsa import AlsaCaptureDevice, AlsaIdentity
 from dashcam.audio.linux import AudioDiscoveryOutcome, AudioDiscoveryStatus
 from dashcam.catalog.database import RetentionThresholdLatch
+from dashcam.catalog.models import EventProtectionResult, EventSource
 from dashcam.config import (
     AudioConfig,
     DashcamConfig,
@@ -158,6 +159,37 @@ class FakePreflight:
         return self.result
 
 
+class SignalingFinalizedQueue(asyncio.Queue[FinalizedFragment]):
+    def __init__(self, backend: FakeBackend) -> None:
+        super().__init__()
+        self._backend = backend
+        self._opened_sequences = {backend.opened_sequence}
+        self._ends: dict[int, int] = {}
+
+    def mark_opened(self, sequence: int) -> None:
+        self._opened_sequences.add(sequence)
+
+    async def put(self, item: FinalizedFragment) -> None:
+        if item.sequence not in self._opened_sequences:
+            start = item.start_running_time_ns
+            if start is None:
+                start = self._ends.get(item.sequence - 1)
+            if start is None:
+                start = item.sequence * 1_000_000_000
+            await self._backend.subsequently_opened.put(
+                OpenedFragment(
+                    item.path,
+                    item.sequence,
+                    start,
+                    start,
+                    item.media_contract,
+                )
+            )
+            self._opened_sequences.add(item.sequence)
+        self._ends[item.sequence] = item.running_time_ns
+        await super().put(item)
+
+
 @dataclass
 class FakeBackend:
     effective: VideoProfile = field(default_factory=VideoProfile)
@@ -170,10 +202,14 @@ class FakeBackend:
     started_with: list[VideoProfile] = field(default_factory=list)
     stop_calls: int = 0
     run_started: asyncio.Event = field(default_factory=asyncio.Event)
-    finalized: asyncio.Queue[FinalizedFragment] = field(default_factory=asyncio.Queue)
+    finalized: asyncio.Queue[FinalizedFragment] = field(init=False)
+    subsequently_opened: asyncio.Queue[OpenedFragment] = field(default_factory=asyncio.Queue)
     configured_overlay_texts: list[str | None] = field(default_factory=list)
     overlay_texts: list[str | None] = field(default_factory=list)
     overlay_error: BaseException | None = None
+
+    def __post_init__(self) -> None:
+        self.finalized = SignalingFinalizedQueue(self)
 
     def configure_overlay_text(self, text: str | None) -> None:
         self.configured_overlay_texts.append(text)
@@ -205,11 +241,16 @@ class FakeBackend:
     async def wait_for_first_fragment_opened(self) -> OpenedFragment:
         if self.open_gate is not None:
             await self.open_gate.wait()
+        if isinstance(self.finalized, SignalingFinalizedQueue):
+            self.finalized.mark_opened(self.opened_sequence)
         return OpenedFragment(
             Path(f"/srv/dashcam/pending/boot-abcdef123456-{self.opened_sequence:06d}.partial.mp4"),
             self.opened_sequence,
             0,
         )
+
+    async def next_opened_fragment(self) -> OpenedFragment:
+        return await self.subsequently_opened.get()
 
     async def next_finalized_fragment(self) -> FinalizedFragment:
         return await self.finalized.get()
@@ -347,6 +388,60 @@ class FakeFinalizer:
     reclamation_steps: list[ReclamationStep] = field(default_factory=list)
     reclamation_calls: list[tuple[str, bool]] = field(default_factory=list)
     reconciliation_reports: list[FinalizationRecoveryReport] = field(default_factory=list)
+    active_registrations: list[tuple[str, UUID, int, int]] = field(default_factory=list)
+    orphan_reports: list[tuple[int, bool]] = field(default_factory=list)
+    executed_intents: list[UUID] = field(default_factory=list)
+    triggered_events: list[tuple[UUID, UUID]] = field(default_factory=list)
+    triggered_event_targets: dict[UUID, UUID] = field(default_factory=dict)
+    next_order: int = 7
+
+    def register_active_clip(
+        self,
+        *,
+        provisional_video_name: str,
+        clip_id: UUID,
+        start_monotonic_ns: int,
+        retention_order: int,
+    ) -> None:
+        self.active_registrations.append(
+            (provisional_video_name, clip_id, start_monotonic_ns, retention_order)
+        )
+
+    def reconcile_orphaned_writing(self, *, limit: int) -> tuple[int, bool]:
+        del limit
+        if self.orphan_reports:
+            return self.orphan_reports.pop(0)
+        return (0, False)
+
+    def execute_intent(self, intent_id: UUID) -> object:
+        self.executed_intents.append(intent_id)
+        return object()
+
+    def trigger_event(
+        self,
+        current_clip_id: UUID | None,
+        *,
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int,
+        next_count: int,
+        event_id: UUID,
+    ) -> EventProtectionResult:
+        del source, monotonic_now_ns, previous_count
+        target = self.triggered_event_targets.get(event_id)
+        if target is None:
+            if current_clip_id is None:
+                raise RuntimeError("new fake event requires a current clip")
+            target = current_clip_id
+            self.triggered_event_targets[event_id] = target
+        self.triggered_events.append((target, event_id))
+        return EventProtectionResult(
+            event_id=event_id,
+            protected_clip_ids=(target,),
+            missing_previous_count=0,
+            pending_next_count=next_count,
+            queued_intent_ids=(),
+        )
 
     def reconcile_pending(self) -> FinalizationRecoveryReport:
         self.reconciled += 1
@@ -359,7 +454,9 @@ class FakeFinalizer:
         return 1_000_000
 
     def next_retention_order(self) -> int:
-        return 7
+        value = self.next_order
+        self.next_order += 1
+        return value
 
     def retention_threshold_latch(self) -> RetentionThresholdLatch | None:
         return self.retention_latch
@@ -1213,6 +1310,309 @@ def test_finalized_fragment_is_promoted_with_canonical_unsynced_metadata() -> No
         assert parse_sidecar_bytes(sidecar_value.to_canonical_json()) == sidecar_value
         assert retention_order == 7
         assert finalizer.reconciled == 1
+
+    run_async(scenario)
+
+
+def test_current_clip_is_durable_before_exposure_and_uuid_survives_rollover() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            monotonic_ns=lambda: 1_000,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+
+        first_id = runtime.current_clip_id()
+        assert first_id is not None
+        assert finalizer.active_registrations[0][1] == first_id
+        assert finalizer.active_registrations[0][0].endswith("000000.partial.mp4")
+        control_intent = UUID(int=901)
+        await runtime.execute_control_intent(control_intent)
+        assert finalizer.executed_intents == [control_intent]
+        event_id = UUID(int=902)
+        event = await runtime.trigger_control_event(
+            EventSource.WEB,
+            10_000,
+            2,
+            1,
+            event_id,
+        )
+        assert event.event_id == event_id
+        assert finalizer.triggered_events == [(first_id, event_id)]
+
+        successor = OpenedFragment(
+            Path("/srv/dashcam/pending/boot-abcdef123456-000001.partial.mp4"),
+            1,
+            60_000_000_000,
+            60_000_000_000,
+        )
+        assert isinstance(backend.finalized, SignalingFinalizedQueue)
+        backend.finalized.mark_opened(1)
+        await backend.subsequently_opened.put(successor)
+        while runtime.current_clip_id() == first_id:
+            await asyncio.sleep(0)
+        second_id = runtime.current_clip_id()
+        assert second_id is not None and second_id != first_id
+
+        await backend.finalized.put(
+            FinalizedFragment(
+                Path("/srv/dashcam/pending/boot-abcdef123456-000000.partial.mp4"),
+                0,
+                60_000_000_000,
+            )
+        )
+        await asyncio.wait_for(backend.finalized.join(), timeout=1)
+        first_sidecar = cast(ClipSidecar, finalizer.calls[0][1])
+        assert first_sidecar.clip_id == first_id
+        assert finalizer.calls[0][2] == finalizer.active_registrations[0][3] == 7
+        assert runtime.current_clip_id() == second_id
+
+        await backend.finalized.put(
+            FinalizedFragment(
+                successor.path,
+                1,
+                120_000_000_000,
+                60_000_000_000,
+            )
+        )
+        await asyncio.wait_for(backend.finalized.join(), timeout=1)
+        second_sidecar = cast(ClipSidecar, finalizer.calls[1][1])
+        assert second_sidecar.clip_id == second_id
+        assert finalizer.calls[1][2] == finalizer.active_registrations[1][3] == 8
+        assert runtime.current_clip_id() is None
+        replay = await runtime.trigger_control_event(
+            EventSource.WEB,
+            20_000,
+            2,
+            1,
+            event_id,
+        )
+        assert replay.event_id == event_id
+        assert finalizer.triggered_events == [(first_id, event_id)] * 2
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_event_mutation_waits_for_inflight_fragment_finalization() -> None:
+    @dataclass
+    class BlockingFinalizer(FakeFinalizer):
+        finalize_entered: threading.Event = field(default_factory=threading.Event)
+        finalize_release: threading.Event = field(default_factory=threading.Event)
+
+        def finalize(
+            self,
+            *,
+            provisional_video_name: str,
+            sidecar: ClipSidecar,
+            retention_order: int,
+        ) -> object:
+            self.finalize_entered.set()
+            assert self.finalize_release.wait(timeout=2)
+            return super().finalize(
+                provisional_video_name=provisional_video_name,
+                sidecar=sidecar,
+                retention_order=retention_order,
+            )
+
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = BlockingFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            monotonic_ns=lambda: 1_000,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+        first_id = runtime.current_clip_id()
+        assert first_id is not None
+        successor = OpenedFragment(
+            Path("/srv/dashcam/pending/boot-abcdef123456-000001.partial.mp4"),
+            1,
+            60_000_000_000,
+            60_000_000_000,
+        )
+        assert isinstance(backend.finalized, SignalingFinalizedQueue)
+        backend.finalized.mark_opened(1)
+        await backend.subsequently_opened.put(successor)
+        while runtime.current_clip_id() == first_id:
+            await asyncio.sleep(0)
+        successor_id = runtime.current_clip_id()
+        assert successor_id is not None and successor_id != first_id
+        await backend.finalized.put(
+            FinalizedFragment(
+                Path("/srv/dashcam/pending/boot-abcdef123456-000000.partial.mp4"),
+                0,
+                60_000_000_000,
+            )
+        )
+        assert await asyncio.to_thread(finalizer.finalize_entered.wait, 1)
+        event_id = UUID(int=903)
+        event_task = asyncio.create_task(
+            runtime.trigger_control_event(
+                EventSource.WEB,
+                10_000,
+                2,
+                1,
+                event_id,
+            )
+        )
+        await asyncio.sleep(0.01)
+        assert finalizer.triggered_events == []
+        finalizer.finalize_release.set()
+        await asyncio.wait_for(backend.finalized.join(), timeout=1)
+        event = await asyncio.wait_for(event_task, timeout=1)
+        assert event.event_id == event_id
+        assert finalizer.triggered_events == [(successor_id, event_id)]
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_event_waits_for_successor_registration_and_observes_published_identity() -> None:
+    @dataclass
+    class BlockingRegistrationFinalizer(FakeFinalizer):
+        successor_entered: threading.Event = field(default_factory=threading.Event)
+        successor_release: threading.Event = field(default_factory=threading.Event)
+
+        def register_active_clip(
+            self,
+            *,
+            provisional_video_name: str,
+            clip_id: UUID,
+            start_monotonic_ns: int,
+            retention_order: int,
+        ) -> None:
+            if self.active_registrations:
+                self.successor_entered.set()
+                assert self.successor_release.wait(timeout=2)
+            super().register_active_clip(
+                provisional_video_name=provisional_video_name,
+                clip_id=clip_id,
+                start_monotonic_ns=start_monotonic_ns,
+                retention_order=retention_order,
+            )
+
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = BlockingRegistrationFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            monotonic_ns=lambda: 1_000,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+        first_id = runtime.current_clip_id()
+        assert first_id is not None
+        await backend.subsequently_opened.put(
+            OpenedFragment(
+                Path("/srv/dashcam/pending/boot-abcdef123456-000001.partial.mp4"),
+                1,
+                60_000_000_000,
+                60_000_000_000,
+            )
+        )
+        assert await asyncio.to_thread(finalizer.successor_entered.wait, 1)
+        event_id = UUID(int=904)
+        event_task = asyncio.create_task(
+            runtime.trigger_control_event(
+                EventSource.WEB,
+                10_000,
+                2,
+                1,
+                event_id,
+            )
+        )
+        await asyncio.sleep(0.01)
+        assert finalizer.triggered_events == []
+        finalizer.successor_release.set()
+        event = await asyncio.wait_for(event_task, timeout=1)
+        successor_id = runtime.current_clip_id()
+        assert successor_id is not None and successor_id != first_id
+        assert event.protected_clip_ids == (successor_id,)
+        assert finalizer.triggered_events == [(successor_id, event_id)]
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_startup_orphan_recovery_is_bounded_and_precedes_camera() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(orphan_reports=[(1, True), (1, False)])
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+        assert backend.started_with == [VideoProfile()]
+        assert finalizer.orphan_reports == []
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_startup_orphan_backlog_refuses_before_camera() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(orphan_reports=[(1, True), (1, True)])
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            limits=RuntimeLimits(max_startup_reconciliation_passes=2),
+        )
+        config = default_config()
+        await runtime.check(config)
+        with pytest.raises(RecorderFinalizationFault, match="orphan recovery exceeded"):
+            await runtime.start(config)
+        assert backend.started_with == []
+        assert runtime.current_clip_id() is None
 
     run_async(scenario)
 

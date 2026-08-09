@@ -97,6 +97,7 @@ class CatalogBackend(Protocol):
         monotonic_now_ns: int,
         previous_count: int = 2,
         next_count: int = 1,
+        event_id: UUID | None = None,
     ) -> EventProtectionResult: ...
 
 
@@ -109,8 +110,11 @@ class PublicSnapshot(Protocol):
 ConfigProvider = Callable[[], DashcamConfig]
 ConfigWriter = Callable[[DashcamConfig], object]
 SnapshotProvider = Callable[[], Mapping[str, object] | PublicSnapshot]
-CurrentClipProvider = Callable[[], UUID | None]
 IntentExecutor = Callable[[UUID], Awaitable[None]]
+EventExecutor = Callable[
+    [EventSource, int, int, int, UUID],
+    Awaitable[EventProtectionResult],
+]
 OperationCallback = Callable[[], Awaitable[Mapping[str, object] | None]]
 
 
@@ -132,8 +136,8 @@ class RecorderControlDispatcher:
         config_writer: ConfigWriter,
         status_provider: SnapshotProvider,
         health_provider: SnapshotProvider,
-        current_clip_provider: CurrentClipProvider,
         intent_executor: IntentExecutor,
+        event_executor: EventExecutor,
         restart_callback: OperationCallback,
         prepare_removal_callback: OperationCallback,
         monotonic_ns: Callable[[], int],
@@ -171,8 +175,8 @@ class RecorderControlDispatcher:
         self._config_writer = config_writer
         self._status_provider = status_provider
         self._health_provider = health_provider
-        self._current_clip_provider = current_clip_provider
         self._intent_executor = intent_executor
+        self._event_executor = event_executor
         self._restart_callback = restart_callback
         self._prepare_removal_callback = prepare_removal_callback
         self._monotonic_ns = monotonic_ns
@@ -401,24 +405,17 @@ class RecorderControlDispatcher:
         try:
             now_ns = _now(self._monotonic_ns)
             if command is ControlCommand.EVENT:
-                _exact_arguments(arguments, {"source"})
+                _exact_arguments(arguments, {"source", "event_id"})
                 if arguments["source"] != EventSource.WEB.value:
                     raise _invalid("event source must be web")
-                current_clip_id = await asyncio.to_thread(self._current_clip_provider)
-                if current_clip_id is None:
-                    raise ControlOperationError(
-                        ErrorCode.CONFLICT, "No current clip is available for an event"
-                    )
-                if not isinstance(current_clip_id, UUID):
-                    raise RuntimeError("current clip provider returned an invalid ID")
+                event_id = _canonical_uuid(arguments, "event_id")
                 config = await asyncio.to_thread(self._config_provider)
-                event = await asyncio.to_thread(
-                    self._catalog.trigger_event,
-                    current_clip_id,
-                    source=EventSource.WEB,
-                    monotonic_now_ns=now_ns,
-                    previous_count=config.storage.protect_previous_clips,
-                    next_count=config.storage.protect_next_clips,
+                event = await self._event_executor(
+                    EventSource.WEB,
+                    now_ns,
+                    config.storage.protect_previous_clips,
+                    config.storage.protect_next_clips,
+                    event_id,
                 )
                 return _event_payload(event)
 
@@ -604,6 +601,19 @@ def _clip_id(arguments: Mapping[str, JsonValue]) -> UUID:
         raise _invalid("clip_id must be a canonical UUID") from error
 
 
+def _canonical_uuid(arguments: Mapping[str, JsonValue], name: str) -> UUID:
+    value = arguments.get(name)
+    if not isinstance(value, str):
+        raise _invalid(f"{name} must be a canonical UUID")
+    try:
+        parsed = UUID(value)
+    except ValueError as error:
+        raise _invalid(f"{name} must be a canonical UUID") from error
+    if str(parsed) != value:
+        raise _invalid(f"{name} must be a canonical UUID")
+    return parsed
+
+
 def _now(provider: Callable[[], int]) -> int:
     value = provider()
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -738,7 +748,6 @@ __all__ = [
     "ConfigProvider",
     "ConfigWriter",
     "ControlOperationState",
-    "CurrentClipProvider",
     "IntentExecutor",
     "OperationCallback",
     "PublicSnapshot",

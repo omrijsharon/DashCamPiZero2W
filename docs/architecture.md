@@ -275,7 +275,13 @@ Phone-preview transport remains open.
   clip-boundary stress and the longer paired resource comparison remain
   unchecked. The exact v7 wheel is now installed as hash-closed release
   `0.1.0.dev0-5f95dd806342ac9e`; deployment does not change its strict resource
-  refusal.
+  refusal. A later hash-closed fused-validation candidate retained full
+  per-buffer safety validation but did not clear the pre-matrix screening
+  contract: its same-boot p95 regressed by 0.9989 percentage points
+  and an encoder-input-PTS-gap drop was already present at the first
+  post-warm-up observation. It was rolled back to `5f95`; the source remains
+  rejected Git evidence rather than the installed release. See
+  `docs/test-reports/2026-08-09-milestone9-fused-validation-rejected.md`.
 - Comparative acceptance is fixed before the integrated run: paired arms use
   one warm-up plus at least ten one-minute clips and at least 1 Hz samples.
   Each clip must deliver at least 29.9 fps; drops/restarts may not increase;

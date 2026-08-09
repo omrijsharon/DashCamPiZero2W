@@ -75,6 +75,27 @@
   overlay cache is unsafe because a DMABUF identity does not bind per-buffer
   `GstMemory` geometry/video metadata; retain per-buffer validation. Evidence:
   `docs/test-reports/2026-08-03-milestone9-overlay-resource-limit.md`.
+  On 2026-08-09, same-boot v2 evidence on the verified Pi established a
+  substantially cooler accepted `5f95` baseline (mean 85.4950%, p95 92.9883%)
+  and identified `task0` at 43.4711% with renderer work averaging about
+  0.544 ms/frame. The hash-closed fused per-frame-validation candidate from
+  Git `a9871cf` (release `0.1.0.dev0-850b8609266e3aaf`, manifest
+  `251294bd4d9bdb295a16a46a4f23df25cc17b25848462c86c03c73e999a6860d`,
+  `SHA256SUMS`
+  `c6b6b36cb66ca79453e178d532d68862a5da542a11b2b2b0366963667fc365f8`,
+  wheel
+  `b90a707b683ed81fda0545654f88208503400b8762b357b1212fcba2f9f69e18`)
+  applied and applied
+  idempotently with zero package changes/no service starts, but is rejected:
+  its one allowed 75-second run had p95 93.9872%, a 0.9989 percentage point
+  same-boot regression rather than the required 2 percentage point improvement,
+  and an encoder-input-PTS-gap drop had already occurred at the first
+  post-warm-up observation. Do not run candidate two or the formal matrix;
+  rollback through the verified `5f95` bundle restored the accepted dormant
+  release, exact managed config hash, and zero-restart state. The candidate
+  installed directory was recoverably removed; its bundle, Git commit, and
+  privacy-safe evidence remain. Evidence:
+  `docs/test-reports/2026-08-09-milestone9-fused-validation-rejected.md`.
 - The last M8-qualified exact-Pi deployment ran hash-closed release
   `0.1.0.dev0-921164f96ad53e0b`; its manifest, final `SHA256SUMS`, and wheel
   SHA-256 values are respectively
@@ -442,11 +463,13 @@
   to that card, the reviewed stock-to-6-GiB contract, and an immediately
   preceding exact identity/layout preflight. General-release destructive
   authorization remains unresolved and must be explicit.
-- The current Pi is reachable as `dashcamadmin@192.168.68.107`; the verified
+- The current Pi is reachable as `dashcamadmin@192.168.68.112`; the verified
   Wi-Fi MAC is `2c:cf:67:98:4c:49`, board serial is
   `00000000db28ffe4`, and pinned SSH ED25519 fingerprint is
   `SHA256:iNlz0NDhUbn+GfH5Nbb5v9nImSX+zFujVDSqvcHSMOg`. Use the ignored
   project-scoped `artifacts/pi-ssh-known-hosts` with strict host-key checking.
+  `192.168.68.107` is foreign (MAC `88:a2:9e:84:b3:a5` and a different SSH
+  key) and must be refused rather than treated as a replacement Pi.
 - The exact Pi evidence remains the target contract: Raspberry Pi OS Lite
   32-bit Trixie; IMX219 `libcamerasrc`/NV12; `/dev/video11` hardware H.264;
   fragmented `splitmuxsink`/`mp4mux`; PL011 `/dev/ttyAMA0` with Bluetooth

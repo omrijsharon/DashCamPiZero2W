@@ -213,18 +213,18 @@ This is the execution checklist for `Pizero_dashcam_PROJECT.md`. The product spe
 
 - [ ] **Milestone 10 complete**
   - [x] **LOCAL:** Implement the durable clip catalog/migrations on ext4 and startup reconciliation against exFAT. Evidence: `docs/test-reports/2026-07-24-pre-pi-implementation.md`.
-  - [ ] **LOCAL/PI:** Implement exact low/high/emergency free-space threshold behavior.
+  - [x] **LOCAL/PI:** Implement exact low/high/emergency free-space threshold behavior. Exact-Pi disposable-loop evidence: `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
     - [x] **LOCAL:** Add an identity-bound durable threshold latch, bounded live observer, advisory reclamation directive, and fail-closed `ENOSPC`/`EDQUOT` safety stop without deletion. Evidence: `docs/test-reports/2026-08-09-milestone10-threshold-monitor-local.md`.
-    - [ ] **LOCAL:** Integrate the durable `DELETING` reclaimer and revise startup preflight so the configured reserve does not preempt legitimate low-space recovery.
-    - [ ] **PI:** Validate exact threshold boundaries, stale-observation stop, and classified no-space behavior only on a disposable bounded exFAT fixture volume; never fill or delete active recordings without explicit authorization.
-  - [ ] **LOCAL/PI:** Implement oldest-first retention using durable `DELETING` intent and idempotent two-file cleanup.
+    - [x] **LOCAL:** Integrate the durable `DELETING` reclaimer and revise startup preflight so the configured reserve does not preempt legitimate low-space recovery. Evidence: `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
+    - [x] **PI:** Validate exact threshold boundaries, stale-observation stop, and classified no-space behavior only on a disposable bounded exFAT fixture volume; never fill or delete active recordings without explicit authorization. Evidence: `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
+  - [x] **LOCAL/PI:** Implement oldest-first retention using durable `DELETING` intent and idempotent two-file cleanup. Evidence: `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
   - [ ] **LOCAL/PI:** Implement bounded download leases and expiry after crashed/abandoned clients.
   - [ ] **LOCAL/PI:** Implement event protection for previous 2, current, and next 1 clips with catalog/retention coordination.
   - [ ] **LOCAL/PI:** Implement protect/unprotect moves as recoverable two-file operations.
-  - [ ] **PI:** Verify unknown/Windows-created files are ignored and preserved.
+  - [x] **PI:** Verify unknown/Windows-created files are ignored and preserved. Evidence: `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
   - [ ] **PI:** Inject interruption after every finalize/protect/unprotect/delete step and verify deterministic reconciliation.
-  - [ ] **PI:** Fill a small test filesystem, cycle retention repeatedly, and prove active/finalizing/protected/leased clips are never selected.
-  - [ ] **PI:** Fill the volume with protected clips and verify explicit critical behavior before evidence destruction.
+  - [ ] **PI:** Fill a small test filesystem, cycle retention repeatedly, and prove active/finalizing/protected/leased clips are never selected. The disposable-loop run proved finalizing/protected/leased catalog exclusions, but did not exercise an active production recording clip.
+  - [ ] **PI:** Fill the volume with protected clips and verify explicit critical behavior before evidence destruction. The disposable-loop run proved no eligible selection and unchanged protected pairs, but did not exercise the production runtime safety-stop path.
   - [ ] **PI:** Prove retention/reconciliation do not create recording gaps or unbounded startup delay.
   - [ ] Exit gate: ring retention is race-safe and crash-recoverable within the documented exFAT limitations.
 

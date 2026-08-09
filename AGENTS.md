@@ -146,25 +146,32 @@
   directory was safely removed while its bundle remains
   at `/var/lib/dashcam/m9-direct-anchor-bundle-864bbef`. Evidence:
   `docs/test-reports/2026-08-09-milestone9-direct-anchor-finalization-rejected.md`.
-- Source commit `75ce2b8` adds only the local Milestone 10 threshold-monitor
-  groundwork; it is neither an exact-Pi result nor a deployable/accepted
-  release because the Milestone 9 resource gate remains rejected. Catalog
-  schema 5 stores a singleton UUID-and-capacity-bound reclaim latch. The
-  runtime samples `f_bavail * f_frsize` and `f_blocks * f_frsize` from one
-  verified descriptor, applies exact low/high/emergency hysteresis, and exposes
-  an advisory directive with `reclaimer_enabled=false`; it never selects or
-  deletes a clip. After the bounded repeated-observation budget is exhausted,
-  or immediately on identity/capacity/latch faults or classified
-  recording-volume `Gst.ResourceError.NO_SPACE_LEFT`, `ENOSPC`, or `EDQUOT`,
-  it takes a clean `STORAGE_SAFETY_STOP` (final
-  `FAULTED/STORAGE_FAULT`, process success to prevent a restart loop). The
-  initial fresh sample occurs before catalog reconciliation or camera opening.
-  Do not deploy or test this slice on the active recording volume. The next
-  local work is a durable `DELETING` reclaimer plus startup-preflight reserve
-  integration: the present preflight still refuses `free <= minimum_free_gib`
-  and can preempt recovery below low/emergency. Any live low-space/ENOSPC test
-  requires a disposable bounded exFAT fixture and explicit authorization.
-  Evidence: `docs/test-reports/2026-08-09-milestone10-threshold-monitor-local.md`.
+- Source commit `7d8e60232a049e6a1fdd96def05b13a426959e43` implements the
+  Milestone 10 threshold/reclaimer source slice: the identity-bound durable
+  latch drives exact low/high/emergency hysteresis; startup reserve exhaustion
+  enters a bounded reclaim/reobserve loop; and one-pair-at-a-time oldest-first
+  deletion is reserved transactionally as `DELETING` and reconciled before the
+  next fresh sample. Protected, leased, finalizing, mutating, unmanaged, and
+  unknown files are excluded. Bounded observation/latch/reclaimer failures and
+  classified recording-volume no-space errors retain the clean
+  `STORAGE_SAFETY_STOP` contract.
+- A hash-closed private-loop harness from that source passed matrices A--H on
+  the exact `.112` Pi. It proved exact threshold boundaries, three reclaim
+  cycles, nine oldest-first pair deletions, unknown-file preservation,
+  persisted-latch restart behavior, preseeded one-member `DELETE` replay, and
+  exFAT fsck/remount/directory-fsync behavior without touching active
+  `/srv/dashcam`. The accepted result is
+  `/var/tmp/m10-retention-result-7d8e602.json`, SHA-256
+  `a8406d991e31ddc2c7f498c7783dad38efc4c067248504ad0792642594dce6b1`.
+  A preceding outer-timeout attempt orphaned its private worker; a controlled
+  reboot cleared the orphan resources, then the validation operator restored
+  the recorder/fallback units to enabled/inactive before the final clean run.
+  Do not cite this as installed-release,
+  production callback/runtime safety-stop, active-clip, SIGKILL, physical
+  power-loss, or production-volume evidence. The accepted installed release
+  remains `5f95`, and Milestones 9 and 10 remain open for the resource,
+  event/web, active-runtime, interruption, and exit gates. Evidence:
+  `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

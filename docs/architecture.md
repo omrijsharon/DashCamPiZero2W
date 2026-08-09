@@ -371,20 +371,32 @@ interfaces:
   drift, and durably applies the configured low/high hysteresis. Equality is
   deliberate: reclaim begins only below the low threshold, remains active below
   the high threshold, and emergency begins only below its threshold; a
-  classified no-space write forces emergency. The present monitor provides a
-  bounded, privacy-safe advisory directive only (`reclaimer_enabled=false`):
-  it has no clip enumeration, unlink, or protected-media authority. A stale or
-  invalid bounded observation budget, latch failure, or recording-volume
+  classified no-space write forces emergency. The source runtime now binds the
+  monitor to a durable reclaimer. Each step first replays one pending `DELETE`
+  intent or transactionally moves exactly one oldest eligible finalized clip
+  to `DELETING`, then reconciles at most its two exFAT members. A fresh
+  same-volume observation is required before another pair can be selected;
+  protected clips, live leases, finalizing clips, and other pending mutations
+  remain ineligible, and unmanaged/unknown files are never selected. Startup
+  reserve exhaustion follows the same bounded delete/reobserve loop and must
+  reach the high-water threshold plus a fresh full preflight before catalog
+  reconciliation or camera opening. A stale or invalid bounded observation
+  budget, latch/reclaimer failure, or recording-volume
   `Gst.ResourceError.NO_SPACE_LEFT`/`ENOSPC`/`EDQUOT` leads to a clean
   `STORAGE_SAFETY_STOP` and `FAULTED/STORAGE_FAULT`, deliberately exiting
-  successfully so `Restart=on-failure` cannot create a camera loop. A future
-  durable `DELETING` transaction must consume that directive, coordinate
-  protection and leases, and reconcile it before any media deletion. Current
-  storage preflight still refuses `free <= minimum_free_gib`, so it must be
-  integrated with this recovery path before low-space restart behavior can be
-  accepted. This local source slice has no exact-Pi validation and is not an
-  accepted release while Milestone 9 resource qualification remains open.
-  Runtime snapshot schema 3 carries the bounded monitor status.
+  successfully so `Restart=on-failure` cannot create a camera loop. Runtime
+  snapshot schema 3 carries bounded monitor and reclamation status.
+
+  A hash-closed exact-Pi component harness passed exact thresholds, three
+  repeated low/high cycles, oldest-first pair deletion, exclusion rules,
+  unknown-file preservation, persisted-latch restart, preseeded one-member
+  `DELETE` replay, exFAT fsck/remount, and directory-fsync checks on private
+  disposable loop filesystems. This is not installed-release, production
+  daemon/camera, active-clip, runtime safety-stop, SIGKILL, physical power-loss,
+  or active `/srv/dashcam` evidence. The accepted installed release remains
+  `5f95`; this newer source is not deployable while the Milestone 9 resource
+  gate and the remaining event/web integration gates are open. Evidence:
+  `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
 - Overlay formatting consumes one coherent telemetry snapshot and emits bounded
   text/layout data. The first pre-encoder `textoverlay` source slice bound
   initial state before PLAYING and used a queue-free optional worker, but its
@@ -401,8 +413,10 @@ A/V, and repeated logical microphone-loss/restoration evidence. Direct dynamic
 audio-pad mutation remains refused; immutable-generation/IDR handoff with
 bounded three-slot recycling is selected. Microphone-absent startup has passed;
 physical hot-unplug/replug is outside current acceptance. Remaining work
-includes exact-Pi overlay qualification, retention/protection, actual socket
-ownership, HTTP serving, preview, and the privileged removal helper.
+includes exact-Pi overlay qualification, production event-window and download
+lease integration, active-recording and safety-stop retention qualification,
+the full crash/power matrix, actual socket ownership, HTTP serving, preview,
+and the privileged removal helper.
 
 ## Structured logging convention
 

@@ -89,6 +89,7 @@ class FakeMapping:
 class FakeAccess:
     def __init__(self) -> None:
         self.identities: dict[int, tuple[int, int]] = {}
+        self.identity_calls: list[int] = []
         self.duplicates: list[tuple[int, int]] = []
         self.mappings: dict[int, FakeMapping] = {}
         self.syncs: list[tuple[int, int]] = []
@@ -98,6 +99,7 @@ class FakeAccess:
         self.change_duplicate_identity = False
 
     def identity(self, fd: int) -> tuple[int, int]:
+        self.identity_calls.append(fd)
         return self.identities.setdefault(fd, (7, fd % 1000))
 
     def duplicate(self, fd: int) -> int:
@@ -124,6 +126,228 @@ class FakeAccess:
 
     def close_fd(self, fd: int) -> None:
         self.closed_fds.append(fd)
+
+
+class FakeGiAllocator:
+    def __init__(self, name: str = "libcameraallocator0") -> None:
+        self.name = name
+
+
+class FakeGiMemory:
+    def __init__(self, plane: int, fd: int = 10) -> None:
+        self.allocator: FakeGiAllocator | None = FakeGiAllocator()
+        self.dmabuf = True
+        self.fd_memory = True
+        self.fd = fd
+        self.sizes: tuple[int, ...] = (
+            (2_073_600, 0, 2_073_600)
+            if plane == 0
+            else (1_036_800, 2_073_600, 3_110_400)
+        )
+
+    def get_sizes(self) -> tuple[int, ...]:
+        return self.sizes
+
+
+class FakeGiStructure:
+    def __init__(self) -> None:
+        self.name = "video/x-raw"
+        self.values: dict[str, object] = {
+            "width": 1920,
+            "height": 1080,
+            "format": "NV12",
+            "framerate": "30/1",
+        }
+
+    def get_name(self) -> str:
+        return self.name
+
+    def get_value(self, name: str) -> object:
+        return self.values[name]
+
+
+class FakeGiFeatures:
+    def __init__(self) -> None:
+        self.text = "memory:SystemMemory"
+
+    def to_string(self) -> str:
+        return self.text
+
+
+class FakeGiCaps:
+    def __init__(self) -> None:
+        self.size = 1
+        self.structure = FakeGiStructure()
+        self.features = FakeGiFeatures()
+
+    def get_size(self) -> int:
+        return self.size
+
+    def get_structure(self, index: int) -> FakeGiStructure:
+        assert index == 0
+        return self.structure
+
+    def get_features(self, index: int) -> FakeGiFeatures:
+        assert index == 0
+        return self.features
+
+
+class FakeGiVideoMeta:
+    def __init__(self) -> None:
+        self.width = 1920
+        self.height = 1080
+        self.n_planes = 2
+        self.offset: tuple[int, ...] = (0, 2_073_600, 0, 0)
+        self.stride: tuple[int, ...] = (1920, 1920, 0, 0)
+
+
+class FakeGiBuffer:
+    def __init__(self) -> None:
+        self.memory_count = 2
+        self.memories = (FakeGiMemory(0), FakeGiMemory(1))
+        self.size = NV12_BUFFER_SIZE
+        self.all_memory_writable = False
+        self.video_meta: FakeGiVideoMeta | None = FakeGiVideoMeta()
+
+    def n_memory(self) -> int:
+        return self.memory_count
+
+    def peek_memory(self, index: int) -> FakeGiMemory:
+        return self.memories[index]
+
+    def get_size(self) -> int:
+        return self.size
+
+    def is_all_memory_writable(self) -> bool:
+        return self.all_memory_writable
+
+
+class FakeGiPad:
+    def __init__(self) -> None:
+        self.caps: FakeGiCaps | None = FakeGiCaps()
+        self.probe_type: object | None = None
+        self.probe_callback: object | None = None
+
+    def get_current_caps(self) -> FakeGiCaps | None:
+        return self.caps
+
+    def add_probe(self, probe_type: object, callback: object) -> int:
+        self.probe_type = probe_type
+        self.probe_callback = callback
+        return 1
+
+
+class FakeGiCamera:
+    def __init__(self, pad: FakeGiPad) -> None:
+        self.pad = pad
+
+    def get_static_pad(self, name: str) -> FakeGiPad | None:
+        return self.pad if name == "src" else None
+
+
+class FakeGstAllocators:
+    def is_dmabuf_memory(self, memory: FakeGiMemory) -> bool:
+        return memory.dmabuf
+
+    def is_fd_memory(self, memory: FakeGiMemory) -> bool:
+        return memory.fd_memory
+
+    def dmabuf_memory_get_fd(self, memory: FakeGiMemory) -> int:
+        return memory.fd
+
+
+class FakeGstVideo:
+    def buffer_get_video_meta(self, buffer: FakeGiBuffer) -> FakeGiVideoMeta | None:
+        return buffer.video_meta
+
+
+class FakeProbeInfo:
+    def __init__(self, buffer: FakeGiBuffer) -> None:
+        self.buffer = buffer
+
+    def get_buffer(self) -> FakeGiBuffer:
+        return self.buffer
+
+
+class FakeGst:
+    class PadProbeType:
+        BUFFER = object()
+
+    class PadProbeReturn:
+        OK = object()
+
+
+def mutate_fake_gi_contract(case: str, pad: FakeGiPad, buffer: FakeGiBuffer) -> None:
+    caps = pad.caps
+    assert caps is not None
+    meta = buffer.video_meta
+    assert meta is not None
+    y_memory, uv_memory = buffer.memories
+    if case == "caps_count":
+        caps.size = 2
+    elif case == "caps_features":
+        caps.features.text = "memory:DMABuf"
+    elif case == "caps_media_type":
+        caps.structure.name = "video/x-bayer"
+    elif case in {"width", "height", "format", "framerate"}:
+        caps.structure.values[case] = {
+            "width": 1280,
+            "height": 720,
+            "format": "I420",
+            "framerate": "30000/1001",
+        }[case]
+    elif case == "buffer_size":
+        buffer.size += 1
+    elif case == "memory_count":
+        buffer.memory_count = 1
+    elif case == "writable":
+        buffer.all_memory_writable = True
+    elif case == "y_allocator":
+        y_memory.allocator = FakeGiAllocator("otherallocator0")
+    elif case == "uv_allocator":
+        uv_memory.allocator = FakeGiAllocator("otherallocator0")
+    elif case == "y_not_dmabuf":
+        y_memory.dmabuf = False
+    elif case == "uv_not_dmabuf":
+        uv_memory.dmabuf = False
+    elif case == "y_not_fd_memory":
+        y_memory.fd_memory = False
+    elif case == "uv_not_fd_memory":
+        uv_memory.fd_memory = False
+    elif case == "y_fd":
+        y_memory.fd = -1
+    elif case == "uv_fd":
+        uv_memory.fd = 11
+    elif case == "y_size":
+        y_memory.sizes = (2_073_599, 0, 2_073_600)
+    elif case == "y_offset":
+        y_memory.sizes = (2_073_600, 1, 2_073_600)
+    elif case == "y_maxsize":
+        y_memory.sizes = (2_073_600, 0, 2_073_601)
+    elif case == "uv_size":
+        uv_memory.sizes = (1_036_799, 2_073_600, 3_110_400)
+    elif case == "uv_offset":
+        uv_memory.sizes = (1_036_800, 2_073_599, 3_110_400)
+    elif case == "uv_maxsize":
+        uv_memory.sizes = (1_036_800, 2_073_600, 3_110_399)
+    elif case == "sizes_length":
+        y_memory.sizes = (2_073_600, 0)
+    elif case == "video_meta_missing":
+        buffer.video_meta = None
+    elif case == "meta_width":
+        meta.width = 1280
+    elif case == "meta_height":
+        meta.height = 720
+    elif case == "meta_planes":
+        meta.n_planes = 1
+    elif case == "meta_offsets":
+        meta.offset = (1, 2_073_600, 0, 0)
+    elif case == "meta_strides":
+        meta.stride = (2048, 1920, 0, 0)
+    elif case == "meta_array_length":
+        meta.offset = (0, 2_073_600)
+    else:  # pragma: no cover - the parameter list is closed below
+        raise AssertionError(f"unknown fake GI drift: {case}")
 
 
 def core_and_access(
@@ -354,12 +578,16 @@ def test_probe_skips_all_gi_extraction_when_disabled_or_already_isolated(
     renderer = GstDmabufOverlayRenderer(Gst(), object(), object(), core=core)
     extractions = 0
 
-    def forbidden_extraction(*_args: object) -> NativeDmabufFrame:
+    def forbidden_extraction(*_args: object) -> int:
         nonlocal extractions
         extractions += 1
         raise AssertionError("disabled probe performed GI extraction")
 
-    monkeypatch.setattr(native_nv12, "_extract_dmabuf_frame", forbidden_extraction)
+    monkeypatch.setattr(
+        native_nv12,
+        "_extract_validated_dmabuf_fd",
+        forbidden_extraction,
+    )
     core.set_text(None)
     assert renderer._probe(object(), object()) is Enum.OK
     core.isolate("already isolated")
@@ -370,35 +598,142 @@ def test_probe_skips_all_gi_extraction_when_disabled_or_already_isolated(
     assert snapshot.frames_seen == snapshot.frames_passthrough == 3
 
 
-def test_probe_still_validates_every_extracted_frame_before_dmabuf_access(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Enum:
-        OK = object()
-
-    class Gst:
-        PadProbeReturn = Enum
-
-    class Info:
-        def get_buffer(self) -> object:
-            return object()
-
+def test_fused_probe_validates_live_gi_contract_and_renders() -> None:
     core, access = core_and_access()
     core.set_text("REC")
-    renderer = GstDmabufOverlayRenderer(Gst(), object(), object(), core=core)
-    monkeypatch.setattr(
-        native_nv12,
-        "_extract_dmabuf_frame",
-        lambda *_args: replace(exact_frame(), caps_format="I420"),
+    pad = FakeGiPad()
+    buffer = FakeGiBuffer()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
     )
+    renderer._bind_extractors(pad)
 
-    assert renderer._probe(object(), Info()) is Enum.OK
+    assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
+
+    snapshot = core.snapshot()
+    assert snapshot.state == "ACTIVE"
+    assert snapshot.frames_rendered == 1
+    assert snapshot.contract_mismatches == 0
+    assert access.duplicates == [(10, 1010)]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "caps_count",
+        "caps_features",
+        "caps_media_type",
+        "width",
+        "height",
+        "format",
+        "framerate",
+        "buffer_size",
+        "memory_count",
+        "writable",
+        "y_allocator",
+        "uv_allocator",
+        "y_not_dmabuf",
+        "uv_not_dmabuf",
+        "y_not_fd_memory",
+        "uv_not_fd_memory",
+        "y_fd",
+        "uv_fd",
+        "y_size",
+        "y_offset",
+        "y_maxsize",
+        "uv_size",
+        "uv_offset",
+        "uv_maxsize",
+        "sizes_length",
+        "video_meta_missing",
+        "meta_width",
+        "meta_height",
+        "meta_planes",
+        "meta_offsets",
+        "meta_strides",
+        "meta_array_length",
+    ],
+)
+def test_fused_probe_refuses_every_live_gi_contract_drift_before_access(case: str) -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    buffer = FakeGiBuffer()
+    mutate_fake_gi_contract(case, pad, buffer)
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+
+    assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
 
     snapshot = core.snapshot()
     assert snapshot.state == "ISOLATED"
     assert snapshot.contract_mismatches == 1
     assert snapshot.frames_passthrough == 1
+    assert access.identity_calls == []
     assert access.duplicates == []
+    assert access.syncs == []
+
+
+def test_fused_probe_revalidates_mutated_same_objects_before_second_frame_access() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    pad = FakeGiPad()
+    buffer = FakeGiBuffer()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer._bind_extractors(pad)
+
+    assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
+    identity_calls = list(access.identity_calls)
+    syncs = list(access.syncs)
+    assert pad.caps is not None
+    pad.caps.structure.values["format"] = "I420"
+
+    assert renderer._probe(pad, FakeProbeInfo(buffer)) is FakeGst.PadProbeReturn.OK
+
+    snapshot = core.snapshot()
+    assert snapshot.state == "ISOLATED"
+    assert snapshot.frames_seen == 2
+    assert snapshot.frames_rendered == 1
+    assert snapshot.frames_passthrough == 1
+    assert snapshot.contract_mismatches == 1
+    assert access.identity_calls == identity_calls
+    assert access.syncs == syncs
+
+
+def test_attach_owns_extractor_when_callback_uses_a_distinct_pad_wrapper() -> None:
+    core, access = core_and_access()
+    core.set_text("REC")
+    attached_pad = FakeGiPad()
+    renderer = GstDmabufOverlayRenderer(
+        FakeGst(),
+        FakeGstAllocators(),
+        FakeGstVideo(),
+        core=core,
+    )
+    renderer.attach(FakeGiCamera(attached_pad))
+
+    assert attached_pad.probe_type is FakeGst.PadProbeType.BUFFER
+    assert attached_pad.probe_callback is not None
+    probe_callback = cast(Any, attached_pad.probe_callback)
+    assert (
+        probe_callback(object(), FakeProbeInfo(FakeGiBuffer()))
+        is FakeGst.PadProbeReturn.OK
+    )
+    assert core.snapshot().state == "ACTIVE"
+    assert access.duplicates == [(10, 1010)]
 
 
 def test_update_refusal_retains_last_valid_bitmap() -> None:

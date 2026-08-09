@@ -17,6 +17,7 @@ import time
 from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from functools import partial
 from threading import Condition, Lock
 from typing import Final, Protocol, SupportsInt, cast
 
@@ -88,6 +89,106 @@ class DmabufMemoryGeometry:
     maxsize: int
 
 
+def _validate_caps_values(
+    features: str,
+    media_type: str,
+    width: int,
+    height: int,
+    pixel_format: str,
+    framerate: str,
+) -> None:
+    if (
+        features != SYSTEM_MEMORY_FEATURE
+        or media_type != "video/x-raw"
+        or width != NV12_FRAME_WIDTH
+        or height != NV12_FRAME_HEIGHT
+        or pixel_format != NV12_FORMAT
+        or framerate != "30/1"
+    ):
+        raise NativeOverlayContractError(
+            "overlay caps differ from exact 1920x1080 NV12 SystemMemory"
+        )
+
+
+def _validate_buffer_values(size: int, memory_count: int, all_memory_writable: bool) -> None:
+    if size != NV12_BUFFER_SIZE or memory_count != 2 or all_memory_writable:
+        raise NativeOverlayContractError(
+            "overlay buffer size, plane count, or writability differs"
+        )
+
+
+def _validate_memory_values(
+    y_allocator_name: str,
+    uv_allocator_name: str,
+    y_is_dmabuf: bool,
+    uv_is_dmabuf: bool,
+    y_is_fd_memory: bool,
+    uv_is_fd_memory: bool,
+    y_fd: int,
+    uv_fd: int,
+    y_size: int,
+    y_offset: int,
+    y_maxsize: int,
+    uv_size: int,
+    uv_offset: int,
+    uv_maxsize: int,
+) -> int:
+    if (
+        _ALLOCATOR_NAME.fullmatch(y_allocator_name) is None
+        or y_allocator_name != uv_allocator_name
+        or not y_is_dmabuf
+        or not uv_is_dmabuf
+        or not y_is_fd_memory
+        or not uv_is_fd_memory
+    ):
+        raise NativeOverlayContractError(
+            "overlay requires two matching bounded libcameraallocator DMABUF memories"
+        )
+    if y_fd < 0 or y_fd != uv_fd:
+        raise NativeOverlayContractError(
+            "overlay NV12 planes do not share one valid DMABUF fd"
+        )
+    if (
+        y_size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
+        or y_offset != NV12_Y_OFFSET
+        or y_maxsize != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
+        or uv_size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT // 2
+        or uv_offset != NV12_UV_OFFSET
+        or uv_maxsize != NV12_BUFFER_SIZE
+    ):
+        raise NativeOverlayContractError("overlay DMABUF plane geometry differs")
+    return y_fd
+
+
+def _validate_video_meta_values(
+    width: int,
+    height: int,
+    planes: int,
+    offset_0: int,
+    offset_1: int,
+    offset_2: int,
+    offset_3: int,
+    stride_0: int,
+    stride_1: int,
+    stride_2: int,
+    stride_3: int,
+) -> None:
+    if (
+        width != NV12_FRAME_WIDTH
+        or height != NV12_FRAME_HEIGHT
+        or planes != 2
+        or offset_0 != NV12_Y_OFFSET
+        or offset_1 != NV12_UV_OFFSET
+        or offset_2 != 0
+        or offset_3 != 0
+        or stride_0 != NV12_Y_STRIDE
+        or stride_1 != NV12_UV_STRIDE
+        or stride_2 != 0
+        or stride_3 != 0
+    ):
+        raise NativeOverlayContractError("overlay GstVideoMeta geometry differs")
+
+
 @dataclass(frozen=True, slots=True)
 class NativeDmabufFrame:
     """Coordinate-free metadata plus the transient source DMABUF descriptor."""
@@ -115,58 +216,43 @@ class NativeDmabufFrame:
     def validate(self) -> None:
         """Refuse every drift from the measured libcamerasrc allocation."""
 
-        if (
-            self.caps_features != SYSTEM_MEMORY_FEATURE
-            or self.caps_media_type != "video/x-raw"
-            or self.caps_width != NV12_FRAME_WIDTH
-            or self.caps_height != NV12_FRAME_HEIGHT
-            or self.caps_format != NV12_FORMAT
-            or self.caps_framerate != "30/1"
-        ):
-            raise NativeOverlayContractError(
-                "overlay caps differ from exact 1920x1080 NV12 SystemMemory"
-            )
-        if (
-            self.buffer_size != NV12_BUFFER_SIZE
-            or self.buffer_memory_count != 2
-            or self.buffer_all_memory_writable
-        ):
-            raise NativeOverlayContractError(
-                "overlay buffer size, plane count, or writability differs"
-            )
+        _validate_caps_values(
+            self.caps_features,
+            self.caps_media_type,
+            self.caps_width,
+            self.caps_height,
+            self.caps_format,
+            self.caps_framerate,
+        )
+        _validate_buffer_values(
+            self.buffer_size,
+            self.buffer_memory_count,
+            self.buffer_all_memory_writable,
+        )
         y_memory, uv_memory = self.memories
-        if (
-            _ALLOCATOR_NAME.fullmatch(y_memory.allocator_name) is None
-            or y_memory.allocator_name != uv_memory.allocator_name
-            or not y_memory.is_dmabuf
-            or not uv_memory.is_dmabuf
-            or not y_memory.is_fd_memory
-            or not uv_memory.is_fd_memory
-        ):
-            raise NativeOverlayContractError(
-                "overlay requires two matching bounded libcameraallocator DMABUF memories"
-            )
-        if y_memory.fd < 0 or y_memory.fd != uv_memory.fd:
-            raise NativeOverlayContractError(
-                "overlay NV12 planes do not share one valid DMABUF fd"
-            )
-        if (
-            y_memory.size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
-            or y_memory.offset != NV12_Y_OFFSET
-            or y_memory.maxsize != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT
-            or uv_memory.size != NV12_FRAME_WIDTH * NV12_FRAME_HEIGHT // 2
-            or uv_memory.offset != NV12_UV_OFFSET
-            or uv_memory.maxsize != NV12_BUFFER_SIZE
-        ):
-            raise NativeOverlayContractError("overlay DMABUF plane geometry differs")
-        if (
-            self.video_meta_width != NV12_FRAME_WIDTH
-            or self.video_meta_height != NV12_FRAME_HEIGHT
-            or self.video_meta_planes != 2
-            or self.video_meta_offsets != (NV12_Y_OFFSET, NV12_UV_OFFSET, 0, 0)
-            or self.video_meta_strides != (NV12_Y_STRIDE, NV12_UV_STRIDE, 0, 0)
-        ):
-            raise NativeOverlayContractError("overlay GstVideoMeta geometry differs")
+        _validate_memory_values(
+            y_memory.allocator_name,
+            uv_memory.allocator_name,
+            y_memory.is_dmabuf,
+            uv_memory.is_dmabuf,
+            y_memory.is_fd_memory,
+            uv_memory.is_fd_memory,
+            y_memory.fd,
+            uv_memory.fd,
+            y_memory.size,
+            y_memory.offset,
+            y_memory.maxsize,
+            uv_memory.size,
+            uv_memory.offset,
+            uv_memory.maxsize,
+        )
+        _validate_video_meta_values(
+            self.video_meta_width,
+            self.video_meta_height,
+            self.video_meta_planes,
+            *self.video_meta_offsets,
+            *self.video_meta_strides,
+        )
 
 
 class DmabufAccess(Protocol):
@@ -584,25 +670,54 @@ class NativeNv12OverlayCore:
             self._access.close_fd(duplicate)
             raise
 
+    def _begin_render(self) -> tuple[bytes, ...] | None:
+        with self._lock:
+            self._frames_seen += 1
+            bitmap_rows = self._bitmap_rows
+            if self._isolated or bitmap_rows is None or self._closed:
+                self._frames_passthrough += 1
+                return None
+            return bitmap_rows
+
     def render(self, frame: NativeDmabufFrame) -> bool:
         """Render one frame in place, or latch isolated passthrough on any drift."""
 
         started_ns = time.monotonic_ns()
-        with self._lock:
-            self._frames_seen += 1
-            isolated = self._isolated
-            bitmap_rows = self._bitmap_rows
-            closed = self._closed
-        if isolated or bitmap_rows is None or closed:
-            with self._lock:
-                self._frames_passthrough += 1
+        bitmap_rows = self._begin_render()
+        if bitmap_rows is None:
             return False
 
         try:
             if not isinstance(frame, NativeDmabufFrame):
                 raise NativeOverlayContractError("native overlay frame is invalid")
             frame.validate()
-            identity = self._access.identity(frame.dmabuf_fd)
+            source_fd = frame.dmabuf_fd
+        except Exception as error:
+            self._latch_failure(
+                error,
+                contract_mismatch=isinstance(error, NativeOverlayContractError),
+            )
+            self._record_latency(started_ns)
+            return False
+        return self._render_validated_fd_active(source_fd, bitmap_rows, started_ns)
+
+    def _render_validated_fd(self, source_fd: int) -> bool:
+        """Render one already exact-contract-validated production descriptor."""
+
+        started_ns = time.monotonic_ns()
+        bitmap_rows = self._begin_render()
+        if bitmap_rows is None:
+            return False
+        return self._render_validated_fd_active(source_fd, bitmap_rows, started_ns)
+
+    def _render_validated_fd_active(
+        self,
+        source_fd: int,
+        bitmap_rows: tuple[bytes, ...],
+        started_ns: int,
+    ) -> bool:
+        try:
+            identity = self._access.identity(source_fd)
             if (
                 len(identity) != 2
                 or isinstance(identity[0], bool)
@@ -613,7 +728,7 @@ class NativeNv12OverlayCore:
                 raise NativeOverlayContractError(
                     "native overlay DMABUF identity is invalid"
                 )
-            duplicate, mapped = self._mapping(frame.dmabuf_fd, identity)
+            duplicate, mapped = self._mapping(source_fd, identity)
         except Exception as error:
             self._latch_failure(
                 error,
@@ -758,15 +873,17 @@ def _int_member(target: object, name: str) -> int:
     return int(cast(SupportsInt, value))
 
 
-def _extract_dmabuf_frame(
-    gstallocators: object,
-    gstvideo: object,
-    pad: object,
+def _extract_validated_dmabuf_fd(
+    get_current_caps: Callable[[], object | None],
+    is_dmabuf: Callable[[object], object],
+    is_fd_memory: Callable[[object], object],
+    get_fd: Callable[[object], object],
+    get_video_meta: Callable[[object], object | None],
     buffer: object,
-) -> NativeDmabufFrame:
-    """Extract one exact frame contract while its transient fds remain valid."""
+) -> int:
+    """Validate one live GI frame without allocating a mirrored object graph."""
 
-    caps = cast(Callable[[], object | None], _member(pad, "get_current_caps"))()
+    caps = get_current_caps()
     if caps is None:
         raise NativeOverlayContractError("native overlay source caps are unavailable")
     caps_size = int(
@@ -779,104 +896,91 @@ def _extract_dmabuf_frame(
     get_value = cast(Callable[[str], object], _member(structure, "get_value"))
     media_type = str(cast(Callable[[], object], _member(structure, "get_name"))())
     feature_text = str(cast(Callable[[], object], _member(features, "to_string"))())
+    _validate_caps_values(
+        feature_text,
+        media_type,
+        int(cast(SupportsInt, get_value("width"))),
+        int(cast(SupportsInt, get_value("height"))),
+        str(get_value("format")),
+        str(get_value("framerate")),
+    )
 
     memory_count = int(
         cast(SupportsInt, cast(Callable[[], object], _member(buffer, "n_memory"))())
     )
     if memory_count != 2:
         raise NativeOverlayContractError("native overlay buffer memory count differs")
+    buffer_size = int(
+        cast(
+            SupportsInt,
+            cast(Callable[[], object], _member(buffer, "get_size"))(),
+        )
+    )
+    buffer_all_memory_writable = bool(
+        cast(
+            Callable[[], object],
+            _member(buffer, "is_all_memory_writable"),
+        )()
+    )
+    _validate_buffer_values(buffer_size, memory_count, buffer_all_memory_writable)
     peek_memory = cast(Callable[[int], object], _member(buffer, "peek_memory"))
-    is_dmabuf = cast(
-        Callable[[object], object],
-        _member(gstallocators, "is_dmabuf_memory"),
+    y_memory = peek_memory(0)
+    uv_memory = peek_memory(1)
+    y_allocator = _member(y_memory, "allocator")
+    uv_allocator = _member(uv_memory, "allocator")
+    y_allocator_name = "" if y_allocator is None else str(_member(y_allocator, "name"))
+    uv_allocator_name = "" if uv_allocator is None else str(_member(uv_allocator, "name"))
+    y_sizes = cast(
+        tuple[object, ...],
+        cast(Callable[[], object], _member(y_memory, "get_sizes"))(),
     )
-    is_fd_memory = cast(
-        Callable[[object], object],
-        _member(gstallocators, "is_fd_memory"),
+    uv_sizes = cast(
+        tuple[object, ...],
+        cast(Callable[[], object], _member(uv_memory, "get_sizes"))(),
     )
-    get_fd = cast(
-        Callable[[object], object],
-        _member(gstallocators, "dmabuf_memory_get_fd"),
+    if len(y_sizes) != 3 or len(uv_sizes) != 3:
+        raise NativeOverlayContractError("native overlay memory geometry is invalid")
+    y_dmabuf = bool(is_dmabuf(y_memory))
+    uv_dmabuf = bool(is_dmabuf(uv_memory))
+    y_fd = int(cast(SupportsInt, get_fd(y_memory))) if y_dmabuf else -1
+    uv_fd = int(cast(SupportsInt, get_fd(uv_memory))) if uv_dmabuf else -1
+    validated_fd = _validate_memory_values(
+        y_allocator_name,
+        uv_allocator_name,
+        y_dmabuf,
+        uv_dmabuf,
+        bool(is_fd_memory(y_memory)),
+        bool(is_fd_memory(uv_memory)),
+        y_fd,
+        uv_fd,
+        int(cast(SupportsInt, y_sizes[0])),
+        int(cast(SupportsInt, y_sizes[1])),
+        int(cast(SupportsInt, y_sizes[2])),
+        int(cast(SupportsInt, uv_sizes[0])),
+        int(cast(SupportsInt, uv_sizes[1])),
+        int(cast(SupportsInt, uv_sizes[2])),
     )
-    geometries: list[DmabufMemoryGeometry] = []
-    for index in range(2):
-        memory = peek_memory(index)
-        allocator = _member(memory, "allocator")
-        allocator_name = (
-            ""
-            if allocator is None
-            else str(_member(allocator, "name"))
-        )
-        sizes = tuple(
-            int(cast(SupportsInt, value))
-            for value in cast(
-                tuple[object, ...],
-                cast(Callable[[], object], _member(memory, "get_sizes"))(),
-            )
-        )
-        if len(sizes) != 3:
-            raise NativeOverlayContractError("native overlay memory geometry is invalid")
-        dmabuf = bool(is_dmabuf(memory))
-        fd = int(cast(SupportsInt, get_fd(memory))) if dmabuf else -1
-        geometries.append(
-            DmabufMemoryGeometry(
-                allocator_name=allocator_name,
-                is_dmabuf=dmabuf,
-                is_fd_memory=bool(is_fd_memory(memory)),
-                fd=fd,
-                size=sizes[0],
-                offset=sizes[1],
-                maxsize=sizes[2],
-            )
-        )
-    video_meta = cast(
-        Callable[[object], object | None],
-        _member(gstvideo, "buffer_get_video_meta"),
-    )(buffer)
+    video_meta = get_video_meta(buffer)
     if video_meta is None:
         raise NativeOverlayContractError("native overlay GstVideoMeta is unavailable")
-    offsets = tuple(
-        int(cast(SupportsInt, value))
-        for value in cast(tuple[object, ...], _member(video_meta, "offset"))
-    )
-    strides = tuple(
-        int(cast(SupportsInt, value))
-        for value in cast(tuple[object, ...], _member(video_meta, "stride"))
-    )
+    offsets = cast(tuple[object, ...], _member(video_meta, "offset"))
+    strides = cast(tuple[object, ...], _member(video_meta, "stride"))
     if len(offsets) != 4 or len(strides) != 4:
         raise NativeOverlayContractError("native overlay GstVideoMeta arrays differ")
-    # Validation remains in ``NativeNv12OverlayCore.render`` so direct callers
-    # and this GI extraction path share exactly one authoritative check.
-    return NativeDmabufFrame(
-        caps_features=feature_text,
-        caps_media_type=media_type,
-        caps_width=int(cast(SupportsInt, get_value("width"))),
-        caps_height=int(cast(SupportsInt, get_value("height"))),
-        caps_format=str(get_value("format")),
-        caps_framerate=str(get_value("framerate")),
-        buffer_size=int(
-            cast(
-                SupportsInt,
-                cast(Callable[[], object], _member(buffer, "get_size"))(),
-            )
-        ),
-        buffer_memory_count=memory_count,
-        buffer_all_memory_writable=bool(
-            cast(
-                Callable[[], object],
-                _member(buffer, "is_all_memory_writable"),
-            )()
-        ),
-        memories=cast(
-            tuple[DmabufMemoryGeometry, DmabufMemoryGeometry],
-            tuple(geometries),
-        ),
-        video_meta_width=_int_member(video_meta, "width"),
-        video_meta_height=_int_member(video_meta, "height"),
-        video_meta_planes=_int_member(video_meta, "n_planes"),
-        video_meta_offsets=offsets,
-        video_meta_strides=strides,
+    _validate_video_meta_values(
+        _int_member(video_meta, "width"),
+        _int_member(video_meta, "height"),
+        _int_member(video_meta, "n_planes"),
+        int(cast(SupportsInt, offsets[0])),
+        int(cast(SupportsInt, offsets[1])),
+        int(cast(SupportsInt, offsets[2])),
+        int(cast(SupportsInt, offsets[3])),
+        int(cast(SupportsInt, strides[0])),
+        int(cast(SupportsInt, strides[1])),
+        int(cast(SupportsInt, strides[2])),
+        int(cast(SupportsInt, strides[3])),
     )
+    return validated_fd
 
 
 class GstDmabufOverlayRenderer:
@@ -894,8 +998,11 @@ class GstDmabufOverlayRenderer:
         self._gstallocators = gstallocators
         self._gstvideo = gstvideo
         self._core = core or NativeNv12OverlayCore()
+        self._probe_return = _member(_member(gst, "PadProbeReturn"), "OK")
         self._pad: object | None = None
         self._probe_id: object | None = None
+        self._bound_extract_pad: object | None = None
+        self._extract_frame: Callable[[object], int] | None = None
         self._condition = Condition()
         self._callbacks_active = 0
         self._closing = False
@@ -910,6 +1017,7 @@ class GstDmabufOverlayRenderer:
         )("src")
         if pad is None:
             raise NativeOverlayContractError("camera has no source pad for native overlay")
+        self._bind_extractors(pad)
         probe_type = _member(_member(self._gst, "PadProbeType"), "BUFFER")
         probe_id = cast(
             Callable[[object, Callable[..., object]], object],
@@ -920,8 +1028,43 @@ class GstDmabufOverlayRenderer:
         self._pad = pad
         self._probe_id = probe_id
 
+    def _bind_extractors(self, pad: object) -> None:
+        if self._bound_extract_pad is not None:
+            if pad is not self._bound_extract_pad:
+                raise NativeOverlayContractError("native overlay callback pad identity changed")
+            return
+        get_current_caps = cast(
+            Callable[[], object | None],
+            _member(pad, "get_current_caps"),
+        )
+        is_dmabuf = cast(
+            Callable[[object], object],
+            _member(self._gstallocators, "is_dmabuf_memory"),
+        )
+        is_fd_memory = cast(
+            Callable[[object], object],
+            _member(self._gstallocators, "is_fd_memory"),
+        )
+        get_fd = cast(
+            Callable[[object], object],
+            _member(self._gstallocators, "dmabuf_memory_get_fd"),
+        )
+        get_video_meta = cast(
+            Callable[[object], object | None],
+            _member(self._gstvideo, "buffer_get_video_meta"),
+        )
+        self._extract_frame = partial(
+            _extract_validated_dmabuf_fd,
+            get_current_caps,
+            is_dmabuf,
+            is_fd_memory,
+            get_fd,
+            get_video_meta,
+        )
+        self._bound_extract_pad = pad
+
     def _probe(self, pad: object, info: object) -> object:
-        probe_return = _member(_member(self._gst, "PadProbeReturn"), "OK")
+        probe_return = self._probe_return
         with self._condition:
             if self._closing:
                 return probe_return
@@ -938,13 +1081,11 @@ class GstDmabufOverlayRenderer:
                 raise NativeOverlayContractError(
                     "native overlay buffer probe received no buffer"
                 )
-            frame = _extract_dmabuf_frame(
-                self._gstallocators,
-                self._gstvideo,
-                pad,
-                buffer,
-            )
-            self._core.render(frame)
+            extract_frame = self._extract_frame
+            if extract_frame is None:
+                raise NativeOverlayContractError("native overlay extractor binding is incomplete")
+            source_fd = extract_frame(buffer)
+            self._core._render_validated_fd(source_fd)
         except Exception as error:
             if self._core.snapshot().state != "ISOLATED":
                 self._core.isolate(error)

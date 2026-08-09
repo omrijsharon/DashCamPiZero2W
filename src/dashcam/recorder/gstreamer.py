@@ -1624,6 +1624,9 @@ class GStreamerBackend:
         self._first_fragment_opened = asyncio.Event()
         self._opened_fragment: OpenedFragment | None = None
         self._active_fragment: OpenedFragment | None = None
+        self._subsequent_opened_fragments: asyncio.Queue[OpenedFragment] = asyncio.Queue(
+            maxsize=output.event_capacity
+        )
         self._effective_caps: EffectiveCaps | None = None
         self._effective_audio_caps: EffectiveAudioCaps | None = None
         self._encoder_identity: EncoderIdentity | None = None
@@ -1847,6 +1850,11 @@ class GStreamerBackend:
             raise PipelineContractError("fragment-opened signal lost its validated event")
         return opened
 
+    async def next_opened_fragment(self) -> OpenedFragment:
+        """Wait for the next validated rollover open after the startup fragment."""
+
+        return await self._subsequent_opened_fragments.get()
+
     def configure_overlay_text(self, text: str | None) -> None:
         """Bind initial overlay state before any camera buffer can flow."""
 
@@ -2010,6 +2018,13 @@ class GStreamerBackend:
         if self._opened_fragment is None:
             self._opened_fragment = opened
             self._first_fragment_opened.set()
+        else:
+            try:
+                self._subsequent_opened_fragments.put_nowait(opened)
+            except asyncio.QueueFull as error:
+                raise ValueError(
+                    "fragment-opened event queue exceeded its configured bound"
+                ) from error
         return opened
 
     def _bind_fragment_contract(

@@ -18,7 +18,10 @@ from dashcam.catalog import (
     EventSource,
     RootedFilesystem,
 )
-from dashcam.catalog.database import RetentionThresholdLatch
+from dashcam.catalog.database import (
+    ActiveClipProtectionChanged,
+    RetentionThresholdLatch,
+)
 from dashcam.metadata.schema import (
     AudioSummary,
     ClipSidecar,
@@ -93,6 +96,24 @@ def _unsynced_clip(
         protected=directory == "protected",
         protection_reason="fixture" if directory == "protected" else None,
         pair_reconciled=True,
+        managed=True,
+    )
+
+
+def _writing_clip(number: int) -> CatalogClip:
+    pair = provisional_clip_pair(boot_id="abcde", sequence=number)
+    return CatalogClip(
+        clip_id=UUID(int=number),
+        lifecycle=ClipLifecycle.WRITING,
+        video_path=f"pending/{pair.video_name}",
+        sidecar_path=f"pending/{pair.metadata_name}",
+        start_monotonic_ns=number * 100,
+        end_monotonic_ns=None,
+        retention_order=number,
+        size_bytes=0,
+        protected=False,
+        protection_reason=None,
+        pair_reconciled=False,
         managed=True,
     )
 
@@ -247,11 +268,24 @@ def test_kind_filtered_pending_query_is_stable_and_cannot_be_masked_by_delete(
             unprotect_id,
         )
         assert all(intent.kind is not IntentKind.DELETE for intent in filtered)
+        assert catalog.get_pending_intent(protect_id) == filtered[0]
+        assert catalog.get_pending_intent(UUID(int=999)) is None
+        assert catalog.list_pending_intents_for_clip(
+            UUID(int=3),
+            kinds=(IntentKind.PROTECT, IntentKind.UNPROTECT),
+            limit=1,
+        ) == (filtered[1],)
         with pytest.raises(ValueError, match="unique IntentKind"):
             catalog.list_pending_intents_by_kind(kinds=(), limit=1)
         with pytest.raises(ValueError, match="unique IntentKind"):
             catalog.list_pending_intents_by_kind(
                 kinds=(IntentKind.PROTECT, IntentKind.PROTECT),
+                limit=1,
+            )
+        with pytest.raises(ValueError, match="unique IntentKind"):
+            catalog.list_pending_intents_for_clip(
+                UUID(int=2),
+                kinds=(),
                 limit=1,
             )
 
@@ -610,6 +644,120 @@ def test_event_protects_an_active_current_clip_before_acknowledgement(
         assert all(
             intent.clip_id != current.clip_id for intent in catalog.list_pending_intents(limit=10)
         )
+
+
+def test_writing_registration_next_consumption_and_orphan_demotion_are_durable(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    with ClipCatalog(database) as catalog:
+        catalog.register_clip(_clip(1), catalog_now_ns=1)
+        active = _writing_clip(2)
+        catalog.register_writing_clip(active, monotonic_now_ns=2)
+        event = catalog.trigger_event(
+            UUID(int=1),
+            source=EventSource.WEB,
+            monotonic_now_ns=3,
+            previous_count=0,
+            next_count=1,
+            event_id=UUID(int=500),
+        )
+
+        state = catalog.active_closing_protection(active.clip_id, monotonic_now_ns=4)
+        repeated = catalog.active_closing_protection(active.clip_id, monotonic_now_ns=5)
+
+        assert state.protected and state.reason == f"event:{event.event_id}:pending-window"
+        assert repeated == state
+        assert catalog.get_clip(active.clip_id).protected
+        assert catalog.list_writing_clips(limit=2) == (catalog.get_clip(active.clip_id),)
+        assert catalog.mark_writing_clip_orphaned(active.clip_id, monotonic_now_ns=6)
+        assert not catalog.mark_writing_clip_orphaned(active.clip_id, monotonic_now_ns=7)
+        orphan = catalog.get_clip(active.clip_id)
+        assert orphan.lifecycle is ClipLifecycle.MISSING_SIDECAR
+        assert orphan.protected
+
+    with ClipCatalog(database) as reopened:
+        assert reopened.get_clip(active.clip_id) == orphan
+        assert reopened.list_writing_clips(limit=1) == ()
+
+
+def test_event_id_retry_is_idempotent_and_reexposes_only_pending_moves(tmp_path: Path) -> None:
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        for number in range(1, 4):
+            catalog.register_clip(_clip(number), catalog_now_ns=number)
+        event_id = UUID(int=600)
+        first = catalog.trigger_event(
+            UUID(int=3),
+            source=EventSource.WEB,
+            monotonic_now_ns=10,
+            event_id=event_id,
+        )
+        pending_before = catalog.list_pending_intents(limit=10)
+
+        retried = catalog.trigger_event(
+            None,
+            source=EventSource.WEB,
+            monotonic_now_ns=999,
+            event_id=event_id,
+        )
+
+        assert retried == first
+        assert catalog.list_pending_intents(limit=10) == pending_before
+        assert catalog.trigger_event(
+            UUID(int=2),
+            source=EventSource.WEB,
+            monotonic_now_ns=1_000,
+            event_id=event_id,
+        ) == first
+        with pytest.raises(CatalogConflictError, match="another request"):
+            catalog.trigger_event(
+                None,
+                source=EventSource.API,
+                monotonic_now_ns=1_001,
+                event_id=event_id,
+            )
+
+
+def test_active_finalize_refuses_stale_protection_revision_without_transition(
+    tmp_path: Path,
+) -> None:
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        active = _writing_clip(1)
+        catalog.register_writing_clip(active, monotonic_now_ns=1)
+        snapshot = catalog.active_closing_protection(active.clip_id, monotonic_now_ns=2)
+        catalog.trigger_event(
+            active.clip_id,
+            source=EventSource.API,
+            monotonic_now_ns=3,
+            previous_count=0,
+            next_count=0,
+            event_id=UUID(int=700),
+        )
+        target = finalized_unsynced_clip_pair(boot_id="abcde", sequence=1)
+        closing = replace(
+            active,
+            lifecycle=ClipLifecycle.FINALIZING,
+            end_monotonic_ns=1_000,
+            size_bytes=10,
+        )
+
+        with pytest.raises(ActiveClipProtectionChanged):
+            catalog.register_finalizing_clip(
+                closing,
+                promotion_paths=PairPaths(
+                    active.video_path,
+                    active.sidecar_path,
+                    f"clips/{target.video_name}",
+                    f"clips/{target.metadata_name}",
+                ),
+                monotonic_now_ns=4,
+                expected_protection_revision=snapshot.revision,
+            )
+
+        durable = catalog.get_clip(active.clip_id)
+        assert durable.lifecycle is ClipLifecycle.WRITING
+        assert durable.protected
+        assert catalog.list_pending_intents(limit=1) == ()
 
 
 def test_catalog_retention_view_excludes_protection_leases_and_mutations(

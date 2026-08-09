@@ -26,7 +26,12 @@ from dashcam.config import (
     write_config_atomic,
 )
 from dashcam.control.api import ErrorCode
-from dashcam.control.dispatcher import OperationCallback, RecorderControlDispatcher
+from dashcam.control.dispatcher import (
+    EventExecutor,
+    IntentExecutor,
+    OperationCallback,
+    RecorderControlDispatcher,
+)
 from dashcam.control.socket_server import (
     ControlCommand,
     ControlOperationError,
@@ -148,6 +153,7 @@ class FakeCatalog:
         monotonic_now_ns: int,
         previous_count: int = 2,
         next_count: int = 1,
+        event_id: UUID | None = None,
     ) -> EventProtectionResult:
         self.event_calls.append(
             {
@@ -156,10 +162,11 @@ class FakeCatalog:
                 "monotonic_now_ns": monotonic_now_ns,
                 "previous_count": previous_count,
                 "next_count": next_count,
+                "event_id": event_id,
             }
         )
         return EventProtectionResult(
-            event_id=UUID(int=201),
+            event_id=UUID(int=201) if event_id is None else event_id,
             protected_clip_ids=(current_clip_id,),
             missing_previous_count=1,
             pending_next_count=next_count,
@@ -204,6 +211,8 @@ def _dispatcher(
     clock: Clock | None = None,
     current_clip: UUID | None = CURRENT_CLIP_ID,
     intents: list[UUID] | None = None,
+    intent_executor: IntentExecutor | None = None,
+    event_executor: EventExecutor | None = None,
     restart: OperationCallback | None = None,
     prepare_removal: OperationCallback | None = None,
     max_leases: int = 32,
@@ -217,6 +226,34 @@ def _dispatcher(
 
     async def execute_intent(intent_id: UUID) -> None:
         executed_intents.append(intent_id)
+
+    selected_intent_executor = (
+        intent_executor if intent_executor is not None else execute_intent
+    )
+
+    async def execute_event(
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int,
+        next_count: int,
+        event_id: UUID,
+    ) -> EventProtectionResult:
+        if current_clip is None:
+            raise ControlOperationError(
+                ErrorCode.CONFLICT,
+                "No current clip is available for an event",
+            )
+        event = selected_catalog.trigger_event(
+            current_clip,
+            source=source,
+            monotonic_now_ns=monotonic_now_ns,
+            previous_count=previous_count,
+            next_count=next_count,
+            event_id=event_id,
+        )
+        for intent_id in event.queued_intent_ids:
+            await selected_intent_executor(intent_id)
+        return event
 
     async def restart_default() -> None:
         return None
@@ -233,8 +270,8 @@ def _dispatcher(
             "session_token": "must-not-leak",
         },
         health_provider=lambda: {"healthy": True, "nested": {"password": "hidden"}},
-        current_clip_provider=lambda: current_clip,
-        intent_executor=execute_intent,
+        intent_executor=selected_intent_executor,
+        event_executor=event_executor if event_executor is not None else execute_event,
         restart_callback=restart if restart is not None else restart_default,
         prepare_removal_callback=(
             prepare_removal if prepare_removal is not None else removal_default
@@ -629,12 +666,16 @@ def test_delete_is_prepared_and_executed_without_accepting_a_path() -> None:
 
 def test_event_uses_recorder_current_clip_and_configured_window() -> None:
     catalog = FakeCatalog((_clip(1),))
-    dispatcher = _dispatcher(catalog=catalog)
+    intents: list[UUID] = []
+    dispatcher = _dispatcher(catalog=catalog, intents=intents)
+    event_id = UUID(int=301)
 
-    result = _run(dispatcher, ControlCommand.EVENT, {"source": "web"})
+    arguments = {"source": "web", "event_id": str(event_id)}
+    result = _run(dispatcher, ControlCommand.EVENT, arguments)
 
-    assert result["event_id"] == str(UUID(int=201))
+    assert result["event_id"] == str(event_id)
     assert result["protected_clip_ids"] == [str(UUID(int=1))]
+    assert intents == [UUID(int=202)]
     assert catalog.event_calls == [
         {
             "current_clip_id": UUID(int=1),
@@ -642,16 +683,40 @@ def test_event_uses_recorder_current_clip_and_configured_window() -> None:
             "monotonic_now_ns": 10_000,
             "previous_count": 2,
             "next_count": 1,
+            "event_id": event_id,
         }
     ]
 
     with pytest.raises(ControlOperationError) as captured:
-        _run(_dispatcher(current_clip=None), ControlCommand.EVENT, {"source": "web"})
+        _run(_dispatcher(current_clip=None), ControlCommand.EVENT, arguments)
     assert captured.value.code is ErrorCode.CONFLICT
 
     with pytest.raises(ControlOperationError) as captured:
-        _run(dispatcher, ControlCommand.EVENT, {"source": "gpio"})
+        _run(dispatcher, ControlCommand.EVENT, {**arguments, "source": "gpio"})
     assert captured.value.code is ErrorCode.INVALID_REQUEST
+
+
+def test_event_retry_uses_caller_event_id_after_post_commit_intent_failure() -> None:
+    attempts = 0
+
+    async def execute_intent(_intent_id: UUID) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("injected move failure")
+
+    catalog = FakeCatalog((_clip(1),))
+    dispatcher = _dispatcher(catalog=catalog, intent_executor=execute_intent)
+    arguments = {"source": "web", "event_id": str(UUID(int=302))}
+
+    with pytest.raises(ControlOperationError) as captured:
+        _run(dispatcher, ControlCommand.EVENT, arguments)
+    assert captured.value.code is ErrorCode.STORAGE_FAULT
+
+    result = _run(dispatcher, ControlCommand.EVENT, arguments)
+    assert result["event_id"] == str(UUID(int=302))
+    assert attempts == 2
+    assert [call["event_id"] for call in catalog.event_calls] == [UUID(int=302)] * 2
 
 
 def test_restart_has_explicit_in_progress_state_and_conflicts() -> None:
@@ -787,14 +852,30 @@ def test_dispatcher_integrates_real_atomic_config_and_catalog_contracts(
     async def operation() -> None:
         return None
 
+    async def execute_event(
+        source: EventSource,
+        monotonic_now_ns: int,
+        previous_count: int,
+        next_count: int,
+        event_id: UUID,
+    ) -> EventProtectionResult:
+        return catalog.trigger_event(
+            UUID(int=2),
+            source=source,
+            monotonic_now_ns=monotonic_now_ns,
+            previous_count=previous_count,
+            next_count=next_count,
+            event_id=event_id,
+        )
+
     dispatcher = RecorderControlDispatcher(
         catalog=catalog,
         config_provider=lambda: load_config(config_path),
         config_writer=lambda config: write_config_atomic(config_path, config),
         status_provider=lambda: {"state": "RECORDING"},
         health_provider=lambda: {"healthy": True},
-        current_clip_provider=lambda: UUID(int=2),
         intent_executor=execute_intent,
+        event_executor=execute_event,
         restart_callback=operation,
         prepare_removal_callback=operation,
         monotonic_ns=lambda: 100,

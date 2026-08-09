@@ -1894,6 +1894,15 @@ def test_run_exposes_first_validated_fragment_opened_readiness() -> None:
             123,
             media_contract=FragmentMediaContract(1, None),
         )
+        assert await asyncio.wait_for(
+            backend.next_opened_fragment(),
+            timeout=0.1,
+        ) == OpenedFragment(
+            config.output_directory / "boot-ba1b2c3d4-000008.partial.mp4",
+            8,
+            60_000_000_123,
+            media_contract=FragmentMediaContract(1, None),
+        )
 
         driver.messages.extend(
             (
@@ -1937,7 +1946,29 @@ def test_run_fails_closed_for_forged_or_unconsumed_fragment_events() -> None:
         driver.messages.append(BusMessage(BusMessageKind.EOS))
         await backend.stop()
 
+    async def full_opened_queue() -> None:
+        config = output_config(event_capacity=1)
+        driver = FakeDriver(
+            messages=[
+                opened_message(config, 0, 0),
+                opened_message(config, 1, 1),
+                opened_message(config, 2, 2),
+            ]
+        )
+        backend = GStreamerBackend(output=config, driver=driver)
+        await backend.start(VideoProfile())
+        with pytest.raises(RecoverablePipelineError, match="opened event queue exceeded"):
+            await backend.run(asyncio.Event())
+        driver.messages.extend(
+            (
+                fragment_message(config, 2),
+                BusMessage(BusMessageKind.EOS),
+            )
+        )
+        await backend.stop()
+
     run_async(forged_location())
+    run_async(full_opened_queue())
     run_async(full_queue())
 
 

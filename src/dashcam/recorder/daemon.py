@@ -19,6 +19,7 @@ from dashcam.recorder.runtime import (
     RecorderStorageFault,
     RuntimeLifecycleEvent,
     RuntimeLifecycleEventKind,
+    StorageSafetyStop,
 )
 from dashcam.recorder.status import RecorderReason, RecorderStatus, RecorderStatusStore
 from dashcam.state import RecorderState
@@ -93,6 +94,7 @@ class DaemonLimits:
 
 class DaemonOutcome(StrEnum):
     STOPPED = "STOPPED"
+    STORAGE_SAFETY_STOP = "STORAGE_SAFETY_STOP"
     CONFIG_ERROR = "CONFIG_ERROR"
     STARTUP_FAILED = "STARTUP_FAILED"
     STARTUP_TIMEOUT = "STARTUP_TIMEOUT"
@@ -110,7 +112,10 @@ class DaemonResult:
 
     @property
     def clean(self) -> bool:
-        return self.outcome is DaemonOutcome.STOPPED
+        return self.outcome in {
+            DaemonOutcome.STOPPED,
+            DaemonOutcome.STORAGE_SAFETY_STOP,
+        }
 
 
 class PipelineNoProgressFault(RuntimeError):
@@ -494,19 +499,25 @@ class RecorderDaemon:
             return DaemonResult(DaemonOutcome.STARTUP_TIMEOUT, self.status)
         startup_error = self._task_error(start_task)
         if startup_error is not None:
-            if isinstance(startup_error, RecorderStorageFault):
+            if isinstance(startup_error, StorageSafetyStop):
                 reason = RecorderReason.STORAGE_FAULT
+                outcome = DaemonOutcome.STORAGE_SAFETY_STOP
+            elif isinstance(startup_error, RecorderStorageFault):
+                reason = RecorderReason.STORAGE_FAULT
+                outcome = DaemonOutcome.STARTUP_FAILED
             elif isinstance(startup_error, RecorderFinalizationFault):
                 reason = RecorderReason.FINALIZATION_FAILED
+                outcome = DaemonOutcome.STARTUP_FAILED
             else:
                 reason = RecorderReason.STARTUP_FAILED
+                outcome = DaemonOutcome.STARTUP_FAILED
             self._publish(
                 RecorderState.FAULTED,
                 reason=reason,
                 detail=_exception_detail(startup_error),
             )
             await self._cleanup_after_failure(None)
-            return DaemonResult(DaemonOutcome.STARTUP_FAILED, self.status)
+            return DaemonResult(outcome, self.status)
 
         if self._stop_requested.is_set():
             run_task = asyncio.create_task(
@@ -587,15 +598,21 @@ class RecorderDaemon:
                 outcome = DaemonOutcome.RUNTIME_EXITED
                 detail = "runtime exited without a stop request"
             else:
-                if isinstance(runtime_error, RecorderStorageFault):
+                if isinstance(runtime_error, StorageSafetyStop):
                     reason = RecorderReason.STORAGE_FAULT
+                    outcome = DaemonOutcome.STORAGE_SAFETY_STOP
+                elif isinstance(runtime_error, RecorderStorageFault):
+                    reason = RecorderReason.STORAGE_FAULT
+                    outcome = DaemonOutcome.RUNTIME_FAILED
                 elif isinstance(runtime_error, PipelineRecoveryExhausted):
                     reason = RecorderReason.PIPELINE_RECOVERY_EXHAUSTED
+                    outcome = DaemonOutcome.RUNTIME_FAILED
                 elif isinstance(runtime_error, RecorderFinalizationFault):
                     reason = RecorderReason.FINALIZATION_FAILED
+                    outcome = DaemonOutcome.RUNTIME_FAILED
                 else:
                     reason = RecorderReason.RUNTIME_FAILED
-                outcome = DaemonOutcome.RUNTIME_FAILED
+                    outcome = DaemonOutcome.RUNTIME_FAILED
                 detail = _exception_detail(runtime_error)
             self._publish(RecorderState.FAULTED, reason=reason, detail=detail)
             await self._cleanup_after_failure(None)

@@ -18,6 +18,7 @@ from dashcam.catalog import (
     EventSource,
     RootedFilesystem,
 )
+from dashcam.catalog.database import RetentionThresholdLatch
 from dashcam.metadata.schema import (
     AudioSummary,
     ClipSidecar,
@@ -228,6 +229,7 @@ def test_metadata_candidates_page_all_current_boot_pairs_across_process_restart(
         (2, "add_event_protection"),
         (3, "add_protection_revisions"),
         (4, "add_name_reconciliation_payload"),
+        (5, "add_retention_threshold_latch"),
     ]
     assert journal_mode == ("wal",)
 
@@ -331,6 +333,28 @@ def test_catalog_refuses_a_newer_database_schema(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         ClipCatalog(database)
+
+
+def test_retention_latch_is_transactional_and_refuses_binding_overwrite(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    first = RetentionThresholdLatch("7EED-3EA7", 24_000_000_000, False)
+    reclaiming = replace(first, reclaim_latched=True)
+
+    with ClipCatalog(database) as catalog:
+        assert catalog.retention_threshold_latch() is None
+        catalog.store_retention_threshold_latch(first)
+        catalog.store_retention_threshold_latch(reclaiming)
+        assert catalog.retention_threshold_latch() == reclaiming
+        with pytest.raises(CatalogConflictError, match="binding differs"):
+            catalog.store_retention_threshold_latch(
+                replace(reclaiming, volume_uuid="FOREIGN")
+            )
+        assert catalog.retention_threshold_latch() == reclaiming
+
+    with ClipCatalog(database) as reopened:
+        assert reopened.retention_threshold_latch() == reclaiming
 
 
 def test_retention_order_is_unique_and_reads_have_a_hard_row_bound(tmp_path: Path) -> None:

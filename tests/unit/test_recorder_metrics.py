@@ -50,7 +50,7 @@ def test_snapshot_is_canonical_bounded_and_atomically_replaced(tmp_path: Path) -
             "state": "STARTING",
         },
         "runtime": Runtime().runtime_snapshot(),
-        "schema_version": 2,
+        "schema_version": 3,
     }
 
 

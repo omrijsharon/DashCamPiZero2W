@@ -8,14 +8,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from dashcam.catalog.database import ClipCatalog
+from dashcam.catalog.database import ClipCatalog, RetentionThresholdLatch
 from dashcam.catalog.filesystem import CatalogFilesystem
 from dashcam.catalog.models import (
     CatalogClip,
     ClipNotFoundError,
     IntentReconciliationResult,
 )
-from dashcam.metadata.reconcile import parse_sidecar_bytes
+from dashcam.metadata.reconcile import MetadataReconciliationPlan, parse_sidecar_bytes
 from dashcam.metadata.schema import (
     AudioSummary,
     ClipSidecar,
@@ -70,6 +70,37 @@ class FakePromotionCatalog:
         self.fail_registration_once = False
         self.fail_before_actions_once = False
         self.fail_before_completion_once = False
+        self.retention_latch: RetentionThresholdLatch | None = None
+
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None:
+        return self.retention_latch
+
+    def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None:
+        self.retention_latch = latch
+
+    def next_retention_order(self) -> int:
+        return 0
+
+    def list_metadata_reconciliation_candidates(
+        self,
+        expected_boot_id: UUID,
+        *,
+        limit: int,
+        after_order: int = -1,
+        after_clip_id: UUID | None = None,
+    ) -> tuple[CatalogClip, ...]:
+        del expected_boot_id, limit, after_order, after_clip_id
+        return ()
+
+    def register_name_reconciliation(
+        self,
+        plan: MetadataReconciliationPlan,
+        *,
+        source_sidecar: ClipSidecar,
+        monotonic_now_ns: int,
+    ) -> UUID:
+        del plan, source_sidecar, monotonic_now_ns
+        raise AssertionError("name reconciliation is outside this finalizer fixture")
 
     def register_finalizing_clip(
         self,

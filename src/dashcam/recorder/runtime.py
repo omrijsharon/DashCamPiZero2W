@@ -23,7 +23,15 @@ from dashcam.audio.linux import (
     discover_capture_device,
 )
 from dashcam.catalog import ClipCatalog
-from dashcam.config import AudioConfig, DashcamConfig, GpsConfig, OverlayConfig, VideoConfig
+from dashcam.catalog.database import RetentionThresholdLatch
+from dashcam.config import (
+    AudioConfig,
+    DashcamConfig,
+    GpsConfig,
+    OverlayConfig,
+    StorageConfig,
+    VideoConfig,
+)
 from dashcam.gps.anchors import NmeaAnchorTracker
 from dashcam.gps.clock import AnchorPolicy, MonotonicUtcClock, to_local_time
 from dashcam.gps.service import GpsCounters, GpsService, GpsServiceLimits, GpsSnapshot
@@ -60,6 +68,7 @@ from dashcam.recorder.gstreamer import (
     FrameCounters,
     GStreamerBackend,
     OpenedFragment,
+    RecordingStorageNoSpaceError,
     SegmentedOutputConfig,
 )
 from dashcam.recorder.pipeline import (
@@ -77,12 +86,15 @@ from dashcam.storage.naming import (
     provisional_clip_pair,
 )
 from dashcam.storage.preflight import PreflightResult, run_live_storage_preflight
+from dashcam.storage.space import (
+    StorageSpaceMonitor,
+    StorageSpaceSnapshot,
+    build_storage_space_monitor,
+)
 from dashcam.version import get_version
 
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
-_BOOT_ID_RE = re.compile(
-    rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n?"
-)
+_BOOT_ID_RE = re.compile(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n?")
 _EXPECTED_VIDEO = VideoConfig()
 _PROCESS_CAMERA_OWNERSHIP = CameraOwnership()
 _MAX_SEQUENCE_ENTRIES = 4096
@@ -104,6 +116,10 @@ _METRES_PER_SECOND_PER_KNOT = 1852.0 / 3600.0
 
 class RecorderStorageFault(PipelineContractError):
     """Storage evidence became invalid before the camera could safely open."""
+
+
+class StorageSafetyStop(RecorderStorageFault):
+    """Storage policy requested a deliberate bounded clean recorder stop."""
 
 
 class RuntimeLifecycleEventKind(StrEnum):
@@ -200,6 +216,10 @@ class RuntimeFinalizer(Protocol):
 
     def next_retention_order(self) -> int: ...
 
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None: ...
+
+    def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None: ...
+
     def finalize(
         self,
         *,
@@ -288,6 +308,18 @@ class RuntimeBackoffWaiter(Protocol):
     async def __call__(self, delay_s: float, stop_requested: asyncio.Event) -> bool: ...
 
 
+class StorageSpaceMonitorFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        storage: StorageConfig,
+        volume_uuid: str,
+        expected_device_id: str,
+        expected_capacity_bytes: int,
+        latch_store: RuntimeFinalizer,
+    ) -> StorageSpaceMonitor: ...
+
+
 async def _wait_for_backoff(delay_s: float, stop_requested: asyncio.Event) -> bool:
     try:
         await asyncio.wait_for(stop_requested.wait(), timeout=delay_s)
@@ -301,6 +333,15 @@ def _bounded_exception_detail(error: BaseException) -> str:
     detail = " ".join(raw.splitlines()).strip()
     detail = "".join(character if character.isprintable() else " " for character in detail)
     return (detail or type(error).__name__)[:512]
+
+
+def _storage_space_detail(status: StorageSpaceSnapshot) -> str:
+    fault = "NONE" if status.fault is None else status.fault.value
+    mode = "UNOBSERVED" if status.mode is None else status.mode.value
+    return (
+        f"storage retention safety stop mode={mode} fault={fault} "
+        f"free_bytes={status.free_bytes} capacity_bytes={status.capacity_bytes}"
+    )[:512]
 
 
 def _recovery_detail(
@@ -323,6 +364,7 @@ class RuntimeLimits:
     finalizer_timeout_s: float = 6.0
     metadata_reconciliation_interval_s: float = 1.0
     overlay_update_interval_s: float = 0.5
+    storage_observation_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -334,6 +376,7 @@ class RuntimeLimits:
                 self.metadata_reconciliation_interval_s,
             ),
             ("overlay_update_interval_s", self.overlay_update_interval_s),
+            ("storage_observation_interval_s", self.storage_observation_interval_s),
         ):
             if (
                 isinstance(value, bool)
@@ -345,12 +388,7 @@ class RuntimeLimits:
 
 def _absolute_posix(path: Path, description: str) -> str:
     value = path.as_posix()
-    if (
-        not value.startswith("/")
-        or "\0" in value
-        or ".." in path.parts
-        or len(value) > 4096
-    ):
+    if not value.startswith("/") or "\0" in value or ".." in path.parts or len(value) > 4096:
         raise ValueError(f"{description} must be a bounded absolute POSIX path")
     return value
 
@@ -404,10 +442,7 @@ def next_pending_sequence(
     for directory_name in _SEQUENCE_DIRECTORIES:
         directory = recording_root / directory_name
         before = os.lstat(directory)
-        if (
-            not stat.S_ISDIR(before.st_mode)
-            or before.st_dev != root_info.st_dev
-        ):
+        if not stat.S_ISDIR(before.st_mode) or before.st_dev != root_info.st_dev:
             raise RecorderStorageFault(
                 f"{directory_name} directory is not on the verified recording mount"
             )
@@ -420,12 +455,7 @@ def next_pending_sequence(
                         "clip directories exceeded their sequence scan bound"
                     )
                 name = entry.name
-                if (
-                    not name
-                    or len(name) > 255
-                    or not name.isascii()
-                    or not name.isprintable()
-                ):
+                if not name or len(name) > 255 or not name.isascii() or not name.isprintable():
                     raise RecorderStorageFault(
                         f"{directory_name} directory contains an unsafe name"
                     )
@@ -434,10 +464,7 @@ def next_pending_sequence(
                 if identity is None:
                     continue
                 found_boot = identity.group("boot") or identity.group("utc_boot")
-                sequence_text = (
-                    identity.group("boot_sequence")
-                    or identity.group("utc_sequence")
-                )
+                sequence_text = identity.group("boot_sequence") or identity.group("utc_sequence")
                 assert found_boot is not None and sequence_text is not None
                 if found_boot.casefold() == boot_id.casefold():
                     highest = max(highest, int(sequence_text))
@@ -461,10 +488,7 @@ def next_pending_sequence(
             )
     for sequence in range(highest + 1, 1_000_000):
         pair = provisional_clip_pair(boot_id=boot_id, sequence=sequence)
-        if (
-            pair.video_name.casefold() not in names
-            and pair.metadata_name.casefold() not in names
-        ):
+        if pair.video_name.casefold() not in names and pair.metadata_name.casefold() not in names:
             return sequence
     raise RecorderStorageFault("provisional clip sequence space is exhausted")
 
@@ -515,9 +539,7 @@ def _anchor_policy(config: GpsConfig) -> AnchorPolicy:
         latest_utc=latest,
         max_uncertainty_ns=config.anchor_uncertainty_ms * 1_000_000,
         max_conflict_ns=config.anchor_max_conflict_ms * 1_000_000,
-        max_reacquire_disagreement_ns=(
-            config.anchor_max_reacquire_disagreement_ms * 1_000_000
-        ),
+        max_reacquire_disagreement_ns=(config.anchor_max_reacquire_disagreement_ms * 1_000_000),
         max_anchor_interval_ns=config.anchor_max_interval_s * 1_000_000_000,
         gps_stale_after_ns=int(config.stale_after_s * 1_000_000_000),
     )
@@ -562,6 +584,7 @@ class GStreamerRecorderRuntime:
         restart_policy: RestartPolicy | None = None,
         backoff_waiter: RuntimeBackoffWaiter = _wait_for_backoff,
         gps_service_factory: GpsServiceFactory | None = None,
+        storage_space_monitor_factory: StorageSpaceMonitorFactory | None = None,
     ) -> None:
         self._config_path = _absolute_posix(config_path, "config_path")
         self._identity_path = _absolute_posix(identity_path, "identity_path")
@@ -579,6 +602,11 @@ class GStreamerRecorderRuntime:
         self._restart_policy = restart_policy or RestartPolicy()
         self._backoff_waiter = backoff_waiter
         self._gps_service_factory = gps_service_factory
+        self._storage_space_monitor_factory = storage_space_monitor_factory
+        self._storage_space_monitor: StorageSpaceMonitor | None = None
+        self._storage_space_task: asyncio.Task[None] | None = None
+        self._storage_space_stop = asyncio.Event()
+        self._reconciliation_allowed = storage_space_monitor_factory is None
         self._gps_service: RuntimeGpsService | None = None
         self._gps_stop = asyncio.Event()
         self._gps_task: asyncio.Task[None] | None = None
@@ -715,12 +743,8 @@ class GStreamerRecorderRuntime:
                     overlay_snapshot_error = "overlay renderer returned an invalid snapshot"
             except BaseException as error:
                 overlay_snapshot_error = _bounded_exception_detail(error)
-        renderer_faulted = (
-            overlay_snapshot_error is not None
-            or (
-                overlay_renderer is not None
-                and overlay_renderer.get("state") == "ISOLATED"
-            )
+        renderer_faulted = overlay_snapshot_error is not None or (
+            overlay_renderer is not None and overlay_renderer.get("state") == "ISOLATED"
         )
         return {
             "video": None
@@ -848,6 +872,11 @@ class GStreamerRecorderRuntime:
                 "bitrate_bps": self._last_clip_bitrate_bps,
                 "frames": self._last_clip_frames,
             },
+            "storage_retention": (
+                None
+                if self._storage_space_monitor is None
+                else self._storage_space_monitor.snapshot.as_dict()
+            ),
             "storage_preflight": None
             if preflight is None
             else {
@@ -861,13 +890,10 @@ class GStreamerRecorderRuntime:
                     "mounted": facts.mount.mounted,
                     "filesystem": facts.mount.filesystem,
                     "label": facts.mount.label,
-                    "uuid_suffix": None
-                    if facts.mount.uuid is None
-                    else facts.mount.uuid[-4:],
+                    "uuid_suffix": None if facts.mount.uuid is None else facts.mount.uuid[-4:],
                     "device_id": facts.mount.device_id,
                     "read_write": (
-                        "rw" in facts.mount.mount_options
-                        and "ro" not in facts.mount.mount_options
+                        "rw" in facts.mount.mount_options and "ro" not in facts.mount.mount_options
                     ),
                 },
                 "free_bytes": None if facts is None else facts.space.free_bytes,
@@ -895,9 +921,7 @@ class GStreamerRecorderRuntime:
             )
             else observed.navigation
         )
-        gps_time_state = (
-            GpsTimeState.UNSYNCED if observed is None else observed.gps_time_state
-        )
+        gps_time_state = GpsTimeState.UNSYNCED if observed is None else observed.gps_time_state
         if supervisor_faulted and observed is not None:
             gps_time_state = (
                 GpsTimeState.GPS_TIME_STALE
@@ -924,7 +948,9 @@ class GStreamerRecorderRuntime:
             "state": (
                 "FAULTED"
                 if supervisor_faulted
-                else "UART_UNAVAILABLE" if observed is None else observed.state.value
+                else "UART_UNAVAILABLE"
+                if observed is None
+                else observed.state.value
             ),
             "connected": False if observed is None or supervisor_faulted else observed.connected,
             "buffered_bytes": 0 if observed is None else observed.buffered_bytes,
@@ -951,9 +977,9 @@ class GStreamerRecorderRuntime:
                 if observed.time_anchor is None
                 else {
                     "monotonic_ns": observed.time_anchor.monotonic_ns,
-                    "utc": observed.time_anchor.utc.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
+                    "utc": observed.time_anchor.utc.isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    ),
                     "source": observed.time_anchor.source.value,
                     "provenance": observed.time_anchor.provenance,
                     "uncertainty_ns": observed.time_anchor.uncertainty_ns,
@@ -1010,50 +1036,34 @@ class GStreamerRecorderRuntime:
             },
             "telemetry": {
                 "sentences_considered": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.sentences_considered
+                    0 if observed is None else observed.telemetry_counters.sentences_considered
                 ),
                 "navigation_observations": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.navigation_observations
+                    0 if observed is None else observed.telemetry_counters.navigation_observations
                 ),
                 "invalid_navigation": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.invalid_navigation
+                    0 if observed is None else observed.telemetry_counters.invalid_navigation
                 ),
                 "ignored_sentences": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.ignored_sentences
+                    0 if observed is None else observed.telemetry_counters.ignored_sentences
                 ),
                 "samples_emitted": (
                     0 if observed is None else observed.telemetry_counters.samples_emitted
                 ),
                 "samples_coalesced": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.samples_coalesced
+                    0 if observed is None else observed.telemetry_counters.samples_coalesced
                 ),
                 "samples_rate_limited": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.samples_rate_limited
+                    0 if observed is None else observed.telemetry_counters.samples_rate_limited
                 ),
                 "samples_evicted": (
                     0 if observed is None else observed.telemetry_counters.samples_evicted
                 ),
                 "monotonic_regressions": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.monotonic_regressions
+                    0 if observed is None else observed.telemetry_counters.monotonic_regressions
                 ),
                 "source_time_regressions": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.source_time_regressions
+                    0 if observed is None else observed.telemetry_counters.source_time_regressions
                 ),
                 "omitted_out_of_range_fields": (
                     0
@@ -1061,9 +1071,7 @@ class GStreamerRecorderRuntime:
                     else observed.telemetry_counters.omitted_out_of_range_fields
                 ),
                 "retained_samples": (
-                    0
-                    if observed is None
-                    else observed.telemetry_counters.retained_samples
+                    0 if observed is None else observed.telemetry_counters.retained_samples
                 ),
             },
         }
@@ -1087,10 +1095,7 @@ class GStreamerRecorderRuntime:
         except Exception as error:
             return (
                 GpsSummary(False, None),
-                (
-                    "GPS telemetry snapshot unavailable: "
-                    f"{_bounded_exception_detail(error)}",
-                ),
+                (f"GPS telemetry snapshot unavailable: {_bounded_exception_detail(error)}",),
             )
         if not isinstance(window, GpsTelemetryWindow):
             return (
@@ -1181,9 +1186,7 @@ class GStreamerRecorderRuntime:
                 timeout=self._limits.task_stop_timeout_s,
             )
             if task not in cancelled:
-                self._gps_task_error = (
-                    "GPS supervisor ignored cancellation after its stop deadline"
-                )
+                self._gps_task_error = "GPS supervisor ignored cancellation after its stop deadline"
                 return
         self._gps_task_finished(task)
         self._gps_task = None
@@ -1365,8 +1368,7 @@ class GStreamerRecorderRuntime:
         if current is None and self._completed_audio_units == 0:
             return None
         return AudioCounters(
-            self._completed_audio_units
-            + (0 if current is None else current.encoded_access_units)
+            self._completed_audio_units + (0 if current is None else current.encoded_access_units)
         )
 
     def _cumulative_counters(self) -> FrameCounters | None:
@@ -1589,6 +1591,89 @@ class GStreamerRecorderRuntime:
         self._preflight_result = result
         return result
 
+    async def _initialize_storage_space_monitor(
+        self,
+        config: DashcamConfig,
+        finalizer: RuntimeFinalizer,
+    ) -> None:
+        factory = self._storage_space_monitor_factory
+        if factory is None:
+            return
+        result = self._preflight_result
+        facts = None if result is None else result.facts
+        if facts is None:
+            raise RecorderStorageFault("READY storage evidence lacks live space facts")
+        device_id = facts.mount.device_id
+        volume_uuid = facts.mount.uuid
+        capacity_bytes = facts.space.capacity_bytes
+        if device_id is None or volume_uuid is None or capacity_bytes is None:
+            raise RecorderStorageFault("READY storage evidence lacks retention identity")
+        try:
+            monitor = factory(
+                storage=config.storage,
+                volume_uuid=volume_uuid,
+                expected_device_id=device_id,
+                expected_capacity_bytes=capacity_bytes,
+                latch_store=finalizer,
+            )
+            status = monitor.snapshot
+            for _ in range(monitor.maximum_observation_failures):
+                status = await asyncio.to_thread(monitor.observe)
+                if status.stop_required or not status.stale:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise RecorderStorageFault("storage threshold monitor failed to initialize") from error
+        self._storage_space_monitor = monitor
+        if status.stop_required or status.stale:
+            raise StorageSafetyStop(_storage_space_detail(status))
+        self._reconciliation_allowed = True
+
+    async def _storage_space_loop(self) -> None:
+        monitor = self._storage_space_monitor
+        if monitor is None:
+            return
+        while not self._storage_space_stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._storage_space_stop.wait(),
+                    timeout=self._limits.storage_observation_interval_s,
+                )
+            except TimeoutError:
+                status = await asyncio.to_thread(monitor.observe)
+                if status.stop_required:
+                    raise StorageSafetyStop(_storage_space_detail(status)) from None
+
+    def _start_storage_space_monitor(self) -> None:
+        if self._storage_space_monitor is None or self._storage_space_task is not None:
+            return
+        self._storage_space_stop.clear()
+        self._storage_space_task = asyncio.create_task(
+            self._storage_space_loop(),
+            name="recorder-storage-space-monitor",
+        )
+
+    async def _stop_storage_space_monitor(self) -> None:
+        self._storage_space_stop.set()
+        task = self._storage_space_task
+        if task is None:
+            return
+        if not task.done():
+            await asyncio.gather(task, return_exceptions=True)
+        elif not task.cancelled():
+            task.exception()
+        self._storage_space_task = None
+
+    async def _escalate_no_space(self, error: BaseException) -> bool:
+        monitor = self._storage_space_monitor
+        if monitor is None:
+            return False
+        if isinstance(error, RecordingStorageNoSpaceError):
+            await asyncio.to_thread(monitor.note_no_space_write)
+            return True
+        return await asyncio.to_thread(monitor.note_write_error, error)
+
     async def _drain_finalized(self, backend: RuntimeBackend) -> None:
         while True:
             fragment = await backend.next_finalized_fragment()
@@ -1596,10 +1681,7 @@ class GStreamerRecorderRuntime:
                 expected = self._next_finalize_sequence
                 if expected is None:
                     raise PipelineFault("fragment finalization order is not initialized")
-                if (
-                    fragment.sequence < expected
-                    or fragment.sequence in self._reordered_finalized
-                ):
+                if fragment.sequence < expected or fragment.sequence in self._reordered_finalized:
                     raise PipelineFault(
                         "fragment finalization reported a duplicate or stale sequence"
                     )
@@ -1696,8 +1778,10 @@ class GStreamerRecorderRuntime:
                     if current.dropped_frames is None or baseline.dropped_frames is None
                     else current.dropped_frames - baseline.dropped_frames
                 )
-                if raw_delta < 0 or encoded_delta < 0 or (
-                    dropped_delta is not None and dropped_delta < 0
+                if (
+                    raw_delta < 0
+                    or encoded_delta < 0
+                    or (dropped_delta is not None and dropped_delta < 0)
                 ):
                     raise PipelineFault("GStreamer frame counters regressed")
                 self._last_clip_frames = {
@@ -1717,9 +1801,7 @@ class GStreamerRecorderRuntime:
                     )
                 self._last_clip_audio_units = units
                 if media_contract.audio_caps is not None and units == 0:
-                    warnings += (
-                        "no encoded AAC access units observed; clip marked video-only",
-                    )
+                    warnings += ("no encoded AAC access units observed; clip marked video-only",)
             elif self._effective_audio_caps is not None:
                 if current_audio is None or baseline_audio is None:
                     warnings += (
@@ -1748,9 +1830,7 @@ class GStreamerRecorderRuntime:
                         "compatibility sentinel",
                     )
             else:
-                warnings += (
-                    "frame and drop counters are unavailable in this recorder release",
-                )
+                warnings += ("frame and drop counters are unavailable in this recorder release",)
             self._last_clip_bitrate_bps = measured_bitrate
             self._last_clip_duration_ns = duration_ns
             self._last_clip_sequence = fragment.sequence
@@ -1766,9 +1846,7 @@ class GStreamerRecorderRuntime:
                 sequence=fragment.sequence,
             )
             effective_audio = (
-                self._effective_audio_caps
-                if media_contract is None
-                else media_contract.audio_caps
+                self._effective_audio_caps if media_contract is None else media_contract.audio_caps
             )
             audio_available = (
                 effective_audio is not None
@@ -1992,9 +2070,7 @@ class GStreamerRecorderRuntime:
 
     async def _cancel_background_tasks(self) -> None:
         tasks = tuple(
-            task
-            for task in (self._backend_run_task, self._fragment_drain_task)
-            if task is not None
+            task for task in (self._backend_run_task, self._fragment_drain_task) if task is not None
         )
         for task in tasks:
             if not task.done():
@@ -2151,10 +2227,16 @@ class GStreamerRecorderRuntime:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if self._backend_run_task in done:
-                await self._backend_run_task
-                raise RecoverablePipelineError(
-                    "backend exited before opening its first fragment"
-                )
+                try:
+                    await self._backend_run_task
+                except BaseException as error:
+                    if await self._escalate_no_space(error):
+                        assert self._storage_space_monitor is not None
+                        raise StorageSafetyStop(
+                            _storage_space_detail(self._storage_space_monitor.snapshot)
+                        ) from error
+                    raise
+                raise RecoverablePipelineError("backend exited before opening its first fragment")
             if opened_task not in done:
                 raise RecoverablePipelineError(
                     "first fragment did not open within the startup deadline"
@@ -2209,6 +2291,7 @@ class GStreamerRecorderRuntime:
                 raise RecorderStorageFault("READY storage evidence lacks a device identity")
             self._finalizer_device_id = device_id
             self._finalizer = self._finalizer_factory(recording_root, device_id)
+            await self._initialize_storage_space_monitor(config, self._finalizer)
             try:
                 await self._durable_worker(
                     self._finalizer.reconcile_pending,
@@ -2218,8 +2301,7 @@ class GStreamerRecorderRuntime:
                 raise
             except BaseException as error:
                 raise RecorderFinalizationFault(
-                    f"pending reconciliation failed: "
-                    f"{_bounded_exception_detail(error)}"
+                    f"pending reconciliation failed: {_bounded_exception_detail(error)}"
                 ) from error
         try:
             await self._start_attempt(profile, audio_plan)
@@ -2235,6 +2317,7 @@ class GStreamerRecorderRuntime:
         self._start_gps(config.gps)
         self._start_overlay(config.overlay)
         self._start_metadata_reconciliation()
+        self._start_storage_space_monitor()
 
     async def _supervise_attempt(self, stop_requested: asyncio.Event) -> None:
         backend_task = self._backend_run_task
@@ -2248,6 +2331,8 @@ class GStreamerRecorderRuntime:
             supervised = {backend_task, external_stop}
             if self._fragment_drain_task is not None:
                 supervised.add(self._fragment_drain_task)
+            if self._storage_space_task is not None:
+                supervised.add(self._storage_space_task)
             done, _ = await asyncio.wait(
                 supervised,
                 return_when=asyncio.FIRST_COMPLETED,
@@ -2255,18 +2340,38 @@ class GStreamerRecorderRuntime:
             if external_stop in done:
                 self._backend_stop.set()
                 return
+            if self._storage_space_task in done:
+                assert self._storage_space_task is not None
+                storage_error = self._storage_space_task.exception()
+                if isinstance(storage_error, StorageSafetyStop):
+                    raise storage_error
+                raise RecorderStorageFault(
+                    "storage threshold monitor exited unexpectedly"
+                ) from storage_error
             if self._fragment_drain_task in done:
                 assert self._fragment_drain_task is not None
                 try:
                     await self._fragment_drain_task
                 except BaseException as error:
                     self._drain_failure_observed = True
+                    if await self._escalate_no_space(error):
+                        assert self._storage_space_monitor is not None
+                        raise StorageSafetyStop(
+                            _storage_space_detail(self._storage_space_monitor.snapshot)
+                        ) from error
                     raise RecorderFinalizationFault(
-                        f"fragment finalization failed: "
-                        f"{_bounded_exception_detail(error)}"
+                        f"fragment finalization failed: {_bounded_exception_detail(error)}"
                     ) from error
                 raise RecorderFinalizationFault("fragment finalizer exited unexpectedly")
-            await backend_task
+            try:
+                await backend_task
+            except BaseException as error:
+                if await self._escalate_no_space(error):
+                    assert self._storage_space_monitor is not None
+                    raise StorageSafetyStop(
+                        _storage_space_detail(self._storage_space_monitor.snapshot)
+                    ) from error
+                raise
             if not self._backend_stop.is_set():
                 raise RecoverablePipelineError("backend exited without a stop request")
         finally:
@@ -2297,9 +2402,7 @@ class GStreamerRecorderRuntime:
                 except BaseException as error:
                     queue_error = error
                 if queue_error is None and self._reordered_finalized:
-                    queue_error = PipelineFault(
-                        "fragment closure sequence has an unresolved gap"
-                    )
+                    queue_error = PipelineFault("fragment closure sequence has an unresolved gap")
             if (
                 not self._drain_failure_observed
                 and drain_task is not None
@@ -2324,9 +2427,7 @@ class GStreamerRecorderRuntime:
                 and not run_task.cancelled()
             ):
                 observed = run_task.exception()
-                if observed is not None and not isinstance(
-                    observed, RecoverablePipelineError
-                ):
+                if observed is not None and not isinstance(observed, RecoverablePipelineError):
                     run_error = observed
         finally:
             self._roll_up_attempt_counters()
@@ -2461,6 +2562,7 @@ class GStreamerRecorderRuntime:
                 return
         except asyncio.CancelledError:
             try:
+                await self._stop_storage_space_monitor()
                 await self._stop_overlay()
                 await self._cleanup_current_attempt()
                 await self._run_metadata_reconciliation_pass()
@@ -2477,11 +2579,12 @@ class GStreamerRecorderRuntime:
 
         media_cleanup: BaseException | None = None
         try:
+            await self._stop_storage_space_monitor()
             await self._stop_overlay()
             await self._cleanup_current_attempt()
         except BaseException as error:
             media_cleanup = error
-        if media_cleanup is None:
+        if media_cleanup is None and self._reconciliation_allowed:
             await self._run_metadata_reconciliation_pass()
         await asyncio.gather(
             self._stop_gps(),
@@ -2563,6 +2666,7 @@ def build_production_runtime(
         audio_discovery=discover_capture_device,
         finalizer_factory=build_finalizer,
         gps_service_factory=build_gps_service,
+        storage_space_monitor_factory=build_storage_space_monitor,
     )
 
 
@@ -2574,6 +2678,7 @@ __all__ = [
     "RuntimeBackend",
     "RuntimeFinalizer",
     "RuntimeLimits",
+    "StorageSafetyStop",
     "build_production_runtime",
     "next_pending_sequence",
     "read_boot_uuid",

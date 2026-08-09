@@ -49,6 +49,7 @@ from dashcam.recorder.gstreamer import (
     OpenedFragment,
     PipelineCounters,
     PyGObjectGStreamerDriver,
+    RecordingStorageNoSpaceError,
     SegmentedOutputConfig,
     _AudioEosArbiter,
     _AudioIngressQuarantine,
@@ -1161,6 +1162,29 @@ def test_run_converts_bus_error_to_recoverable_failure() -> None:
     run_async(scenario())
 
 
+def test_run_preserves_structured_recording_storage_no_space() -> None:
+    async def scenario() -> None:
+        driver = FakeDriver(
+            messages=[
+                BusMessage(
+                    BusMessageKind.ERROR,
+                    "opaque resource failure",
+                    recording_storage_no_space=True,
+                )
+            ]
+        )
+        backend = GStreamerBackend(output=output_config(), driver=driver)
+        await backend.start(VideoProfile())
+
+        with pytest.raises(RecordingStorageNoSpaceError, match="no space"):
+            await backend.run(asyncio.Event())
+
+        driver.messages.append(BusMessage(BusMessageKind.EOS))
+        await backend.stop()
+
+    run_async(scenario())
+
+
 def test_cancelled_driver_call_retains_serialization_until_native_worker_exits() -> None:
     async def scenario() -> None:
         backend = GStreamerBackend(output=output_config(), driver=FakeDriver())
@@ -1176,9 +1200,7 @@ def test_cancelled_driver_call_retains_serialization_until_native_worker_exits()
         first = asyncio.create_task(backend._driver_call(blocked))
         assert await asyncio.to_thread(started.wait, 0.2)
         first.cancel()
-        second = asyncio.create_task(
-            backend._driver_call(lambda: order.append("second_done"))
-        )
+        second = asyncio.create_task(backend._driver_call(lambda: order.append("second_done")))
         await asyncio.sleep(0.02)
         first.cancel()
         await asyncio.sleep(0.01)
@@ -2368,11 +2390,31 @@ class FakeFormat:
     TIME = "time"
 
 
+class FakeResourceError:
+    NO_SPACE_LEFT = 28
+
+    @staticmethod
+    def quark() -> int:
+        return 9001
+
+
+@dataclass(frozen=True)
+class FakeParsedError:
+    no_space: bool
+
+    def matches(self, domain: object, code: object) -> bool:
+        return self.no_space and domain == 9001 and code == 28
+
+    def __str__(self) -> str:
+        return "opaque resource error"
+
+
 @dataclass
 class FakeGst:
     pipeline: FakeGstPipeline
     MessageType: type[FakeMessageType] = FakeMessageType
     Format: type[FakeFormat] = FakeFormat
+    ResourceError: type[FakeResourceError] = FakeResourceError
     descriptions: list[str] = field(default_factory=list)
 
     def parse_launch(self, description: str) -> FakeGstPipeline:
@@ -2493,6 +2535,28 @@ def test_pygobject_driver_keeps_camera_encoder_mux_and_name_impostors_critical(
     assert driver.poll_bus(pipeline, 0.1) == BusMessage(
         BusMessageKind.ERROR,
         f"critical failure; debug={source_name}",
+    )
+
+
+@pytest.mark.parametrize("no_space", [False, True])
+def test_pygobject_driver_preserves_structured_resource_no_space(no_space: bool) -> None:
+    pipeline = FakeGstPipeline(
+        FakeElement(),
+        FakeBus(
+            [
+                FakeGstMessage(
+                    FakeMessageType.ERROR,
+                    error=(FakeParsedError(no_space), "opaque debug"),
+                )
+            ]
+        ),
+    )
+    driver = PyGObjectGStreamerDriver(FakeGst(pipeline))
+
+    assert driver.poll_bus(pipeline, 0.1) == BusMessage(
+        BusMessageKind.ERROR,
+        "opaque resource error; debug=opaque debug",
+        recording_storage_no_space=no_space,
     )
 
 
@@ -5499,9 +5563,7 @@ def _critical_loss_shutdown_fixture() -> tuple[
 
 
 def test_critical_loss_shutdown_closes_only_exact_retired_av_fragment() -> None:
-    driver, context, retiring, successor, retirement_pad = (
-        _critical_loss_shutdown_fixture()
-    )
+    driver, context, retiring, successor, retirement_pad = _critical_loss_shutdown_fixture()
 
     assert driver.send_eos(context.pipeline) is True
 
@@ -5551,9 +5613,7 @@ def test_critical_loss_shutdown_closes_only_exact_retired_av_fragment() -> None:
 
 
 def test_critical_loss_shutdown_rejects_stale_successor_closure_identity() -> None:
-    driver, context, retiring, successor, _retirement_pad = (
-        _critical_loss_shutdown_fixture()
-    )
+    driver, context, retiring, successor, _retirement_pad = _critical_loss_shutdown_fixture()
     assert driver.send_eos(context.pipeline) is True
     location = next(iter(retiring.opened))
     context.pipeline.bus.messages.append(
@@ -5579,9 +5639,7 @@ def test_critical_loss_shutdown_rejects_stale_successor_closure_identity() -> No
 
 
 def test_critical_loss_retirement_worker_is_bounded_by_parent_null() -> None:
-    driver, context, retiring, _successor, _retirement_pad = (
-        _critical_loss_shutdown_fixture()
-    )
+    driver, context, retiring, _successor, _retirement_pad = _critical_loss_shutdown_fixture()
     blocking = _BlockingRetirementPad()
     retiring.video_queue = _RetirementQueue(retiring.bin, blocking)
     assert driver._critical_loss_shutdown_generation(context) is retiring
@@ -5619,9 +5677,7 @@ def test_critical_loss_shutdown_refuses_ambiguous_provenance(
     drift: str,
     message: str,
 ) -> None:
-    driver, context, retiring, successor, retirement_pad = (
-        _critical_loss_shutdown_fixture()
-    )
+    driver, context, retiring, successor, retirement_pad = _critical_loss_shutdown_fixture()
     location = next(iter(retiring.opened))
     if drift == "missing_retired_location":
         retiring.opened.clear()
@@ -5777,9 +5833,7 @@ class _ForcePad:
 
     def get_sticky_event(self, _event_type: object, _index: int) -> _ForceSegmentEvent | None:
         return (
-            None
-            if self.segment_offset_ns is None
-            else _ForceSegmentEvent(self.segment_offset_ns)
+            None if self.segment_offset_ns is None else _ForceSegmentEvent(self.segment_offset_ns)
         )
 
 
@@ -6334,9 +6388,7 @@ def test_audio_loss_holds_forced_idr_before_retiring_audio_route(
         order.append("proof")
         assert generation.last_audio_end_running_time_ns is not None
         return forced_idr_proof(
-            edge_skew_ns=(
-                60_000_000_000 - generation.last_audio_end_running_time_ns
-            )
+            edge_skew_ns=(60_000_000_000 - generation.last_audio_end_running_time_ns)
         )
 
     def drain_and_arm(
@@ -6395,19 +6447,13 @@ def test_audio_loss_holds_forced_idr_before_retiring_audio_route(
             ]
         )
     elif force_outcome == "timeout":
-        expected_order.extend(
-            ["await_force", "open_1_false", "link_1_false"]
-        )
+        expected_order.extend(["await_force", "open_1_false", "link_1_false"])
     assert order == expected_order
     assert (context.routing_phase == "LOSS_CONTAINMENT_CRITICAL") is (
         force_outcome != "dispatch_refused"
     )
-    assert context.generations[1].linked is (
-        force_outcome == "dispatch_refused"
-    )
-    assert context.generations[2].linked is (
-        force_outcome != "dispatch_refused"
-    )
+    assert context.generations[1].linked is (force_outcome == "dispatch_refused")
+    assert context.generations[2].linked is (force_outcome != "dispatch_refused")
     assert ("open_1_false" in order) is (force_outcome != "dispatch_refused")
     assert ("open_2_true" in order) is (force_outcome == "held")
     assert audio_valve.src.probes == {}
@@ -6602,9 +6648,7 @@ def test_audio_loss_retirement_boundary_refusal_releases_held_force_gate() -> No
         order.append("proof")
         assert generation.last_audio_end_running_time_ns is not None
         return forced_idr_proof(
-            edge_skew_ns=(
-                60_000_000_000 - generation.last_audio_end_running_time_ns
-            )
+            edge_skew_ns=(60_000_000_000 - generation.last_audio_end_running_time_ns)
         )
 
     def await_before_boundary(*_args: object, **_kwargs: object) -> None:
@@ -6796,9 +6840,7 @@ def test_forced_idr_post_route_revalidation_refuses_aac_edge_change() -> None:
     )
     try:
         proof = _finalize_forced_gate(driver, generation, gate)
-        generation.last_audio_end_running_time_ns = (
-            proof.last_audio_end_running_time_ns + 1
-        )
+        generation.last_audio_end_running_time_ns = proof.last_audio_end_running_time_ns + 1
         with pytest.raises(GStreamerDriverError, match="AAC access-unit end changed"):
             driver._revalidate_forced_idr_audio_edge(generation, proof)
     finally:

@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol
 from uuid import UUID
 
+from dashcam.catalog.database import RetentionThresholdLatch
 from dashcam.catalog.filesystem import CatalogFilesystem, RootedFilesystem
 from dashcam.catalog.models import (
     CatalogClip,
@@ -74,6 +75,10 @@ class PairPromotionCatalog(Protocol):
     def get_clip(self, clip_id: UUID) -> CatalogClip: ...
 
     def next_retention_order(self) -> int: ...
+
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None: ...
+
+    def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None: ...
 
     def list_metadata_reconciliation_candidates(
         self,
@@ -433,6 +438,16 @@ class RecorderClipFinalizer:
 
     def next_retention_order(self) -> int:
         return self._catalog.next_retention_order()
+
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None:
+        """Load the volume-bound threshold latch without touching clip rows."""
+
+        return self._catalog.retention_threshold_latch()
+
+    def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None:
+        """Persist threshold hysteresis without touching clip rows."""
+
+        self._catalog.store_retention_threshold_latch(latch)
 
     def metadata_reconciliation_candidates(
         self,

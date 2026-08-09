@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from dashcam.recorder.daemon import (
-    DaemonOutcome,
     DaemonResult,
     RecorderDaemon,
     RecorderRuntime,
@@ -154,7 +153,7 @@ async def run_daemon(
         raise
     finally:
         _remove_stop_handlers(loop, installed)
-    return 0 if result.outcome is DaemonOutcome.STOPPED else 1
+    return 0 if result.clean else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

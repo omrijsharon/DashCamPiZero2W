@@ -454,6 +454,7 @@ def _run(
     *,
     accepted: frozenset[int] = frozenset({0}),
     timeout: int = COMMAND_TIMEOUT_S,
+    safe_worker_refusal: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     if (
         not command
@@ -481,8 +482,17 @@ def _run(
     if len(result.stdout) > MAX_OUTPUT_BYTES or len(result.stderr) > MAX_OUTPUT_BYTES:
         raise HarnessError(f"command output exceeded its bound: {command[0]}")
     if result.returncode not in accepted:
-        raise HarnessError(f"command failed with status {result.returncode}: {command[0]}")
+        message = f"command failed with status {result.returncode}: {command[0]}"
+        if safe_worker_refusal:
+            message += ": " + _safe_worker_refusal_detail(result.stderr)
+        raise HarnessError(message)
     return result
+
+
+def _safe_worker_refusal_detail(stderr: bytes) -> str:
+    if not isinstance(stderr, bytes):
+        return "worker-stderr-unavailable"
+    return f"worker-stderr-sha256={_sha256(stderr)},bytes={len(stderr)}"
 
 
 def _findmnt(target: Path) -> dict[str, str] | None:
@@ -1876,7 +1886,7 @@ def _parent(arguments: argparse.Namespace) -> int:
         )
         baseline = cast(tuple[tuple[str, str, bool], ...], before["loop_inventory"])
         try:
-            _run(command, timeout=WORKER_TIMEOUT_S)
+            _run(command, timeout=WORKER_TIMEOUT_S, safe_worker_refusal=True)
         finally:
             _cleanup_worker_loops(work, baseline)
         worker_result = _strict_json(

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -478,6 +479,35 @@ def test_publication_occurs_after_cleanup_barrier_and_removes_failed_output(
     assert source.index("_publish_result(output, completed_result)") > source.index(
         "if cleanup_errors:"
     )
+
+
+def test_safe_worker_refusal_exposes_only_digest_and_size() -> None:
+    private = b"REFUSED: SSID MyHome PSK hunter2 coordinates 32.1,34.8\n"
+    detail = harness._safe_worker_refusal_detail(private)
+    assert detail == (
+        "worker-stderr-sha256=" + hashlib.sha256(private).hexdigest() + f",bytes={len(private)}"
+    )
+    for fragment in ("MyHome", "hunter2", "32.1", "34.8", "REFUSED"):
+        assert fragment not in detail
+
+
+def test_only_opted_in_worker_command_surfaces_safe_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = subprocess.CompletedProcess(
+        [harness.UNSHARE, "--"],
+        2,
+        stdout=b"",
+        stderr=b"REFUSED: exact safe worker reason\n",
+    )
+    monkeypatch.setattr(harness.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    expected_digest = hashlib.sha256(completed.stderr).hexdigest()
+    with pytest.raises(harness.HarnessError, match=expected_digest):
+        harness._run((harness.UNSHARE, "--"), safe_worker_refusal=True)
+    with pytest.raises(harness.HarnessError) as ordinary:
+        harness._run((harness.UNSHARE, "--"))
+    assert "exact safe worker reason" not in str(ordinary.value)
 
 
 def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> None:

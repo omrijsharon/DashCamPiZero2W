@@ -1375,7 +1375,9 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert source.count("os.posix_fallocate") == 2
     ext4_format = (
         'MKFS_EXT4,\n                "-F",\n                "-m",\n                "0",\n'
-        '                "-E",\n                "nodiscard",\n                "-L",\n'
+        '                "-E",\n'
+        '                "nodiscard,lazy_itable_init=0,lazy_journal_init=0",\n'
+        '                "-L",\n'
         '                "M10CAT",'
     )
     assert ext4_format in source
@@ -1417,8 +1419,9 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "480 MiB loop-backed exFAT" in readme
     assert "64 MiB loop-backed ext4" in readme
     assert "at least 2 GiB" in readme
-    assert "`-E nodiscard`" in readme
-    assert "mounted with explicit `nodiscard`" in readme
+    assert "`-E nodiscard,lazy_itable_init=0,lazy_journal_init=0`" in readme
+    assert "Ext4 is also mounted with" in readme
+    assert "explicit `nodiscard`" in readme
     assert "production_release_tested=false" in readme
     assert "physical_power_loss_tested=false" in readme
     assert "m10_exit_gate_closed=false" in readme

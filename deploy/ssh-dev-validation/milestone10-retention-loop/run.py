@@ -2536,7 +2536,7 @@ def _worker(arguments: argparse.Namespace) -> int:
                 "-m",
                 "0",
                 "-E",
-                "nodiscard",
+                "nodiscard,lazy_itable_init=0,lazy_journal_init=0",
                 "-L",
                 "M10CAT",
                 str(ext4_loop),

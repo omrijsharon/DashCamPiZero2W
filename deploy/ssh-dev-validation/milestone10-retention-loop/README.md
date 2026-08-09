@@ -59,10 +59,11 @@ are required again after every cleanup path and before result publication.
 Each image is fully allocated and fsynced before loop attachment, with exact
 size and allocated-block coverage verified and the remaining budget rechecked
 immediately before and after each allocation. The ext4 formatter uses its
-documented `-E nodiscard` option, and both images must retain full allocated-
-block coverage immediately after formatting and before mounting. Ext4 is also
-mounted with explicit `nodiscard`; its backing allocation is rechecked after
-each mount.
+documented `-E nodiscard,lazy_itable_init=0,lazy_journal_init=0` options so
+formatting performs inode-table and journal initialization without deferred
+mount-time work. Both images must retain full allocated-block coverage
+immediately after formatting and before mounting. Ext4 is also mounted with
+explicit `nodiscard`; its backing allocation is rechecked after each mount.
 
 The worker makes `/` recursively private before unmounting the cloned
 production mount. Every destructive filesystem command accepts only a numbered

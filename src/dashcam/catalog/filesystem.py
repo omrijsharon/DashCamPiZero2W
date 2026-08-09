@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Callable
@@ -79,8 +80,43 @@ class RootedFilesystem:
             _fsync_directory(target_path.parent)
 
     def unlink(self, relative_path: str) -> None:
-        with suppress(FileNotFoundError):
-            self._resolve(relative_path).unlink()
+        path = self._resolve(relative_path)
+        if os.name == "nt":
+            with suppress(FileNotFoundError):
+                path.unlink()
+            return
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path.parent, flags)
+        try:
+            directory = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(directory.st_mode)
+                or _device_id(directory.st_dev) != self._expected_device_id
+            ):
+                raise OSError("managed directory is no longer bound to the verified device")
+            try:
+                member = os.stat(
+                    path.name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.fsync(descriptor)
+                return
+            if (
+                not stat.S_ISREG(member.st_mode)
+                or _device_id(member.st_dev) != self._expected_device_id
+            ):
+                raise OSError("managed unlink target is not a bound regular file")
+            os.unlink(path.name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def iter_files(self, directory: str, *, limit: int) -> tuple[tuple[str, ...], int, bool]:
         if directory not in self._DIRECTORIES:

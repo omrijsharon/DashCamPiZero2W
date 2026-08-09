@@ -836,38 +836,55 @@ class ClipCatalog:
         _boot_id(boot_id)
         with self._transaction():
             row = self._required_clip_row(clip_id)
-            pending = self._pending_intent_row(clip_id)
-            if pending is not None:
-                if IntentKind(str(pending["kind"])) is IntentKind.DELETE:
-                    return UUID(str(pending["intent_id"]))
-                raise CatalogConflictError("clip mutation is already in progress")
-            if ClipLifecycle(str(row["lifecycle"])) is not ClipLifecycle.FINALIZED:
-                raise CatalogConflictError("only finalized clips can be deleted")
-            if bool(row["protected"]):
-                raise CatalogConflictError("protected clips cannot be deleted")
-            if not bool(row["pair_reconciled"]) or not bool(row["managed"]):
-                raise CatalogConflictError("only reconciled managed clips can be deleted")
-            if _row_has_active_lease(row, monotonic_now_ns=monotonic_now_ns, boot_id=boot_id):
-                raise CatalogConflictError("download lease is active")
-            paths = PairPaths(str(row["video_path"]), str(row["sidecar_path"]))
-            intent = self._insert_intent_locked(
-                clip_id,
-                kind=IntentKind.DELETE,
-                paths=paths,
+            return self._prepare_delete_row_locked(
+                row,
                 monotonic_now_ns=monotonic_now_ns,
+                boot_id=boot_id,
             )
-            self._connection.execute(
+
+    def prepare_oldest_eligible_delete(
+        self,
+        *,
+        monotonic_now_ns: int,
+        boot_id: str,
+    ) -> UUID | None:
+        """Atomically reserve exactly one oldest eligible reconciled clip."""
+
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        _boot_id(boot_id)
+        with self._transaction():
+            row = self._connection.execute(
                 """
-                UPDATE clips
-                SET lifecycle = ?, pair_reconciled = 0,
-                    lease_holder = NULL, lease_issued_ns = NULL,
-                    lease_expires_ns = NULL, lease_boot_id = NULL,
-                    updated_catalog_ns = ?
-                WHERE clip_id = ?
+                SELECT c.* FROM clips c
+                WHERE c.lifecycle = ?
+                  AND c.managed = 1
+                  AND c.pair_reconciled = 1
+                  AND c.protected = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM operation_intents i
+                      WHERE i.clip_id = c.clip_id AND i.status = 'PENDING'
+                  )
+                  AND NOT (
+                      c.lease_holder IS NOT NULL
+                      AND c.lease_boot_id = ?
+                      AND c.lease_expires_ns > ?
+                  )
+                ORDER BY c.retention_order, c.clip_id
+                LIMIT 1
                 """,
-                (ClipLifecycle.DELETING.value, monotonic_now_ns, str(clip_id)),
+                (
+                    ClipLifecycle.FINALIZED.value,
+                    boot_id,
+                    monotonic_now_ns,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._prepare_delete_row_locked(
+                row,
+                monotonic_now_ns=monotonic_now_ns,
+                boot_id=boot_id,
             )
-            return intent.intent_id
 
     def trigger_event(
         self,
@@ -1092,6 +1109,22 @@ class ClipCatalog:
             ).fetchall()
         return tuple(_intent_from_row(row) for row in rows)
 
+    def list_pending_delete_intents(self, *, limit: int) -> tuple[OperationIntent, ...]:
+        """Return a bounded oldest-first view that cannot be masked by other intents."""
+
+        _row_limit(limit, "limit")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM operation_intents
+                WHERE status = 'PENDING' AND kind = ?
+                ORDER BY created_monotonic_ns, intent_id
+                LIMIT ?
+                """,
+                (IntentKind.DELETE.value, limit),
+            ).fetchall()
+        return tuple(_intent_from_row(row) for row in rows)
+
     def reconcile_intent(
         self,
         intent_id: UUID,
@@ -1163,6 +1196,18 @@ class ClipCatalog:
                         False,
                         (validation_problem,),
                     )
+            if intent.kind is IntentKind.DELETE:
+                existing_sources = frozenset(action.source for action in plan.actions)
+                for source in (
+                    intent.paths.video_source,
+                    intent.paths.sidecar_source,
+                ):
+                    if source not in existing_sources:
+                        # Absence after an interrupted unlink is not durable
+                        # evidence until the verified parent is fsynced.  The
+                        # production unlink seam performs that confirmation
+                        # idempotently without affecting other intent kinds.
+                        filesystem.unlink(source)
             actions_attempted = 0
             for action in plan.actions[:max_actions]:
                 if action.kind is ActionKind.MOVE:
@@ -1736,6 +1781,56 @@ class ClipCatalog:
                 ),
                 monotonic_now_ns=monotonic_now_ns,
             )
+
+    def _prepare_delete_row_locked(
+        self,
+        row: sqlite3.Row,
+        *,
+        monotonic_now_ns: int,
+        boot_id: str,
+    ) -> UUID:
+        clip_id = UUID(str(row["clip_id"]))
+        pending = self._pending_intent_row(clip_id)
+        if pending is not None:
+            if IntentKind(str(pending["kind"])) is IntentKind.DELETE:
+                return UUID(str(pending["intent_id"]))
+            raise CatalogConflictError("clip mutation is already in progress")
+        if ClipLifecycle(str(row["lifecycle"])) is not ClipLifecycle.FINALIZED:
+            raise CatalogConflictError("only finalized clips can be deleted")
+        if bool(row["protected"]):
+            raise CatalogConflictError("protected clips cannot be deleted")
+        if not bool(row["pair_reconciled"]) or not bool(row["managed"]):
+            raise CatalogConflictError("only reconciled managed clips can be deleted")
+        if _row_has_active_lease(
+            row,
+            monotonic_now_ns=monotonic_now_ns,
+            boot_id=boot_id,
+        ):
+            raise CatalogConflictError("download lease is active")
+        paths = PairPaths(str(row["video_path"]), str(row["sidecar_path"]))
+        if (
+            PurePosixPath(paths.video_source).parent.as_posix() != "clips"
+            or PurePosixPath(paths.sidecar_source).parent.as_posix() != "clips"
+        ):
+            raise CatalogConflictError("retention may delete only reconciled clips/ pairs")
+        intent = self._insert_intent_locked(
+            clip_id,
+            kind=IntentKind.DELETE,
+            paths=paths,
+            monotonic_now_ns=monotonic_now_ns,
+        )
+        self._connection.execute(
+            """
+            UPDATE clips
+            SET lifecycle = ?, pair_reconciled = 0,
+                lease_holder = NULL, lease_issued_ns = NULL,
+                lease_expires_ns = NULL, lease_boot_id = NULL,
+                updated_catalog_ns = ?
+            WHERE clip_id = ?
+            """,
+            (ClipLifecycle.DELETING.value, monotonic_now_ns, str(clip_id)),
+        )
+        return intent.intent_id
 
     def _mark_intent_complete_locked(self, intent: OperationIntent, monotonic_now_ns: int) -> None:
         self._connection.execute(

@@ -135,6 +135,7 @@ class StorageConfig:
     high_watermark_percent: int = 20
     minimum_free_gib: float = 2.0
     emergency_free_mib: int = 256
+    download_lease_timeout_s: int = 300
     protect_previous_clips: int = 2
     protect_next_clips: int = 1
 
@@ -546,6 +547,12 @@ def _storage(root: Mapping[str, object]) -> StorageConfig:
             1,
             1_048_576,
             "storage.emergency_free_mib",
+        ),
+        download_lease_timeout_s=_bounded_int(
+            _integer(table, "download_lease_timeout_s", "storage"),
+            1,
+            900,
+            "storage.download_lease_timeout_s",
         ),
         protect_previous_clips=_bounded_int(
             _integer(table, "protect_previous_clips", "storage"),

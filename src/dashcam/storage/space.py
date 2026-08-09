@@ -417,6 +417,7 @@ def build_storage_space_monitor(
         ),
         observer=observer_factory(Path(storage.recording_root)),
         latch_store=latch_store,
+        reclaimer_available=True,
     )
 
 

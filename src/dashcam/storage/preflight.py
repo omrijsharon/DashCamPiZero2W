@@ -324,6 +324,18 @@ class PreflightResult:
             and self.probe_succeeded
         )
 
+    @property
+    def recoverable_reserve_exhaustion(self) -> bool:
+        """Admit only identity-valid low space to bounded pre-camera reclamation."""
+
+        return (
+            self.state is StorageState.EMERGENCY
+            and self.reasons == (PreflightReason.RESERVE_EXHAUSTED,)
+            and self.facts is not None
+            and not self.probe_attempted
+            and not self.probe_succeeded
+        )
+
 
 def recording_root_facts_from_mapping(raw: Mapping[str, object]) -> RecordingRootFacts:
     """Strictly parse bounded structured facts; shell text is never accepted."""

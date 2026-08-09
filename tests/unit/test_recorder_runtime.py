@@ -92,6 +92,7 @@ from dashcam.storage.preflight import (
     RecordingRootFacts,
     SpaceFacts,
 )
+from dashcam.storage.reclaimer import ReclamationStep
 from dashcam.storage.retention import StorageThresholds
 from dashcam.storage.space import FilesystemSpaceObservation, StorageSpaceMonitor
 
@@ -127,6 +128,18 @@ def ready_storage_with_device() -> PreflightResult:
         ),
         True,
         True,
+    )
+
+
+def reserve_exhausted_storage_with_device() -> PreflightResult:
+    ready = ready_storage_with_device()
+    assert ready.facts is not None
+    return PreflightResult(
+        StorageState.EMERGENCY,
+        (PreflightReason.RESERVE_EXHAUSTED,),
+        replace(ready.facts, space=SpaceFacts(24_000_000_000, 2 * 1024**3)),
+        False,
+        False,
     )
 
 
@@ -331,9 +344,14 @@ class FakeFinalizer:
     metadata_attempts: int = 0
     metadata_candidate_scans: int = 0
     retention_latch: RetentionThresholdLatch | None = None
+    reclamation_steps: list[ReclamationStep] = field(default_factory=list)
+    reclamation_calls: list[tuple[str, bool]] = field(default_factory=list)
+    reconciliation_reports: list[FinalizationRecoveryReport] = field(default_factory=list)
 
     def reconcile_pending(self) -> FinalizationRecoveryReport:
         self.reconciled += 1
+        if self.reconciliation_reports:
+            return self.reconciliation_reports.pop(0)
         return FinalizationRecoveryReport(0, 0, 0, False)
 
     def video_size(self, provisional_video_name: str) -> int:
@@ -348,6 +366,12 @@ class FakeFinalizer:
 
     def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None:
         self.retention_latch = latch
+
+    def reclaim_storage_once(self, *, boot_id: str, allow_new: bool) -> ReclamationStep:
+        self.reclamation_calls.append((boot_id, allow_new))
+        if self.reclamation_steps:
+            return self.reclamation_steps.pop(0)
+        return ReclamationStep(None, None, False, False, False, 0)
 
     def metadata_reconciliation_candidates(
         self,
@@ -421,6 +445,7 @@ class FakeFinalizer:
 class SpaceMonitorFactory:
     observations: list[object]
     calls: int = 0
+    reclaimer_available: bool = False
 
     def __call__(
         self,
@@ -448,6 +473,7 @@ class SpaceMonitorFactory:
             thresholds=StorageThresholds(15, 20, 2 * 1024**3, 256 * 1024**2),
             observer=observe,
             latch_store=latch_store,
+            reclaimer_available=self.reclaimer_available,
         )
 
 
@@ -3042,5 +3068,384 @@ def test_duplicate_generation_closure_is_terminal_and_never_regresses_last_clip(
             await runtime.run(asyncio.Event())
         assert runtime.runtime_snapshot()["last_clip"]["sequence"] == 0  # type: ignore[index]
         await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_reserve_exhausted_startup_reclaims_to_high_then_requires_fresh_ready_probe() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(
+            reclamation_steps=[
+                ReclamationStep(UUID(int=1), UUID(int=2), True, True, True, 1)
+            ]
+        )
+        preflight = ScriptedPreflight(
+            [reserve_exhausted_storage_with_device(), ready_storage_with_device()]
+        )
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=preflight,
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 2 * 1024**3),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 5_000_000_000),
+                ],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+
+        result = await runtime.check(config)
+        assert result.recoverable_reserve_exhaustion
+        await runtime.start(config)
+        await runtime.stop()
+
+        assert len(preflight.calls) == 2
+        assert finalizer.reclamation_calls[0] == (
+            "12345678-1234-5678-9234-567812345678",
+            True,
+        )
+        assert backend.started_with == [VideoProfile()]
+
+    run_async(scenario)
+
+
+def test_reserve_recovery_refuses_camera_when_bounded_delete_budget_cannot_reach_high() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(
+            reclamation_steps=[
+                ReclamationStep(UUID(int=1), UUID(int=2), False, True, True, 2),
+                ReclamationStep(UUID(int=3), UUID(int=4), False, True, True, 2),
+            ]
+        )
+        preflight = ScriptedPreflight(
+            [reserve_exhausted_storage_with_device(), ready_storage_with_device()]
+        )
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=preflight,
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            limits=RuntimeLimits(max_startup_reclamation_steps=1),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 2 * 1024**3),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 3_000_000_000),
+                ],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        with pytest.raises(StorageSafetyStop, match="high-water"):
+            await runtime.start(config)
+
+        assert len(finalizer.reclamation_calls) == 1
+        assert len(preflight.calls) == 1
+        assert backend.started_with == []
+
+    run_async(scenario)
+
+
+def test_startup_budget_refuses_normal_space_with_committed_delete_remaining() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(
+            reclamation_steps=[
+                ReclamationStep(
+                    UUID(int=1),
+                    UUID(int=2),
+                    True,
+                    True,
+                    True,
+                    2,
+                    pending_delete_remaining=True,
+                ),
+                ReclamationStep(UUID(int=3), UUID(int=4), True, True, True, 2),
+            ]
+        )
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            limits=RuntimeLimits(max_startup_reclamation_steps=1),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000),
+                ],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        with pytest.raises(StorageSafetyStop, match="convergence budget"):
+            await runtime.start(config)
+
+        assert len(finalizer.reclamation_calls) == 1
+        assert len(finalizer.reclamation_steps) == 1
+        assert backend.started_with == []
+
+    run_async(scenario)
+
+
+def test_startup_reconciliation_converges_in_bounded_multiple_passes() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(
+            reconciliation_reports=[
+                FinalizationRecoveryReport(64, 128, 64, True),
+                FinalizationRecoveryReport(1, 2, 1, False),
+            ]
+        )
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+        await runtime.stop()
+
+        assert finalizer.reconciled == 2
+        assert backend.started_with == [VideoProfile()]
+
+    run_async(scenario)
+
+
+def test_startup_reconciliation_refuses_backlog_beyond_total_pass_bound() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(
+            reconciliation_reports=[
+                FinalizationRecoveryReport(64, 128, 64, True),
+                FinalizationRecoveryReport(64, 128, 64, True),
+                FinalizationRecoveryReport(1, 2, 1, False),
+            ]
+        )
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            limits=RuntimeLimits(max_startup_reconciliation_passes=2),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        with pytest.raises(RecorderFinalizationFault, match="convergence passes"):
+            await runtime.start(config)
+
+        assert finalizer.reconciled == 2
+        assert len(finalizer.reconciliation_reports) == 1
+        assert backend.started_with == []
+
+    run_async(scenario)
+
+
+def test_emergency_without_eligible_managed_clip_stops_before_camera() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [FilesystemSpaceObservation("179:3", 24_000_000_000, 100_000_000)],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        with pytest.raises(StorageSafetyStop, match="no eligible"):
+            await runtime.start(config)
+
+        assert backend.started_with == []
+
+    run_async(scenario)
+
+
+def test_cancelled_startup_joins_active_delete_and_never_starts_a_second_mutation() -> None:
+    class BlockingFinalizer(FakeFinalizer):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def reclaim_storage_once(self, *, boot_id: str, allow_new: bool) -> ReclamationStep:
+            self.reclamation_calls.append((boot_id, allow_new))
+            self.entered.set()
+            assert self.release.wait(timeout=1)
+            return ReclamationStep(UUID(int=1), UUID(int=2), False, True, True, 2)
+
+    async def scenario() -> None:
+        BlockingFinalizer.entered.clear()
+        BlockingFinalizer.release.clear()
+        backend = FakeBackend()
+        finalizer = BlockingFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [FilesystemSpaceObservation("179:3", 24_000_000_000, 3_000_000_000)],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+        task = asyncio.create_task(runtime.start(config))
+        assert await asyncio.to_thread(BlockingFinalizer.entered.wait, 1)
+
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        assert len(finalizer.reclamation_calls) == 1
+        BlockingFinalizer.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(finalizer.reclamation_calls) == 1
+        assert backend.started_with == []
+
+    run_async(scenario)
+
+
+def test_periodic_low_water_reclaims_one_pair_then_continues_same_backend() -> None:
+    async def scenario() -> None:
+        idle = ReclamationStep(None, None, False, False, False, 0)
+        deleted = ReclamationStep(UUID(int=1), UUID(int=2), False, True, True, 2)
+        backend = FakeBackend()
+        finalizer = FakeFinalizer(reclamation_steps=[idle, idle, deleted])
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            limits=RuntimeLimits(storage_observation_interval_s=0.02),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 3_000_000_000),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 5_000_000_000),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 5_000_000_000),
+                ],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+        stop = asyncio.Event()
+        running = asyncio.create_task(runtime.run(stop))
+        for _ in range(100):
+            if len(finalizer.reclamation_calls) >= 3:
+                break
+            await asyncio.sleep(0.001)
+
+        assert len(finalizer.reclamation_calls) >= 3
+        assert finalizer.reclamation_calls[2][1] is True
+        assert not running.done()
+        assert runtime.runtime_snapshot()["pipeline_restart_count"] == 0
+        stop.set()
+        await running
+        await runtime.stop()
+        assert len(backend.started_with) == 1
+
+    run_async(scenario)
+
+
+def test_post_reclamation_ready_probe_must_retain_exact_bound_device_identity() -> None:
+    async def scenario() -> None:
+        initial = reserve_exhausted_storage_with_device()
+        refreshed = ready_storage_with_device()
+        assert refreshed.facts is not None
+        drifted = replace(
+            refreshed,
+            facts=replace(
+                refreshed.facts,
+                mount=replace(refreshed.facts.mount, device_id="179:4"),
+            ),
+        )
+        finalizer = FakeFinalizer(
+            reclamation_steps=[
+                ReclamationStep(UUID(int=1), UUID(int=2), False, True, True, 2)
+            ]
+        )
+        backend = FakeBackend()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=ScriptedPreflight([initial, drifted]),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 2 * 1024**3),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 5_000_000_000),
+                ],
+                reclaimer_available=True,
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        with pytest.raises(StorageSafetyStop, match="identity differs"):
+            await runtime.start(config)
+        assert backend.started_with == []
 
     run_async(scenario)

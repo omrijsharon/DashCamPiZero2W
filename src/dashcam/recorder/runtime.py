@@ -87,6 +87,8 @@ from dashcam.storage.naming import (
     provisional_clip_pair,
 )
 from dashcam.storage.preflight import PreflightResult, run_live_storage_preflight
+from dashcam.storage.reclaimer import ReclamationStep
+from dashcam.storage.retention import RetentionMode
 from dashcam.storage.space import (
     StorageSpaceMonitor,
     StorageSpaceSnapshot,
@@ -220,6 +222,8 @@ class RuntimeFinalizer(Protocol):
     def retention_threshold_latch(self) -> RetentionThresholdLatch | None: ...
 
     def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None: ...
+
+    def reclaim_storage_once(self, *, boot_id: str, allow_new: bool) -> ReclamationStep: ...
 
     def finalize(
         self,
@@ -366,6 +370,9 @@ class RuntimeLimits:
     metadata_reconciliation_interval_s: float = 1.0
     overlay_update_interval_s: float = 0.5
     storage_observation_interval_s: float = 1.0
+    max_reclamation_steps_per_pass: int = 8
+    max_startup_reclamation_steps: int = 64
+    max_startup_reconciliation_passes: int = 4
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -385,6 +392,24 @@ class RuntimeLimits:
                 or not 0 < value <= 120
             ):
                 raise ValueError(f"{name} must be greater than zero and at most 120")
+        if (
+            isinstance(self.max_reclamation_steps_per_pass, bool)
+            or not isinstance(self.max_reclamation_steps_per_pass, int)
+            or not 1 <= self.max_reclamation_steps_per_pass <= 64
+        ):
+            raise ValueError("max_reclamation_steps_per_pass must be between 1 and 64")
+        if (
+            isinstance(self.max_startup_reclamation_steps, bool)
+            or not isinstance(self.max_startup_reclamation_steps, int)
+            or not 1 <= self.max_startup_reclamation_steps <= 1_024
+        ):
+            raise ValueError("max_startup_reclamation_steps must be between 1 and 1024")
+        if (
+            isinstance(self.max_startup_reconciliation_passes, bool)
+            or not isinstance(self.max_startup_reconciliation_passes, int)
+            or not 1 <= self.max_startup_reconciliation_passes <= 64
+        ):
+            raise ValueError("max_startup_reconciliation_passes must be between 1 and 64")
 
 
 def _absolute_posix(path: Path, description: str) -> str:
@@ -1661,6 +1686,62 @@ class GStreamerRecorderRuntime:
             raise StorageSafetyStop(_storage_space_detail(status))
         self._reconciliation_allowed = True
 
+    async def _fresh_storage_observation(self) -> StorageSpaceSnapshot:
+        monitor = self._storage_space_monitor
+        if monitor is None:
+            raise RecorderStorageFault("storage threshold monitor is unavailable")
+        status = monitor.snapshot
+        for _ in range(monitor.maximum_observation_failures):
+            status = await asyncio.to_thread(monitor.observe)
+            if status.stop_required or not status.stale:
+                break
+        if status.stop_required or status.stale:
+            raise StorageSafetyStop(_storage_space_detail(status))
+        return status
+
+    async def _run_storage_reclamation(
+        self, *, maximum_steps: int
+    ) -> tuple[StorageSpaceSnapshot, int, bool]:
+        """Complete committed deletes and reclaim one pair per fresh observation."""
+
+        monitor = self._storage_space_monitor
+        finalizer = self._finalizer
+        boot_uuid = self._boot_uuid
+        if monitor is None or finalizer is None or boot_uuid is None:
+            raise RecorderStorageFault("storage reclaimer lacks its verified runtime binding")
+        status = monitor.snapshot
+        steps_used = 0
+        pending_delete_remaining = False
+        for _ in range(maximum_steps):
+            allow_new = status.directive is not None
+            try:
+                value = await self._durable_worker(
+                    finalizer.reclaim_storage_once,
+                    boot_id=str(boot_uuid),
+                    allow_new=allow_new,
+                    deadline_detail="storage reclamation exceeded its deadline",
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                raise StorageSafetyStop(
+                    "storage reclamation failed: " + _bounded_exception_detail(error)
+                ) from error
+            if not isinstance(value, ReclamationStep):
+                raise StorageSafetyStop("storage reclaimer returned an invalid result")
+            if not value.eligible_found:
+                if status.mode is RetentionMode.EMERGENCY:
+                    raise StorageSafetyStop(
+                        "emergency storage reclamation found no eligible managed clip"
+                    )
+                return status, steps_used, False
+            if not value.deleted:
+                raise StorageSafetyStop("storage reclaimer made no durable deletion progress")
+            steps_used += 1
+            pending_delete_remaining = value.pending_delete_remaining
+            status = await self._fresh_storage_observation()
+        return status, steps_used, pending_delete_remaining
+
     async def _storage_space_loop(self) -> None:
         monitor = self._storage_space_monitor
         if monitor is None:
@@ -1672,9 +1753,12 @@ class GStreamerRecorderRuntime:
                     timeout=self._limits.storage_observation_interval_s,
                 )
             except TimeoutError:
-                status = await asyncio.to_thread(monitor.observe)
+                status = await self._fresh_storage_observation()
                 if status.stop_required:
                     raise StorageSafetyStop(_storage_space_detail(status)) from None
+                await self._run_storage_reclamation(
+                    maximum_steps=self._limits.max_reclamation_steps_per_pass
+                )
 
     def _start_storage_space_monitor(self) -> None:
         if self._storage_space_monitor is None or self._storage_space_task is not None:
@@ -2306,36 +2390,110 @@ class GStreamerRecorderRuntime:
             raise PipelineContractError("recorder runtime instances are single-use")
         self._start_attempted = True
         profile = _video_profile(config.video)
+        checked_result = self._preflight_result
         if (
             self._checked_config != config
-            or self._preflight_result is None
-            or not self._preflight_result.ready
+            or checked_result is None
+            or not (
+                checked_result.ready
+                or checked_result.recoverable_reserve_exhaustion
+            )
         ):
             raise RecorderStorageFault("runtime lacks matching READY storage evidence")
+        reclaim_before_probe = checked_result.recoverable_reserve_exhaustion
         recording_root = Path(config.storage.recording_root)
         self._boot_short_id = await asyncio.to_thread(self._boot_id_reader)
         self._config = config
         audio_plan = await self._resolve_audio(config.audio)
         if self._finalizer_factory is not None:
             self._boot_uuid = await asyncio.to_thread(self._boot_uuid_reader)
-            facts = self._preflight_result.facts
+            facts = checked_result.facts
             device_id = None if facts is None else facts.mount.device_id
             if device_id is None:
                 raise RecorderStorageFault("READY storage evidence lacks a device identity")
             self._finalizer_device_id = device_id
             self._finalizer = self._finalizer_factory(recording_root, device_id)
             await self._initialize_storage_space_monitor(config, self._finalizer)
-            try:
-                await self._durable_worker(
-                    self._finalizer.reconcile_pending,
-                    deadline_detail="pending reconciliation exceeded its deadline",
+            status = None
+            startup_steps_remaining = self._limits.max_startup_reclamation_steps
+            if self._storage_space_monitor is not None:
+                status, used, pending_delete_remaining = await self._run_storage_reclamation(
+                    maximum_steps=startup_steps_remaining
                 )
-            except asyncio.CancelledError:
-                raise
-            except BaseException as error:
+                startup_steps_remaining -= used
+            else:
+                pending_delete_remaining = False
+            if pending_delete_remaining:
+                raise StorageSafetyStop(
+                    "startup deletion recovery exceeded its bounded convergence budget"
+                )
+            for _ in range(self._limits.max_startup_reconciliation_passes):
+                try:
+                    recovery_value = await self._durable_worker(
+                        self._finalizer.reconcile_pending,
+                        deadline_detail="pending reconciliation exceeded its deadline",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    raise RecorderFinalizationFault(
+                        f"pending reconciliation failed: {_bounded_exception_detail(error)}"
+                    ) from error
+                if not isinstance(recovery_value, FinalizationRecoveryReport):
+                    raise RecorderFinalizationFault(
+                        "pending reconciliation returned an invalid report"
+                    )
+                if not recovery_value.more_work:
+                    break
+            else:
                 raise RecorderFinalizationFault(
-                    f"pending reconciliation failed: {_bounded_exception_detail(error)}"
-                ) from error
+                    "pending reconciliation exceeded its bounded convergence passes"
+                )
+            if self._storage_space_monitor is not None and startup_steps_remaining:
+                status, _, pending_delete_remaining = await self._run_storage_reclamation(
+                    maximum_steps=startup_steps_remaining
+                )
+            if pending_delete_remaining:
+                raise StorageSafetyStop(
+                    "startup deletion recovery exceeded its bounded convergence budget"
+                )
+            if reclaim_before_probe:
+                if status is None or status.mode is not RetentionMode.NORMAL:
+                    raise StorageSafetyStop(
+                        "startup reserve recovery did not restore the high-water threshold"
+                    )
+                try:
+                    refreshed = await asyncio.to_thread(
+                        self._preflight,
+                        config,
+                        identity_path=self._identity_path,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    raise RecorderStorageFault(
+                        "post-reclamation storage preflight failed"
+                    ) from error
+                if not isinstance(refreshed, PreflightResult) or not refreshed.ready:
+                    raise StorageSafetyStop(
+                        "post-reclamation full storage preflight did not reach READY"
+                    )
+                refreshed_facts = refreshed.facts
+                monitor = self._storage_space_monitor
+                if (
+                    refreshed_facts is None
+                    or monitor is None
+                    or refreshed_facts.mount.device_id != self._finalizer_device_id
+                    or refreshed_facts.mount.uuid != monitor.snapshot.volume_uuid
+                    or refreshed_facts.space.capacity_bytes
+                    != monitor.snapshot.capacity_bytes
+                ):
+                    raise StorageSafetyStop(
+                        "post-reclamation storage identity differs from the bound volume"
+                    )
+                self._preflight_result = refreshed
+        elif reclaim_before_probe:
+            raise RecorderStorageFault("startup reserve recovery requires the durable reclaimer")
         try:
             await self._start_attempt(profile, audio_plan)
         except AudioStartupError as error:

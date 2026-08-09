@@ -122,6 +122,7 @@ def test_canonical_json_is_deterministic_and_has_explicit_identity() -> None:
     document = json.loads(first)
 
     assert first == second
+    assert first is second
     assert first.startswith(b'{"audio":')
     assert document["clip_id"] == "12345678-1234-5678-9234-567812345678"
     assert document["metadata_file"].endswith(".json")
@@ -129,6 +130,18 @@ def test_canonical_json_is_deterministic_and_has_explicit_identity() -> None:
     assert document["start_local"] == "2026-07-23T21:27:00.000+03:00"
     assert document["time_anchor"]["source"] == "GPS"
     assert document["gps"]["samples"][0]["timestamp_quality"] == "GPS_ANCHORED"
+
+
+def test_replaced_sidecar_does_not_reuse_stale_canonical_bytes() -> None:
+    sidecar = anchored_sidecar()
+    original = sidecar.to_canonical_json()
+
+    updated = replace(sidecar, software_version="v0.1.1-test")
+    updated_bytes = updated.to_canonical_json()
+
+    assert updated_bytes is updated.to_canonical_json()
+    assert updated_bytes != original
+    assert json.loads(updated_bytes)["software_version"] == "v0.1.1-test"
 
 
 def test_canonical_document_validates_against_the_public_json_schema() -> None:

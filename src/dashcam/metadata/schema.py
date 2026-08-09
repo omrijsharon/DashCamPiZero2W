@@ -7,7 +7,7 @@ import math
 import os
 import tempfile
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -330,6 +330,13 @@ class ClipSidecar:
     protection_reason: str | None
     software_version: str
     warnings: tuple[str, ...] = ()
+    _canonical_json: bytes | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -506,13 +513,22 @@ class ClipSidecar:
     def to_canonical_json(self) -> bytes:
         """Return deterministic UTF-8 JSON with no insignificant whitespace."""
 
-        return json.dumps(
+        cached = self._canonical_json
+        if cached is not None:
+            return cached
+        encoded = json.dumps(
             self.to_mapping(),
             ensure_ascii=True,
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        # ClipSidecar and every value reachable from it are frozen value
+        # objects. Memoizing their deterministic bytes removes repeated large
+        # GPS-history serialization inside durable checks without changing
+        # logical state or any persisted representation.
+        object.__setattr__(self, "_canonical_json", encoded)
+        return encoded
 
 
 def write_sidecar_atomic(

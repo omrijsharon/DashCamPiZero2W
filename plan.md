@@ -222,7 +222,7 @@ This is the execution checklist for `Pizero_dashcam_PROJECT.md`. The product spe
   - [ ] **LOCAL/PI:** Implement event protection for previous 2, current, and next 1 clips with catalog/retention coordination.
   - [ ] **LOCAL/PI:** Implement protect/unprotect moves as recoverable two-file operations.
   - [x] **PI:** Verify unknown/Windows-created files are ignored and preserved. Evidence: `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
-  - [ ] **PI:** Inject interruption after every finalize/protect/unprotect/delete step and verify deterministic reconciliation.
+  - [x] **PI:** Inject interruption after every finalize/protect/unprotect/delete step and verify deterministic reconciliation. Sixteen fresh-subprocess `SIGKILL` cells covered all four operation/cutpoint combinations and converged after reopen plus idempotent replay; this is not physical-power-loss evidence. Evidence: `docs/test-reports/2026-08-10-milestone10-sigkill-live.md`.
   - [ ] **PI:** Fill a small test filesystem, cycle retention repeatedly, and prove active/finalizing/protected/leased clips are never selected. The disposable-loop run proved finalizing/protected/leased catalog exclusions, but did not exercise an active production recording clip.
   - [ ] **PI:** Fill the volume with protected clips and verify explicit critical behavior before evidence destruction. The disposable-loop run proved no eligible selection and unchanged protected pairs, but did not exercise the production runtime safety-stop path.
   - [ ] **PI:** Prove retention/reconciliation do not create recording gaps or unbounded startup delay.

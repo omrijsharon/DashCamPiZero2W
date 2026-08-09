@@ -387,16 +387,24 @@ interfaces:
   successfully so `Restart=on-failure` cannot create a camera loop. Runtime
   snapshot schema 3 carries bounded monitor and reclamation status.
 
-  A hash-closed exact-Pi component harness passed exact thresholds, three
+  The first hash-closed exact-Pi component harness passed exact thresholds, three
   repeated low/high cycles, oldest-first pair deletion, exclusion rules,
   unknown-file preservation, persisted-latch restart, preseeded one-member
   `DELETE` replay, exFAT fsck/remount, and directory-fsync checks on private
-  disposable loop filesystems. This is not installed-release, production
-  daemon/camera, active-clip, runtime safety-stop, SIGKILL, physical power-loss,
-  or active `/srv/dashcam` evidence. The accepted installed release remains
-  `5f95`; this newer source is not deployable while the Milestone 9 resource
-  gate and the remaining event/web integration gates are open. Evidence:
-  `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
+  disposable loop filesystems. A hash-closed follow-up from source
+  `ec226bf2fc0a01159f4e729ee2cc375e442693fb` then passed sixteen actual
+  process-`SIGKILL` cells: each `FINALIZE`, `PROTECT`, `UNPROTECT`, and `DELETE`
+  operation was killed at four durable boundaries, reopened through a fresh
+  catalog, reconciled, and replayed idempotently. The follow-up retained clean
+  filesystem checks, remount identity, full backing allocation, and exact
+  cleanup. This is process-loss evidence, not physical power interruption,
+  installed-release, production daemon/camera, active-clip, runtime
+  safety-stop, or active `/srv/dashcam` evidence. The accepted installed
+  release remains `5f95`; this newer source is not deployable while the
+  Milestone 9 resource gate and the remaining event/web integration gates are
+  open. Evidence:
+  `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md` and
+  `docs/test-reports/2026-08-10-milestone10-sigkill-live.md`.
 - Overlay formatting consumes one coherent telemetry snapshot and emits bounded
   text/layout data. The first pre-encoder `textoverlay` source slice bound
   initial state before PLAYING and used a queue-free optional worker, but its
@@ -415,7 +423,7 @@ bounded three-slot recycling is selected. Microphone-absent startup has passed;
 physical hot-unplug/replug is outside current acceptance. Remaining work
 includes exact-Pi overlay qualification, production event-window and download
 lease integration, active-recording and safety-stop retention qualification,
-the full crash/power matrix, actual socket ownership, HTTP serving, preview,
+the physical power-loss matrix, actual socket ownership, HTTP serving, preview,
 and the privileged removal helper.
 
 ## Structured logging convention

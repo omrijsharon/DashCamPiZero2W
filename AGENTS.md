@@ -169,9 +169,25 @@
   Do not cite this as installed-release,
   production callback/runtime safety-stop, active-clip, SIGKILL, physical
   power-loss, or production-volume evidence. The accepted installed release
-  remains `5f95`, and Milestones 9 and 10 remain open for the resource,
-  event/web, active-runtime, interruption, and exit gates. Evidence:
+  remains `5f95`; that first result did not close the resource, event/web,
+  active-runtime, interruption, or exit gates. Evidence:
   `docs/test-reports/2026-08-10-milestone10-retention-loop-live.md`.
+- Follow-up source commit `ec226bf2fc0a01159f4e729ee2cc375e442693fb`
+  extended the same private-loop harness with sixteen actual process-`SIGKILL`
+  cells: `FINALIZE`, `PROTECT`, `UNPROTECT`, and `DELETE` were each interrupted
+  after durable intent, after member one, after member two but before catalog
+  completion, and immediately after committed completion. Every fresh
+  subprocess/catalog reopened, reconciled, and converged idempotently with
+  recovery actions `[2,1,0,0]` for each operation. Hash-closed exact-Pi
+  matrices A--H passed; bundle-manifest SHA-256 is
+  `fda594df0af51984ba2560c2970393812b1170436ecbcebdcf9cc2a176cd4229`
+  and the privacy-safe result SHA-256 is
+  `313b5c6c1059657ec1e96cedef1cf5652df9013570e41f50eb505d1ce74827cc`.
+  This is process-loss plus clean filesystem/remount evidence, not physical
+  power-loss, installed-release, production daemon/camera, or Milestone 10
+  exit-gate evidence. Earlier diagnostic harness refusals produced no accepted
+  result and cleaned their disposable resources. Evidence:
+  `docs/test-reports/2026-08-10-milestone10-sigkill-live.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

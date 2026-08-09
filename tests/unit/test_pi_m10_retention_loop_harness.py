@@ -5,10 +5,11 @@ import importlib.util
 import json
 import os
 import stat
+import sys
 import zipfile
 from pathlib import Path
 from types import ModuleType
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -21,6 +22,7 @@ def _load(name: str, path: Path) -> ModuleType:
     assert specification is not None
     assert specification.loader is not None
     module = importlib.util.module_from_spec(specification)
+    sys.modules[name] = module
     specification.loader.exec_module(module)
     return module
 
@@ -334,6 +336,86 @@ def test_result_output_is_constrained_to_direct_bounded_var_tmp_name() -> None:
             harness._validate_output_path(refused)
 
 
+def _root_observation(free_bytes: int) -> Any:
+    return harness.RootBackingObservation(
+        device_id="179:2",
+        source="/dev/mmcblk0p2",
+        target="/",
+        filesystem="ext4",
+        capacity_bytes=6 * 1024**3,
+        free_bytes=free_bytes,
+    )
+
+
+def test_root_backing_preflight_budget_accepts_equality_and_refuses_one_byte_below() -> None:
+    required = harness.required_root_free_bytes()
+    harness.validate_root_backing_preflight(_root_observation(required))
+    with pytest.raises(harness.HarnessError, match="2 GiB reserve"):
+        harness.validate_root_backing_preflight(_root_observation(required - 1))
+    assert required == 2624 * 1024**2
+
+
+def test_root_backing_budget_checks_identity_overflow_and_remaining_allocation() -> None:
+    required = harness.required_root_free_bytes()
+    wrong_source = harness.RootBackingObservation(
+        device_id="179:2",
+        source="/dev/loop7",
+        target="/",
+        filesystem="ext4",
+        capacity_bytes=6 * 1024**3,
+        free_bytes=required,
+    )
+    with pytest.raises(harness.HarnessError, match="identity"):
+        harness.validate_root_backing_preflight(wrong_source)
+    wrong_capacity = harness.RootBackingObservation(
+        device_id="179:2",
+        source="/dev/mmcblk0p2",
+        target="/",
+        filesystem="ext4",
+        capacity_bytes=8 * 1024**3,
+        free_bytes=required,
+    )
+    with pytest.raises(harness.HarnessError, match="capacity"):
+        harness.validate_root_backing_preflight(wrong_capacity)
+    with pytest.raises(harness.HarnessError, match="overflows"):
+        harness.required_root_free_bytes(
+            exfat_image_bytes=harness.MAX_SIGNED_BYTES,
+            preserved_free_bytes=1,
+        )
+
+    remaining_required = harness.required_root_free_bytes(
+        exfat_image_bytes=harness.EXT4_IMAGE_BYTES,
+        ext4_image_bytes=0,
+    )
+    harness.validate_root_remaining_budget(
+        _root_observation(remaining_required),
+        remaining_allocation_bytes=harness.EXT4_IMAGE_BYTES,
+    )
+    with pytest.raises(harness.HarnessError, match="remaining"):
+        harness.validate_root_remaining_budget(
+            _root_observation(remaining_required - 1),
+            remaining_allocation_bytes=harness.EXT4_IMAGE_BYTES,
+        )
+
+
+def test_root_postcleanup_requires_same_identity_and_two_gibibyte_reserve() -> None:
+    before = _root_observation(harness.required_root_free_bytes())
+    at_reserve = _root_observation(2 * 1024**3)
+    harness.validate_root_backing_poststate(before, at_reserve)
+    with pytest.raises(harness.HarnessError, match="2 GiB"):
+        harness.validate_root_backing_poststate(before, _root_observation(2 * 1024**3 - 1))
+    drifted = harness.RootBackingObservation(
+        device_id="179:3",
+        source="/dev/mmcblk0p2",
+        target="/",
+        filesystem="ext4",
+        capacity_bytes=6 * 1024**3,
+        free_bytes=2 * 1024**3,
+    )
+    with pytest.raises(harness.HarnessError, match="drifted"):
+        harness.validate_root_backing_poststate(before, drifted)
+
+
 def test_freeze_bundle_removes_exact_partial_directory_on_verify_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -405,6 +487,18 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert '"--mount",\n            "--fork",\n            "--kill-child"' in source
     assert "MAX_FILLER_BYTES" in source
     assert "MAX_RECLAIM_STEPS" in source
+    assert "os.posix_fallocate" in source
+    assert "allocated.st_blocks * 512 < size" in source
+    parent_source = source[source.index("def _parent(") :]
+    assert parent_source.index(
+        "root_backing_before = _observe_root_backing()"
+    ) < parent_source.index("lock_path =")
+    assert parent_source.index('cleanup_errors.append(f"root-reserve:') < parent_source.index(
+        "_publish_result(output, completed_result)"
+    )
+    assert "480 MiB loop-backed exFAT" in readme
+    assert "64 MiB loop-backed ext4" in readme
+    assert "at least 2 GiB" in readme
     assert "production_release_tested=false" in readme
     assert "physical_power_loss_tested=false" in readme
     assert "m10_exit_gate_closed=false" in readme

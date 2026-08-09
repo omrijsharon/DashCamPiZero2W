@@ -5,8 +5,8 @@ does **not** install the current checkout, start `dashcamd`, record camera data,
 or mutate the active `/srv/dashcam` filesystem or production catalog. It runs
 commit-source catalog, threshold, and reclaimer modules from a verified ZIP in
 a private mount namespace. Within that namespace only, the cloned production
-mount is removed and replaced by a new 768 MiB loop-backed exFAT fixture. A
-separate 128 MiB loop-backed ext4 fixture holds all test catalogs.
+mount is removed and replaced by a new 480 MiB loop-backed exFAT fixture. A
+separate 64 MiB loop-backed ext4 fixture holds all test catalogs.
 
 The checked-in directory deliberately contains no generated archive or
 manifest. `prepare-bundle.py` builds these outside the repository from one
@@ -49,6 +49,16 @@ lock is held. It snapshots the real mount, sentinel, production catalog/WAL/SHM,
 services, network, throttle, namespaces, and loop inventory before work and
 requires byte-identical structured poststate. It never runs a mutating
 `systemctl` or `nmcli` command.
+
+Before creating the lock, frozen bundle, work directory, or either backing
+image, the parent binds `/var/tmp` to the expected ext4 root device and observes
+space with `f_bavail * f_frsize`. Checked arithmetic requires room for full
+allocation of both images, 32 MiB bounded overhead, and at least 2 GiB of
+preserved root free space. The same device/capacity identity and 2 GiB reserve
+are required again after every cleanup path and before result publication.
+Each image is fully allocated and fsynced before loop attachment, with exact
+size and allocated-block coverage verified and the remaining budget rechecked
+immediately before and after each allocation.
 
 The worker makes `/` recursively private before unmounting the cloned
 production mount. Every destructive filesystem command accepts only a numbered

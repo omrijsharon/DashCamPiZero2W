@@ -16,6 +16,7 @@ import sys
 import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
 
@@ -52,9 +53,15 @@ MAX_SOURCE_MEMBERS: Final = 512
 MAX_OUTPUT_BYTES: Final = 64 * 1024
 COMMAND_TIMEOUT_S: Final = 120
 WORKER_TIMEOUT_S: Final = 900
-EXFAT_IMAGE_BYTES: Final = 768 * 1024**2
-EXT4_IMAGE_BYTES: Final = 128 * 1024**2
-MAX_FILLER_BYTES: Final = 640 * 1024**2
+EXFAT_IMAGE_BYTES: Final = 480 * 1024**2
+EXT4_IMAGE_BYTES: Final = 64 * 1024**2
+MAX_FILLER_BYTES: Final = 256 * 1024**2
+ROOT_PRESERVED_FREE_BYTES: Final = 2 * 1024**3
+ROOT_BOUNDED_OVERHEAD_BYTES: Final = 32 * 1024**2
+EXPECTED_ROOT_SOURCE: Final = "/dev/mmcblk0p2"
+MIN_ROOT_CAPACITY_BYTES: Final = 5 * 1024**3
+MAX_ROOT_CAPACITY_BYTES: Final = 7 * 1024**3
+MAX_SIGNED_BYTES: Final = 2**63 - 1
 MAX_RECLAIM_STEPS: Final = 64
 MAX_FIXTURE_FILES: Final = 256
 
@@ -90,6 +97,16 @@ REQUIRED_EXECUTABLES: Final = (
 
 class HarnessError(RuntimeError):
     """A safety, identity, evidence, or bound check refused the run."""
+
+
+@dataclass(frozen=True, slots=True)
+class RootBackingObservation:
+    device_id: str
+    source: str
+    target: str
+    filesystem: str
+    capacity_bytes: int
+    free_bytes: int
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -501,6 +518,139 @@ def _findmnt(target: Path) -> dict[str, str] | None:
     if any(not isinstance(item, str) or len(item) > 4096 for item in translated.values()):
         raise HarnessError("findmnt returned unsafe values")
     return cast(dict[str, str], translated)
+
+
+def _findmnt_backing(target: Path) -> dict[str, str]:
+    result = _run(
+        (
+            FINDMNT,
+            "--json",
+            "--target",
+            str(target),
+            "--output",
+            "SOURCE,TARGET,FSTYPE",
+        )
+    )
+    try:
+        rows = json.loads(result.stdout.decode("utf-8"))["filesystems"]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise HarnessError("findmnt backing-filesystem output is malformed") from error
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise HarnessError("findmnt backing-filesystem identity is ambiguous")
+    row = cast(dict[str, object], rows[0])
+    values = {
+        "source": row.get("source"),
+        "target": row.get("target"),
+        "fstype": row.get("fstype"),
+    }
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise HarnessError("findmnt backing-filesystem values are unsafe")
+    return cast(dict[str, str], values)
+
+
+def required_root_free_bytes(
+    *,
+    exfat_image_bytes: int = EXFAT_IMAGE_BYTES,
+    ext4_image_bytes: int = EXT4_IMAGE_BYTES,
+    overhead_bytes: int = ROOT_BOUNDED_OVERHEAD_BYTES,
+    preserved_free_bytes: int = ROOT_PRESERVED_FREE_BYTES,
+) -> int:
+    values = (
+        exfat_image_bytes,
+        ext4_image_bytes,
+        overhead_bytes,
+        preserved_free_bytes,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        raise HarnessError("root-space budget contains an invalid byte count")
+    total = 0
+    for value in values:
+        if value > MAX_SIGNED_BYTES - total:
+            raise HarnessError("root-space budget overflows its checked integer range")
+        total += value
+    return total
+
+
+def _validate_root_backing_identity(observation: RootBackingObservation) -> None:
+    if (
+        not isinstance(observation, RootBackingObservation)
+        or DEVICE_RE.fullmatch(observation.device_id) is None
+        or observation.source != EXPECTED_ROOT_SOURCE
+        or observation.target != "/"
+        or observation.filesystem != "ext4"
+        or not MIN_ROOT_CAPACITY_BYTES <= observation.capacity_bytes <= MAX_ROOT_CAPACITY_BYTES
+        or not 0 <= observation.free_bytes <= observation.capacity_bytes
+    ):
+        raise HarnessError("/var/tmp backing-filesystem identity or capacity differs")
+
+
+def validate_root_backing_preflight(observation: RootBackingObservation) -> None:
+    _validate_root_backing_identity(observation)
+    if observation.free_bytes < required_root_free_bytes():
+        raise HarnessError("/var/tmp lacks the bounded fixture budget plus 2 GiB reserve")
+
+
+def validate_root_backing_poststate(
+    before: RootBackingObservation, after: RootBackingObservation
+) -> None:
+    _validate_root_backing_identity(after)
+    if (
+        after.device_id != before.device_id
+        or after.source != before.source
+        or after.target != before.target
+        or after.filesystem != before.filesystem
+        or after.capacity_bytes != before.capacity_bytes
+    ):
+        raise HarnessError("/var/tmp backing-filesystem identity drifted")
+    if after.free_bytes < ROOT_PRESERVED_FREE_BYTES:
+        raise HarnessError("root free space did not restore the preserved 2 GiB reserve")
+
+
+def validate_root_remaining_budget(
+    observation: RootBackingObservation, *, remaining_allocation_bytes: int
+) -> None:
+    _validate_root_backing_identity(observation)
+    required = required_root_free_bytes(
+        exfat_image_bytes=remaining_allocation_bytes,
+        ext4_image_bytes=0,
+    )
+    if observation.free_bytes < required:
+        raise HarnessError("root reserve fell below the remaining allocation budget")
+
+
+def _observe_root_backing(*, require_fixture_budget: bool = True) -> RootBackingObservation:
+    temporary = Path("/var/tmp")
+    root = Path("/")
+    temporary_metadata = temporary.stat()
+    root_metadata = root.stat()
+    if temporary_metadata.st_dev != root_metadata.st_dev:
+        raise HarnessError("/var/tmp is not on the expected root backing device")
+    row = _findmnt_backing(temporary)
+    values = os.statvfs(temporary)  # type: ignore[attr-defined]
+    if (
+        values.f_blocks <= 0
+        or values.f_frsize <= 0
+        or values.f_bavail < 0
+        or values.f_bavail > values.f_blocks
+    ):
+        raise HarnessError("/var/tmp returned invalid statvfs values")
+    capacity = values.f_blocks * values.f_frsize
+    free = values.f_bavail * values.f_frsize
+    if capacity > MAX_SIGNED_BYTES or free > MAX_SIGNED_BYTES:
+        raise HarnessError("/var/tmp space observation exceeds its integer bound")
+    observation = RootBackingObservation(
+        device_id=f"{os.major(temporary_metadata.st_dev)}:{os.minor(temporary_metadata.st_dev)}",  # type: ignore[attr-defined]
+        source=row["source"],
+        target=row["target"],
+        filesystem=row["fstype"],
+        capacity_bytes=capacity,
+        free_bytes=free,
+    )
+    if require_fixture_budget:
+        validate_root_backing_preflight(observation)
+    else:
+        _validate_root_backing_identity(observation)
+    return observation
 
 
 def _file_fact(path: Path) -> dict[str, object]:
@@ -1368,13 +1518,35 @@ def _worker(arguments: argparse.Namespace) -> int:
     ext4_image = work / "catalog.ext4.img"
     catalog_mount = work / "catalog"
     catalog_mount.mkdir(mode=0o700)
-    for image, size in ((exfat_image, EXFAT_IMAGE_BYTES), (ext4_image, EXT4_IMAGE_BYTES)):
+    image_contracts = (
+        (exfat_image, EXFAT_IMAGE_BYTES),
+        (ext4_image, EXT4_IMAGE_BYTES),
+    )
+    remaining_allocation = sum(size for _image, size in image_contracts)
+    for image, size in image_contracts:
+        validate_root_remaining_budget(
+            _observe_root_backing(require_fixture_budget=False),
+            remaining_allocation_bytes=remaining_allocation,
+        )
         descriptor = os.open(image, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.ftruncate(descriptor, size)
+            os.posix_fallocate(descriptor, 0, size)  # type: ignore[attr-defined]
             os.fsync(descriptor)
+            allocated = os.fstat(descriptor)
+            if (
+                allocated.st_size != size
+                or allocated.st_nlink != 1
+                or allocated.st_blocks * 512 < size  # type: ignore[attr-defined]
+            ):
+                raise HarnessError("loop backing image is not fully allocated")
         finally:
             os.close(descriptor)
+        remaining_allocation -= size
+        validate_root_remaining_budget(
+            _observe_root_backing(require_fixture_budget=False),
+            remaining_allocation_bytes=remaining_allocation,
+        )
     baseline = _loop_snapshot()
     exfat_loop: Path | None = None
     ext4_loop: Path | None = None
@@ -1652,6 +1824,7 @@ def _parent(arguments: argparse.Namespace) -> int:
     for executable in REQUIRED_EXECUTABLES:
         if not Path(executable).is_file() or not os.access(executable, os.X_OK):
             raise HarnessError(f"required executable is unavailable: {executable}")
+    root_backing_before = _observe_root_backing()
     lock_path = Path("/run/dashcam-m10-retention-loop.lock")
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
     frozen: Path | None = None
@@ -1666,6 +1839,9 @@ def _parent(arguments: argparse.Namespace) -> int:
             )
         except BlockingIOError as error:
             raise HarnessError("another M10 retention harness holds the global lock") from error
+        locked_root_backing = _observe_root_backing()
+        validate_root_backing_poststate(root_backing_before, locked_root_backing)
+        root_backing_before = locked_root_backing
         before = _host_snapshot(arguments.expected_board_serial)
         before_digest = _sha256(canonical_json(before))
         frozen = _freeze_bundle(
@@ -1745,6 +1921,19 @@ def _parent(arguments: argparse.Namespace) -> int:
                     cleanup_errors.append("production-poststate-differs")
             except Exception as error:
                 cleanup_errors.append(f"poststate:{type(error).__name__}")
+        try:
+            root_backing_after = _observe_root_backing(require_fixture_budget=False)
+            validate_root_backing_poststate(root_backing_before, root_backing_after)
+            if completed_result is not None:
+                completed_result["root_space"] = {
+                    "capacity_bytes": root_backing_after.capacity_bytes,
+                    "preflight_free_bytes": root_backing_before.free_bytes,
+                    "postcleanup_free_bytes": root_backing_after.free_bytes,
+                    "required_preflight_bytes": required_root_free_bytes(),
+                    "preserved_free_bytes": ROOT_PRESERVED_FREE_BYTES,
+                }
+        except Exception as error:
+            cleanup_errors.append(f"root-reserve:{type(error).__name__}")
         os.close(descriptor)
         if cleanup_errors:
             raise HarnessError("parent final cleanup failed: " + ",".join(cleanup_errors))

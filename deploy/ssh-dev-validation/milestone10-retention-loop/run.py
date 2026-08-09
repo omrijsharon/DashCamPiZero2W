@@ -1854,6 +1854,7 @@ def _parent(arguments: argparse.Namespace) -> int:
             "--mount",
             "--fork",
             "--kill-child",
+            "--",
             sys.executable,
             "-I",
             str(frozen / "run.py"),

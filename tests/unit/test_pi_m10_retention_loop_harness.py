@@ -484,7 +484,10 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     source = (HARNESS_ROOT / "run.py").read_text(encoding="utf-8")
     readme = (HARNESS_ROOT / "README.md").read_text(encoding="utf-8")
     assert '"--make-rprivate", "/"' in source
-    assert '"--mount",\n            "--fork",\n            "--kill-child"' in source
+    assert (
+        '"--mount",\n            "--fork",\n            "--kill-child",\n            "--",'
+        "\n            sys.executable"
+    ) in source
     assert "MAX_FILLER_BYTES" in source
     assert "MAX_RECLAIM_STEPS" in source
     assert "os.posix_fallocate" in source

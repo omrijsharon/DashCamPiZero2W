@@ -218,6 +218,44 @@ def test_delete_refuses_unprotected_row_whose_pair_is_in_protected_directory(
             )
 
 
+def test_kind_filtered_pending_query_is_stable_and_cannot_be_masked_by_delete(
+    tmp_path: Path,
+) -> None:
+    with ClipCatalog(tmp_path / "catalog.sqlite3") as catalog:
+        catalog.register_clip(_clip(1), catalog_now_ns=1)
+        catalog.register_clip(_clip(2), catalog_now_ns=2)
+        catalog.register_clip(
+            _clip(3, protected=True, directory="protected"),
+            catalog_now_ns=3,
+        )
+        catalog.prepare_delete(UUID(int=1), monotonic_now_ns=10, boot_id="boot-a")
+        protect_id = catalog.prepare_protect(
+            UUID(int=2),
+            reason="event",
+            monotonic_now_ns=11,
+        )
+        unprotect_id = catalog.prepare_unprotect(UUID(int=3), monotonic_now_ns=12)
+        assert protect_id is not None and unprotect_id is not None
+
+        filtered = catalog.list_pending_intents_by_kind(
+            kinds=(IntentKind.PROTECT, IntentKind.UNPROTECT),
+            limit=2,
+        )
+
+        assert tuple(intent.intent_id for intent in filtered) == (
+            protect_id,
+            unprotect_id,
+        )
+        assert all(intent.kind is not IntentKind.DELETE for intent in filtered)
+        with pytest.raises(ValueError, match="unique IntentKind"):
+            catalog.list_pending_intents_by_kind(kinds=(), limit=1)
+        with pytest.raises(ValueError, match="unique IntentKind"):
+            catalog.list_pending_intents_by_kind(
+                kinds=(IntentKind.PROTECT, IntentKind.PROTECT),
+                limit=1,
+            )
+
+
 def test_migrations_are_explicit_versioned_and_reopen_cleanly(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
 

@@ -1125,6 +1125,36 @@ class ClipCatalog:
             ).fetchall()
         return tuple(_intent_from_row(row) for row in rows)
 
+    def list_pending_intents_by_kind(
+        self,
+        *,
+        kinds: tuple[IntentKind, ...],
+        limit: int,
+    ) -> tuple[OperationIntent, ...]:
+        """Return a bounded stable view containing only the requested kinds."""
+
+        _row_limit(limit, "limit")
+        if (
+            not isinstance(kinds, tuple)
+            or not kinds
+            or len(kinds) > len(IntentKind)
+            or any(not isinstance(kind, IntentKind) for kind in kinds)
+            or len(set(kinds)) != len(kinds)
+        ):
+            raise ValueError("kinds must be a non-empty unique IntentKind tuple")
+        placeholders = ",".join("?" for _ in kinds)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM operation_intents
+                WHERE status = 'PENDING' AND kind IN ({placeholders})
+                ORDER BY created_monotonic_ns, intent_id
+                LIMIT ?
+                """,
+                (*tuple(kind.value for kind in kinds), limit),
+            ).fetchall()
+        return tuple(_intent_from_row(row) for row in rows)
+
     def reconcile_intent(
         self,
         intent_id: UUID,

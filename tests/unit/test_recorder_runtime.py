@@ -442,6 +442,22 @@ class FakeFinalizer:
 
 
 @dataclass
+class BlockingCompensationFinalizer(FakeFinalizer):
+    compensation_entered: threading.Event = field(default_factory=threading.Event)
+    release_compensation: threading.Event = field(default_factory=threading.Event)
+
+    def reconcile_pending(self) -> FinalizationRecoveryReport:
+        self.reconciled += 1
+        if self.reconciled == 1:
+            # Models UNPROTECT completion atomically enqueuing a compensating PROTECT.
+            return FinalizationRecoveryReport(1, 2, 1, True)
+        self.compensation_entered.set()
+        if not self.release_compensation.wait(timeout=5):
+            raise TimeoutError("test did not release compensating PROTECT recovery")
+        return FinalizationRecoveryReport(1, 2, 1, False)
+
+
+@dataclass
 class SpaceMonitorFactory:
     observations: list[object]
     calls: int = 0
@@ -3238,6 +3254,39 @@ def test_startup_reconciliation_converges_in_bounded_multiple_passes() -> None:
 
         assert finalizer.reconciled == 2
         assert backend.started_with == [VideoProfile()]
+
+    run_async(scenario)
+
+
+def test_startup_does_not_open_camera_until_compensating_protect_completes() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = BlockingCompensationFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        start_task = asyncio.create_task(runtime.start(config))
+        entered = await asyncio.to_thread(finalizer.compensation_entered.wait, 2)
+        assert entered
+        assert not start_task.done()
+        assert backend.started_with == []
+
+        finalizer.release_compensation.set()
+        await start_task
+        assert finalizer.reconciled == 2
+        assert backend.started_with == [VideoProfile()]
+        await runtime.stop()
 
     run_async(scenario)
 

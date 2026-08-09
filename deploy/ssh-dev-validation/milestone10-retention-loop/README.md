@@ -79,8 +79,13 @@ The matrices cover:
   exclusions plus survival of unknown/Windows-style files;
 - **D:** durable previous-two/current/next-one event selection and protected
   pair-intent convergence;
-- **E:** catalog-reopen replay from a deliberately pre-seeded one-member
-  DELETE interruption (not a SIGKILL or physical-power test);
+- **E:** sixteen actual process-`SIGKILL` cells: FINALIZE, PROTECT, UNPROTECT,
+  and DELETE are each killed after durable intent creation/before member one,
+  after member one's real parent-directory fsync, after member two's real fsync
+  but before catalog completion, and after committed completion. Every cell
+  uses a fresh subprocess and ext4 catalog, then reopens, reconciles, repeats
+  reconciliation idempotently, and verifies the exact exFAT pair/catalog end
+  state. This is process-loss evidence, not physical-power-loss evidence;
 - **F:** actual directory-fsync paths, unmount, read-only `fsck.exfat` and
   `e2fsck`, remount, and stable disposable identity;
 - **G:** protected-full/no-eligible behavior with the reclaimer enabled and no
@@ -88,10 +93,13 @@ The matrices cover:
 - **H:** source import provenance, namespace/identity/privacy bounds, exact
   cleanup, and production pre/post equality.
 
-The result always states `production_release_tested=false`,
+Result schema 2 makes the complete 4-by-4 SIGKILL evidence mandatory. The
+result always states `production_release_tested=false`,
 `physical_power_loss_tested=false`, and `m10_exit_gate_closed=false`. This loop
 evidence cannot close production daemon/camera behavior, structured GStreamer
-no-space handling on the recording path, a real all-operation SIGKILL cutpoint
-matrix, physical power interruption, performance, or a deployable installed
-Milestone 10 release. Those remain explicit deferred gates, even when every
-component matrix in this harness passes.
+no-space handling on the recording path, physical power interruption,
+performance, or a deployable installed Milestone 10 release. Those remain
+explicit deferred gates, even when every component matrix in this harness
+passes. The complete worker, including all sixteen bounded crash subprocesses
+and their recovery checks, remains under the parent's 900-second timeout and
+exact cleanup barrier.

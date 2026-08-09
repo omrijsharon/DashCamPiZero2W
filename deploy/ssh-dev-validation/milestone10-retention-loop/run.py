@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 EXPECTED_RELEASE: Final = "0.1.0.dev0-5f95dd806342ac9e"
 EXPECTED_RELEASE_MANIFEST: Final = (
     "619fe30e8123e0ceaec55269de0a6faf6ec88ccb4859a98bbef2d87776dbb655"
@@ -59,6 +59,10 @@ WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "matrix_b_c",
     "matrix_d",
     "matrix_e",
+    "crash_cell",
+    "prepare_crash_intent",
+    "run_crash_subprocess",
+    "validate_crash_cell_environment",
     "matrix_g",
     "write_result",
     "load_commit_source",
@@ -99,6 +103,21 @@ MAX_ROOT_CAPACITY_BYTES: Final = 7 * 1024**3
 MAX_SIGNED_BYTES: Final = 2**63 - 1
 MAX_RECLAIM_STEPS: Final = 64
 MAX_FIXTURE_FILES: Final = 256
+CRASH_OPERATIONS: Final = ("FINALIZE", "PROTECT", "UNPROTECT", "DELETE")
+CRASH_CUTPOINTS: Final = (
+    "AFTER_INTENT",
+    "AFTER_MEMBER1",
+    "AFTER_MEMBER2",
+    "AFTER_COMPLETE",
+)
+CRASH_CELL_COUNT: Final = len(CRASH_OPERATIONS) * len(CRASH_CUTPOINTS)
+CRASH_CELL_TIMEOUT_S: Final = 15
+CRASH_CELL_BASE_ORDER: Final = 180
+SIGKILL_NUMBER: Final = 9
+CRASH_INTENT_LINE_RE: Final = re.compile(
+    rb"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    rb"[89ab][0-9a-f]{3}-[0-9a-f]{12}\n"
+)
 
 FINDMNT: Final = "/usr/bin/findmnt"
 MOUNT: Final = "/usr/bin/mount"
@@ -442,7 +461,67 @@ def validate_privacy(value: object) -> None:
             raise HarnessError("result contains raw or excessive private text")
 
 
+def validate_sigkill_matrix_evidence(matrix: Mapping[str, object]) -> None:
+    raw_cells = matrix.get("cells")
+    if (
+        matrix.get("operations") != len(CRASH_OPERATIONS)
+        or matrix.get("cutpoints_per_operation") != len(CRASH_CUTPOINTS)
+        or matrix.get("cell_count") != CRASH_CELL_COUNT
+        or matrix.get("actual_sigkill_cells") != CRASH_CELL_COUNT
+        or matrix.get("fresh_catalogs") != CRASH_CELL_COUNT
+        or matrix.get("sigkill_cutpoint_matrix_tested") is not True
+        or matrix.get("physical_power_loss_tested") is not False
+        or not isinstance(raw_cells, list)
+        or len(raw_cells) != CRASH_CELL_COUNT
+    ):
+        raise HarnessError("SIGKILL matrix summary differs")
+    expected = {
+        (operation, cutpoint)
+        for operation in CRASH_OPERATIONS
+        for cutpoint in CRASH_CUTPOINTS
+    }
+    observed: set[tuple[str, str]] = set()
+    recovery_actions = {
+        "AFTER_INTENT": 2,
+        "AFTER_MEMBER1": 1,
+        "AFTER_MEMBER2": 0,
+        "AFTER_COMPLETE": 0,
+    }
+    for raw_cell in raw_cells:
+        if not isinstance(raw_cell, dict):
+            raise HarnessError("SIGKILL matrix cell is not an object")
+        cell = cast(dict[str, object], raw_cell)
+        if set(cell) != {
+            "operation",
+            "cutpoint",
+            "sigkill_observed",
+            "reopen_reconciled",
+            "idempotent_reconcile",
+            "recovery_actions",
+        }:
+            raise HarnessError("SIGKILL matrix cell fields differ")
+        operation = cell["operation"]
+        cutpoint = cell["cutpoint"]
+        if not isinstance(operation, str) or not isinstance(cutpoint, str):
+            raise HarnessError("SIGKILL matrix cell identity differs")
+        identity = (operation, cutpoint)
+        if (
+            identity not in expected
+            or identity in observed
+            or cell["sigkill_observed"] is not True
+            or cell["reopen_reconciled"] is not True
+            or cell["idempotent_reconcile"] is not True
+            or cell["recovery_actions"] != recovery_actions[cutpoint]
+        ):
+            raise HarnessError("SIGKILL matrix cell evidence differs")
+        observed.add(identity)
+    if observed != expected:
+        raise HarnessError("SIGKILL matrix coverage differs")
+
+
 def validate_result_evidence(result: Mapping[str, object]) -> None:
+    if result.get("schema_version") != SCHEMA_VERSION:
+        raise HarnessError("result schema version differs")
     raw_matrices = result.get("matrices")
     if not isinstance(raw_matrices, dict) or set(raw_matrices) != set(MATRIX_NAMES):
         raise HarnessError("matrix result set is incomplete")
@@ -451,6 +530,7 @@ def validate_result_evidence(result: Mapping[str, object]) -> None:
             raise HarnessError(f"matrix {name} did not pass its declared component scope")
     matrices = cast(dict[str, dict[str, object]], result["matrices"])
     validate_threshold_evidence(cast(Sequence[Mapping[str, object]], matrices["A"].get("cases")))
+    validate_sigkill_matrix_evidence(matrices["E"])
     semantic_checks = (
         matrices["A"].get("identity_drift_refused") is True,
         matrices["A"].get("capacity_drift_refused") is True,
@@ -472,7 +552,6 @@ def validate_result_evidence(result: Mapping[str, object]) -> None:
         matrices["D"].get("previous_count") == 2,
         matrices["D"].get("current_count") == 1,
         matrices["D"].get("next_count") == 1,
-        matrices["E"].get("delete_one_member_preseeded_replay") is True,
         matrices["F"].get("exfat_read_only_fsck_status") == 0,
         matrices["F"].get("ext4_read_only_fsck_status") == 0,
         matrices["G"].get("no_eligible_candidate") is True,
@@ -1195,6 +1274,368 @@ def _materialize_clip(root: Path, clip: Any, *, video_bytes: int = 1024 * 1024) 
     _write_member(root, cast(str, clip.sidecar_path), b'{"schema_version":1}\n')
 
 
+def _crash_cell_coordinates(
+    work: Path, operation: str, cutpoint: str
+) -> tuple[str, int, Path]:
+    if operation not in CRASH_OPERATIONS or cutpoint not in CRASH_CUTPOINTS:
+        raise HarnessError("crash-cell operation or cutpoint differs")
+    resolved_work = work.resolve(strict=True)
+    if (
+        resolved_work.parent != Path("/var/tmp")
+        or re.fullmatch(r"dashcam-m10-retention-loop\.[A-Za-z0-9_-]{6,32}", resolved_work.name)
+        is None
+    ):
+        raise HarnessError("crash-cell work identity differs")
+    operation_index = CRASH_OPERATIONS.index(operation)
+    cutpoint_index = CRASH_CUTPOINTS.index(cutpoint)
+    order = CRASH_CELL_BASE_ORDER + operation_index * len(CRASH_CUTPOINTS) + cutpoint_index
+    cell_id = f"{operation.lower()}-{cutpoint.lower().replace('_', '-')}"
+    catalog = resolved_work / "catalog" / f"crash-{cell_id}.sqlite3"
+    return cell_id, order, catalog
+
+
+def _validate_crash_fixture_mount(
+    target: Path,
+    image: Path,
+    *,
+    expected_size: int,
+    filesystem: str,
+    label: str,
+) -> None:
+    image_metadata = image.stat()
+    if (
+        not stat.S_ISREG(image_metadata.st_mode)
+        or image_metadata.st_nlink != 1
+        or image_metadata.st_size != expected_size
+        or image_metadata.st_blocks * 512 < expected_size  # type: ignore[attr-defined]
+    ):
+        raise HarnessError("crash-cell backing image allocation differs")
+    row = _findmnt(target)
+    if row is None or not isinstance(row.get("source"), str):
+        raise HarnessError("crash-cell fixture mount is absent")
+    loop = Path(row["source"])
+    if LOOP_RE.fullmatch(loop.as_posix()) is None:
+        raise HarnessError("crash-cell fixture is not loop-backed")
+    _require_owned_loop(loop, image)
+    facts = _blkid(loop)
+    if facts["TYPE"] != filesystem or facts["LABEL"] != label:
+        raise HarnessError("crash-cell filesystem identity differs")
+    validate_mount_identity(
+        row,
+        source=str(loop),
+        target=str(target),
+        filesystem=filesystem,
+        uuid=facts["UUID"],
+        label=label,
+    )
+
+
+def _validate_crash_cell_environment(
+    work: Path, operation: str, cutpoint: str
+) -> tuple[Path, int, Path]:
+    _cell_id, order, catalog = _crash_cell_coordinates(work, operation, cutpoint)
+    resolved_work = work.resolve(strict=True)
+    expected_python = (
+        Path("/opt/dashcam/releases") / EXPECTED_RELEASE / "venv/bin/python"
+    ).resolve(strict=True)
+    work_metadata = resolved_work.stat()
+    if (
+        sys.platform != "linux"
+        or os.geteuid() != 0
+        or Path(sys.executable).resolve(strict=True) != expected_python
+        or not stat.S_ISDIR(work_metadata.st_mode)
+        or work_metadata.st_uid != 0
+        or stat.S_IMODE(work_metadata.st_mode) != 0o700
+        or work_metadata.st_dev != Path("/var/tmp").stat().st_dev
+    ):
+        raise HarnessError("crash-cell process or work ownership differs")
+    catalog_mount = (resolved_work / "catalog").resolve(strict=True)
+    _validate_crash_fixture_mount(
+        RECORDING_ROOT.resolve(strict=True),
+        resolved_work / "recording.exfat.img",
+        expected_size=EXFAT_IMAGE_BYTES,
+        filesystem="exfat",
+        label="M10LOOP",
+    )
+    _validate_crash_fixture_mount(
+        catalog_mount,
+        resolved_work / "catalog.ext4.img",
+        expected_size=EXT4_IMAGE_BYTES,
+        filesystem="ext4",
+        label="M10CAT",
+    )
+    if (
+        catalog.parent != catalog_mount
+        or not catalog.is_file()
+        or catalog.is_symlink()
+        or catalog.stat().st_dev != catalog_mount.stat().st_dev
+    ):
+        raise HarnessError("crash-cell catalog identity differs")
+    return resolved_work, order, catalog
+
+
+def _crash_finalizing_fixture(order: int) -> tuple[Any, Any, bytes]:
+    from uuid import UUID
+
+    from dashcam.catalog.models import CatalogClip
+    from dashcam.metadata.schema import AudioSummary, ClipSidecar, GpsSummary, VideoSummary
+    from dashcam.state import (
+        ClipLifecycle,
+        GpsTimeState,
+        SystemClockState,
+        TimestampQuality,
+    )
+    from dashcam.storage.intents import PairPaths
+    from dashcam.storage.naming import finalized_unsynced_clip_pair, provisional_clip_pair
+
+    source = provisional_clip_pair(boot_id="m10kill", sequence=order)
+    target = finalized_unsynced_clip_pair(boot_id="m10kill", sequence=order)
+    clip_id = UUID(int=order + 1)
+    start = order * 1_000_000_000
+    end = start + 1_000_000_000
+    clip = CatalogClip(
+        clip_id=clip_id,
+        lifecycle=ClipLifecycle.FINALIZING,
+        video_path=f"pending/{source.video_name}",
+        sidecar_path=f"pending/{source.metadata_name}",
+        start_monotonic_ns=start,
+        end_monotonic_ns=end,
+        retention_order=order,
+        size_bytes=64 * 1024,
+        protected=False,
+        protection_reason=None,
+        pair_reconciled=False,
+        managed=True,
+    )
+    paths = PairPaths(
+        clip.video_path,
+        clip.sidecar_path,
+        f"clips/{target.video_name}",
+        f"clips/{target.metadata_name}",
+    )
+    sidecar = ClipSidecar(
+        schema_version=1,
+        clip_id=clip_id,
+        boot_id=UUID(int=1),
+        sequence=order,
+        video_file=target.video_name,
+        metadata_file=target.metadata_name,
+        start_utc=None,
+        end_utc=None,
+        start_monotonic_ns=start,
+        end_monotonic_ns=end,
+        gps_time_state=GpsTimeState.UNSYNCED,
+        system_clock_state=SystemClockState.UNSET,
+        timestamp_quality=TimestampQuality.MONOTONIC_ONLY,
+        time_anchor=None,
+        timezone="UTC",
+        start_local=None,
+        video=VideoSummary("h264", 1920, 1080, 30.0, 8_000_000, 8_000_000, 30, 0),
+        audio=AudioSummary(False, None, None, None, None),
+        gps=GpsSummary(False, None),
+        protected=False,
+        protection_reason=None,
+        software_version="m10-loop",
+    )
+    return clip, paths, sidecar.to_canonical_json()
+
+
+def _crash_fixture(operation: str, order: int) -> tuple[Any, Any | None, bytes | None]:
+    if operation == "FINALIZE":
+        return _crash_finalizing_fixture(order)
+    return _fixture_clip(order, protected=operation == "UNPROTECT"), None, None
+
+
+class _CrashAfterActionFilesystem:
+    def __init__(self, filesystem: Any, *, kill_after: int) -> None:
+        if kill_after not in {1, 2}:
+            raise HarnessError("crash member cutpoint differs")
+        self._filesystem = filesystem
+        self._kill_after = kill_after
+        self._actions = 0
+
+    def exists(self, relative_path: str) -> bool:
+        return cast(bool, self._filesystem.exists(relative_path))
+
+    def read_bytes(self, relative_path: str, *, maximum_bytes: int) -> bytes:
+        return cast(
+            bytes,
+            self._filesystem.read_bytes(relative_path, maximum_bytes=maximum_bytes),
+        )
+
+    def move(self, source: str, target: str) -> None:
+        self._filesystem.move(source, target)
+        self._after_durable_action()
+
+    def unlink(self, relative_path: str) -> None:
+        self._filesystem.unlink(relative_path)
+        self._after_durable_action()
+
+    def _after_durable_action(self) -> None:
+        self._actions += 1
+        if self._actions == self._kill_after:
+            os.kill(os.getpid(), SIGKILL_NUMBER)
+            os._exit(125)
+
+
+def _prepare_crash_intent(
+    catalog_path: Path,
+    root: Path,
+    *,
+    operation: str,
+    cutpoint: str,
+    order: int,
+) -> None:
+    from dashcam.catalog.database import ClipCatalog
+    from dashcam.catalog.filesystem import RootedFilesystem
+
+    clip, paths, _sidecar = _crash_fixture(operation, order)
+    with ClipCatalog(catalog_path) as catalog:
+        intent_id: Any
+        if operation == "FINALIZE":
+            assert paths is not None
+            intent_id = catalog.register_finalizing_clip(
+                clip,
+                promotion_paths=paths,
+                monotonic_now_ns=80_000 + order,
+            )
+        elif operation == "PROTECT":
+            intent_id = catalog.prepare_protect(
+                clip.clip_id,
+                reason="m10:sigkill",
+                monotonic_now_ns=80_000 + order,
+            )
+        elif operation == "UNPROTECT":
+            intent_id = catalog.prepare_unprotect(
+                clip.clip_id,
+                monotonic_now_ns=80_000 + order,
+            )
+        elif operation == "DELETE":
+            intent_id = catalog.prepare_delete(
+                clip.clip_id,
+                monotonic_now_ns=80_000 + order,
+                boot_id="m10-sigkill",
+            )
+        else:
+            raise HarnessError("crash-cell operation differs")
+        if intent_id is None:
+            raise HarnessError("crash-cell intent was not durably prepared")
+        _write_all(sys.stdout.fileno(), f"{intent_id}\n".encode("ascii"))
+        if cutpoint == "AFTER_INTENT":
+            os.kill(os.getpid(), SIGKILL_NUMBER)
+            os._exit(125)
+        filesystem: Any = RootedFilesystem(root, expected_device_id=_device_id(root))
+        if cutpoint in {"AFTER_MEMBER1", "AFTER_MEMBER2"}:
+            filesystem = _CrashAfterActionFilesystem(
+                filesystem,
+                kill_after=1 if cutpoint == "AFTER_MEMBER1" else 2,
+            )
+        result = catalog.reconcile_intent(
+            intent_id,
+            filesystem,
+            monotonic_now_ns=90_000 + order,
+            max_actions=2,
+        )
+        if not result.complete or result.problems:
+            raise HarnessError("crash-cell reconciliation did not complete")
+        if cutpoint != "AFTER_COMPLETE":
+            raise HarnessError("crash-cell member cutpoint did not terminate")
+        os.kill(os.getpid(), SIGKILL_NUMBER)
+        os._exit(125)
+    raise HarnessError("crash-cell unexpectedly survived its completion cutpoint")
+
+
+def _crash_cell(arguments: argparse.Namespace) -> int:
+    work, order, catalog = _validate_crash_cell_environment(
+        Path(cast(str, arguments.work)),
+        cast(str, arguments.cell_operation),
+        cast(str, arguments.cell_cutpoint),
+    )
+    metadata = verify_bundle(
+        Path(arguments.bundle).resolve(strict=True),
+        arguments.expected_manifest_sha256,
+        arguments.expected_commit,
+    )
+    _load_commit_source(
+        Path(arguments.bundle).resolve(strict=True) / "dashcam-source.zip",
+        cast(dict[str, object], metadata["members"]),
+    )
+    _prepare_crash_intent(
+        catalog,
+        RECORDING_ROOT.resolve(strict=True),
+        operation=arguments.cell_operation,
+        cutpoint=arguments.cell_cutpoint,
+        order=order,
+    )
+    raise HarnessError(f"crash-cell unexpectedly returned: {work.name}")
+
+
+def _run_crash_subprocess(
+    *,
+    bundle: Path,
+    work: Path,
+    expected_manifest_sha256: str,
+    expected_commit: str,
+    operation: str,
+    cutpoint: str,
+) -> Any:
+    from uuid import UUID
+
+    _crash_cell_coordinates(work, operation, cutpoint)
+    command = (
+        sys.executable,
+        "-I",
+        str(bundle / "run.py"),
+        "--crash-cell",
+        "--bundle",
+        str(bundle),
+        "--work",
+        str(work),
+        "--expected-manifest-sha256",
+        expected_manifest_sha256,
+        "--expected-commit",
+        expected_commit,
+        "--cell-operation",
+        operation,
+        "--cell-cutpoint",
+        cutpoint,
+    )
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+    try:
+        try:
+            returncode = process.wait(timeout=CRASH_CELL_TIMEOUT_S)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait(timeout=5)
+            raise HarnessError("crash-cell exceeded its bounded timeout") from error
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout = process.stdout.read(513)
+        stderr = process.stderr.read(513)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    if (
+        returncode != -SIGKILL_NUMBER
+        or len(stdout) > 512
+        or stderr
+        or CRASH_INTENT_LINE_RE.fullmatch(stdout) is None
+    ):
+        raise HarnessError("crash-cell did not terminate at the exact SIGKILL cutpoint")
+    return UUID(stdout.decode("ascii").strip())
+
+
 def _matrix_a(
     catalog_path: Path, volume_uuid: str, capacity: int, device_id: str
 ) -> dict[str, object]:
@@ -1626,41 +2067,205 @@ def _matrix_d(root: Path, catalog_path: Path) -> dict[str, object]:
     }
 
 
-def _matrix_e(root: Path, catalog_path: Path) -> dict[str, object]:
+def _crash_expected_targets(operation: str, clip: Any, paths: Any | None) -> tuple[str, str] | None:
+    if operation == "DELETE":
+        return None
+    if operation == "FINALIZE":
+        assert paths is not None
+        return cast(str, paths.video_target), cast(str, paths.sidecar_target)
+    directory = "protected" if operation == "PROTECT" else "clips"
+    return (
+        f"{directory}/{PurePosixPath(clip.video_path).name}",
+        f"{directory}/{PurePosixPath(clip.sidecar_path).name}",
+    )
+
+
+def _assert_crash_cutpoint_files(
+    root: Path,
+    *,
+    operation: str,
+    cutpoint: str,
+    clip: Any,
+    paths: Any | None,
+) -> None:
+    targets = _crash_expected_targets(operation, clip, paths)
+    expected_sources = {
+        "AFTER_INTENT": (True, True),
+        "AFTER_MEMBER1": (False, True),
+        "AFTER_MEMBER2": (False, False),
+        "AFTER_COMPLETE": (False, False),
+    }[cutpoint]
+    observed_sources = (
+        (root / clip.video_path).is_file(),
+        (root / clip.sidecar_path).is_file(),
+    )
+    if observed_sources != expected_sources:
+        raise HarnessError("SIGKILL source-member cutpoint state differs")
+    if targets is None:
+        return
+    expected_targets = {
+        "AFTER_INTENT": (False, False),
+        "AFTER_MEMBER1": (True, False),
+        "AFTER_MEMBER2": (True, True),
+        "AFTER_COMPLETE": (True, True),
+    }[cutpoint]
+    observed_targets = ((root / targets[0]).is_file(), (root / targets[1]).is_file())
+    if observed_targets != expected_targets:
+        raise HarnessError("SIGKILL target-member cutpoint state differs")
+
+
+def _matrix_e(
+    root: Path,
+    catalog_mount: Path,
+    *,
+    bundle: Path,
+    work: Path,
+    expected_manifest_sha256: str,
+    expected_commit: str,
+) -> dict[str, object]:
     from dashcam.catalog.database import ClipCatalog
     from dashcam.catalog.filesystem import RootedFilesystem
-    from dashcam.storage.reclaimer import StorageReclaimer
+    from dashcam.state import ClipLifecycle
 
-    filesystem = RootedFilesystem(root)
-    clip = _fixture_clip(150)
-    _materialize_clip(root, clip, video_bytes=64 * 1024)
-    with ClipCatalog(catalog_path) as catalog:
-        catalog.register_clip(clip, catalog_now_ns=50)
-        intent_id = catalog.prepare_delete(
-            clip.clip_id, monotonic_now_ns=60_000, boot_id="m10-loop-crash"
-        )
-        # This is the exact persisted state left by a process loss after the
-        # first DELETE member: one member absent, intent still PENDING.
-        filesystem.unlink(clip.video_path)
-        if not (root / clip.sidecar_path).is_file():
-            raise HarnessError("one-member interruption fixture differs")
-    _run((SYNC, "-f", str(root)), timeout=30)
-    with ClipCatalog(catalog_path) as reopened:
-        pending = reopened.list_pending_delete_intents(limit=2)
-        if len(pending) != 1 or pending[0].intent_id != intent_id:
-            raise HarnessError("pending delete did not survive catalog reopen")
-        step = StorageReclaimer(
-            catalog=reopened, filesystem=filesystem, monotonic_ns=lambda: 60_001
-        ).run_one(boot_id="m10-loop-crash", allow_new=False)
-        if not step.recovered or not step.deleted:
-            raise HarnessError("one-member deletion replay did not converge")
-    if (root / clip.video_path).exists() or (root / clip.sidecar_path).exists():
-        raise HarnessError("replayed deletion pair remains")
+    filesystem = RootedFilesystem(root, expected_device_id=_device_id(root))
+    cells: list[dict[str, object]] = []
+    for operation in CRASH_OPERATIONS:
+        for cutpoint in CRASH_CUTPOINTS:
+            _cell_id, order, catalog_path = _crash_cell_coordinates(work, operation, cutpoint)
+            if catalog_path.parent != catalog_mount.resolve(strict=True) or catalog_path.exists():
+                raise HarnessError("crash-cell catalog is not a fresh exact target")
+            clip, paths, sidecar = _crash_fixture(operation, order)
+            if operation == "FINALIZE":
+                assert paths is not None and sidecar is not None
+                _write_member(root, clip.video_path, b"M10-SIGKILL-VIDEO\n")
+                _write_member(root, clip.sidecar_path, sidecar)
+                with ClipCatalog(catalog_path):
+                    pass
+            else:
+                _materialize_clip(root, clip, video_bytes=64 * 1024)
+                with ClipCatalog(catalog_path) as catalog:
+                    catalog.register_clip(clip, catalog_now_ns=70_000 + order)
+            _run((SYNC, "-f", str(root)), timeout=30)
+            _run((SYNC, "-f", str(catalog_mount)), timeout=30)
+            intent_id = _run_crash_subprocess(
+                bundle=bundle,
+                work=work,
+                expected_manifest_sha256=expected_manifest_sha256,
+                expected_commit=expected_commit,
+                operation=operation,
+                cutpoint=cutpoint,
+            )
+            _assert_crash_cutpoint_files(
+                root,
+                operation=operation,
+                cutpoint=cutpoint,
+                clip=clip,
+                paths=paths,
+            )
+            expected_actions = {
+                "AFTER_INTENT": 2,
+                "AFTER_MEMBER1": 1,
+                "AFTER_MEMBER2": 0,
+                "AFTER_COMPLETE": 0,
+            }[cutpoint]
+            with ClipCatalog(catalog_path) as reopened:
+                pending_before = reopened.list_pending_intents(limit=2)
+                if cutpoint == "AFTER_COMPLETE":
+                    if pending_before:
+                        raise HarnessError("completed SIGKILL cell retained a pending intent")
+                elif (
+                    len(pending_before) != 1
+                    or pending_before[0].intent_id != intent_id
+                    or pending_before[0].clip_id != clip.clip_id
+                    or pending_before[0].kind.value != operation
+                ):
+                    raise HarnessError("SIGKILL cell did not retain its exact durable intent")
+                first = reopened.reconcile_intent(
+                    intent_id,
+                    filesystem,
+                    monotonic_now_ns=100_000 + order,
+                    max_actions=2,
+                )
+                second = reopened.reconcile_intent(
+                    intent_id,
+                    filesystem,
+                    monotonic_now_ns=110_000 + order,
+                    max_actions=2,
+                )
+                stored = reopened.get_clip(clip.clip_id)
+                pending = reopened.list_pending_intents(limit=2)
+            if (
+                first.intent.intent_id != intent_id
+                or first.intent.clip_id != clip.clip_id
+                or first.intent.kind.value != operation
+                or not first.complete
+                or first.problems
+                or first.actions_attempted != expected_actions
+                or second.intent.intent_id != intent_id
+                or not second.complete
+                or second.problems
+                or second.actions_attempted != 0
+                or pending
+            ):
+                raise HarnessError("SIGKILL cell did not replay and converge idempotently")
+            if operation == "DELETE":
+                if (
+                    stored.lifecycle is not ClipLifecycle.DELETED
+                    or not stored.pair_reconciled
+                    or (root / clip.video_path).exists()
+                    or (root / clip.sidecar_path).exists()
+                ):
+                    raise HarnessError("SIGKILL DELETE final state differs")
+            else:
+                assert paths is not None or operation in {"PROTECT", "UNPROTECT"}
+                expected_directory = "protected" if operation == "PROTECT" else "clips"
+                if operation == "FINALIZE":
+                    assert paths is not None
+                    expected_video = cast(str, paths.video_target)
+                    expected_sidecar = cast(str, paths.sidecar_target)
+                    expected_protected = False
+                else:
+                    expected_video = f"{expected_directory}/{PurePosixPath(clip.video_path).name}"
+                    expected_sidecar = (
+                        f"{expected_directory}/{PurePosixPath(clip.sidecar_path).name}"
+                    )
+                    expected_protected = operation == "PROTECT"
+                if (
+                    stored.lifecycle is not ClipLifecycle.FINALIZED
+                    or stored.protected is not expected_protected
+                    or not stored.pair_reconciled
+                    or stored.video_path != expected_video
+                    or stored.sidecar_path != expected_sidecar
+                    or not (root / expected_video).is_file()
+                    or not (root / expected_sidecar).is_file()
+                    or (expected_video != clip.video_path and (root / clip.video_path).exists())
+                    or (
+                        expected_sidecar != clip.sidecar_path
+                        and (root / clip.sidecar_path).exists()
+                    )
+                ):
+                    raise HarnessError(f"SIGKILL {operation} final state differs")
+            cells.append(
+                {
+                    "operation": operation,
+                    "cutpoint": cutpoint,
+                    "sigkill_observed": True,
+                    "reopen_reconciled": True,
+                    "idempotent_reconcile": True,
+                    "recovery_actions": expected_actions,
+                }
+            )
+    if len(cells) != CRASH_CELL_COUNT:
+        raise HarnessError("SIGKILL matrix cell count differs")
     return {
         "passed": True,
-        "delete_one_member_preseeded_replay": True,
-        "catalog_reopen_used": True,
-        "sigkill_cutpoint_matrix_tested": False,
+        "operations": len(CRASH_OPERATIONS),
+        "cutpoints_per_operation": len(CRASH_CUTPOINTS),
+        "cell_count": len(cells),
+        "actual_sigkill_cells": len(cells),
+        "fresh_catalogs": len(cells),
+        "cells": cells,
+        "sigkill_cutpoint_matrix_tested": True,
         "physical_power_loss_tested": False,
     }
 
@@ -1823,7 +2428,14 @@ def _worker(arguments: argparse.Namespace) -> int:
             RECORDING_ROOT, catalog_mount / "matrix-bc.sqlite3"
         )
         matrices["D"] = _matrix_d(RECORDING_ROOT, catalog_mount / "matrix-d.sqlite3")
-        matrices["E"] = _matrix_e(RECORDING_ROOT, catalog_mount / "matrix-e.sqlite3")
+        matrices["E"] = _matrix_e(
+            RECORDING_ROOT,
+            catalog_mount,
+            bundle=bundle,
+            work=work,
+            expected_manifest_sha256=arguments.expected_manifest_sha256,
+            expected_commit=arguments.expected_commit,
+        )
         _run((SYNC, "-f", str(RECORDING_ROOT)), timeout=30)
         _run((SYNC, "-f", str(catalog_mount)), timeout=30)
         _unmount_owned(RECORDING_ROOT, exfat_loop, exfat_image)
@@ -1890,7 +2502,6 @@ def _worker(arguments: argparse.Namespace) -> int:
             "deferred_gates": [
                 "real-production-daemon-and-camera-integration",
                 "structured-gstreamer-no-space-on-physical-recording-path",
-                "sigkill-all-operation-cutpoint-matrix",
                 "physical-power-interruption-and-remount",
                 "installed-deployable-m10-release",
             ],
@@ -2197,10 +2808,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-board-serial", default=EXPECTED_BOARD_SERIAL)
     parser.add_argument("--output")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--crash-cell", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--work", help=argparse.SUPPRESS)
     parser.add_argument("--result", help=argparse.SUPPRESS)
     parser.add_argument("--parent-mount-namespace", help=argparse.SUPPRESS)
     parser.add_argument("--parent-network-namespace", help=argparse.SUPPRESS)
+    parser.add_argument("--cell-operation", choices=CRASH_OPERATIONS, help=argparse.SUPPRESS)
+    parser.add_argument("--cell-cutpoint", choices=CRASH_CUTPOINTS, help=argparse.SUPPRESS)
     return parser
 
 
@@ -2213,7 +2827,26 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
         raise HarnessError("expected board serial is malformed")
     if arguments.expected_board_serial != EXPECTED_BOARD_SERIAL:
         raise HarnessError("expected board serial differs from the accepted exact Pi")
-    if arguments.worker:
+    if arguments.worker and arguments.crash_cell:
+        raise HarnessError("worker modes are mutually exclusive")
+    if arguments.crash_cell:
+        if (
+            not isinstance(arguments.work, str)
+            or not arguments.work
+            or arguments.cell_operation not in CRASH_OPERATIONS
+            or arguments.cell_cutpoint not in CRASH_CUTPOINTS
+            or any(
+                value is not None
+                for value in (
+                    arguments.output,
+                    arguments.result,
+                    arguments.parent_mount_namespace,
+                    arguments.parent_network_namespace,
+                )
+            )
+        ):
+            raise HarnessError("crash-cell arguments are incomplete or excessive")
+    elif arguments.worker:
         if not all(
             isinstance(value, str) and value
             for value in (
@@ -2237,14 +2870,16 @@ def main() -> int:
     arguments = _parser().parse_args()
     try:
         _validate_arguments(arguments)
+        if arguments.crash_cell:
+            return _crash_cell(arguments)
         return _worker(arguments) if arguments.worker else _parent(arguments)
     except (HarnessError, OSError, ValueError, UnicodeError, zipfile.BadZipFile) as error:
-        if arguments.worker:
+        if arguments.worker or arguments.crash_cell:
             return _emit_worker_refusal(error)
         print(f"REFUSED: {error}", file=sys.stderr)
         return 2
     except Exception as error:
-        if arguments.worker:
+        if arguments.worker or arguments.crash_cell:
             return _emit_worker_refusal(error)
         print("REFUSED: unexpected parent exception", file=sys.stderr)
         return 2

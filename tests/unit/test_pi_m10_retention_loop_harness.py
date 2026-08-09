@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -99,8 +100,30 @@ def _threshold_cases() -> list[dict[str, object]]:
     ]
 
 
+def _sigkill_cells() -> list[dict[str, object]]:
+    recovery_actions = {
+        "AFTER_INTENT": 2,
+        "AFTER_MEMBER1": 1,
+        "AFTER_MEMBER2": 0,
+        "AFTER_COMPLETE": 0,
+    }
+    return [
+        {
+            "operation": operation,
+            "cutpoint": cutpoint,
+            "sigkill_observed": True,
+            "reopen_reconciled": True,
+            "idempotent_reconcile": True,
+            "recovery_actions": recovery_actions[cutpoint],
+        }
+        for operation in harness.CRASH_OPERATIONS
+        for cutpoint in harness.CRASH_CUTPOINTS
+    ]
+
+
 def _result() -> dict[str, object]:
     return {
+        "schema_version": harness.SCHEMA_VERSION,
         "matrices": {
             "A": {
                 "passed": True,
@@ -133,7 +156,17 @@ def _result() -> dict[str, object]:
                 "current_count": 1,
                 "next_count": 1,
             },
-            "E": {"passed": True, "delete_one_member_preseeded_replay": True},
+            "E": {
+                "passed": True,
+                "operations": 4,
+                "cutpoints_per_operation": 4,
+                "cell_count": 16,
+                "actual_sigkill_cells": 16,
+                "fresh_catalogs": 16,
+                "cells": _sigkill_cells(),
+                "sigkill_cutpoint_matrix_tested": True,
+                "physical_power_loss_tested": False,
+            },
             "F": {
                 "passed": True,
                 "exfat_read_only_fsck_status": 0,
@@ -294,6 +327,11 @@ def test_threshold_and_matrix_evidence_enforce_boundaries_and_false_claims() -> 
     with pytest.raises(harness.HarnessError, match="unsafe acceptance"):
         harness.validate_result_evidence(result)
 
+    wrong_schema = _result()
+    wrong_schema["schema_version"] = 1
+    with pytest.raises(harness.HarnessError, match="schema"):
+        harness.validate_result_evidence(wrong_schema)
+
 
 def test_result_validator_does_not_trust_matrix_pass_boolean() -> None:
     result = _result()
@@ -301,6 +339,316 @@ def test_result_validator_does_not_trust_matrix_pass_boolean() -> None:
     matrices["C"]["active_lease_excluded"] = False
     with pytest.raises(harness.HarnessError, match="semantic"):
         harness.validate_result_evidence(result)
+
+
+def test_sigkill_matrix_validator_requires_every_exact_unique_cell() -> None:
+    matrix = cast(dict[str, object], cast(dict[str, object], _result()["matrices"])["E"])
+    harness.validate_sigkill_matrix_evidence(matrix)
+
+    missing = dict(matrix)
+    missing["cells"] = cast(list[dict[str, object]], matrix["cells"])[:-1]
+    with pytest.raises(harness.HarnessError, match="SIGKILL"):
+        harness.validate_sigkill_matrix_evidence(missing)
+
+    forged = dict(matrix)
+    forged_cells = [dict(cell) for cell in cast(list[dict[str, object]], matrix["cells"])]
+    forged_cells[0]["sigkill_observed"] = False
+    forged["cells"] = forged_cells
+    with pytest.raises(harness.HarnessError, match="SIGKILL"):
+        harness.validate_sigkill_matrix_evidence(forged)
+
+
+def test_crash_fixture_mount_refuses_active_or_non_owned_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Image:
+        @staticmethod
+        def stat() -> os.stat_result:
+            return cast(
+                os.stat_result,
+                type(
+                    "Metadata",
+                    (),
+                    {
+                        "st_mode": stat.S_IFREG | 0o600,
+                        "st_nlink": 1,
+                        "st_size": 4096,
+                        "st_blocks": 8,
+                    },
+                )(),
+            )
+
+    row = {
+        "source": str(Path("/dev/loop7")),
+        "target": str(Path("/srv/dashcam")),
+        "fstype": "exfat",
+        "uuid": "ABCD-1234",
+        "label": "M10LOOP",
+        "options": "rw,nodev",
+    }
+    monkeypatch.setattr(harness, "_findmnt", lambda _target: row)
+    monkeypatch.setattr(harness, "_require_owned_loop", lambda _loop, _image: None)
+    monkeypatch.setattr(
+        harness,
+        "_blkid",
+        lambda _loop: {
+            "DEVNAME": "/dev/loop7",
+            "UUID": "ABCD-1234",
+            "TYPE": "exfat",
+            "LABEL": "M10LOOP",
+        },
+    )
+    harness._validate_crash_fixture_mount(
+        Path("/srv/dashcam"),
+        cast(Any, Image()),
+        expected_size=4096,
+        filesystem="exfat",
+        label="M10LOOP",
+    )
+
+    active = dict(row, source=str(Path("/dev/mmcblk0p3")))
+    monkeypatch.setattr(harness, "_findmnt", lambda _target: active)
+    with pytest.raises(harness.HarnessError, match="loop-backed"):
+        harness._validate_crash_fixture_mount(
+            Path("/srv/dashcam"),
+            cast(Any, Image()),
+            expected_size=4096,
+            filesystem="exfat",
+            label="M10LOOP",
+        )
+
+
+def test_crash_cell_parser_is_closed_and_mutually_exclusive() -> None:
+    arguments = harness._parser().parse_args(
+        [
+            "--bundle",
+            "/run/reviewed-bundle",
+            "--expected-manifest-sha256",
+            "a" * 64,
+            "--expected-commit",
+            "b" * 40,
+            "--crash-cell",
+            "--work",
+            "/var/tmp/dashcam-m10-retention-loop.fixture",
+            "--cell-operation",
+            "DELETE",
+            "--cell-cutpoint",
+            "AFTER_MEMBER2",
+        ]
+    )
+    harness._validate_arguments(arguments)
+    arguments.worker = True
+    with pytest.raises(harness.HarnessError, match="mutually exclusive"):
+        harness._validate_arguments(arguments)
+
+
+def test_crash_subprocess_requires_exact_sigkill_uuid_and_closed_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    intent = b"12345678-1234-4abc-8def-1234567890ab\n"
+    observed: dict[str, object] = {}
+    sigkill = cast(int, harness.SIGKILL_NUMBER)
+
+    class Process:
+        stdout = io.BytesIO(intent)
+        stderr = io.BytesIO(b"")
+
+        def wait(self, *, timeout: int) -> int:
+            observed["timeout"] = timeout
+            return -sigkill
+
+        @staticmethod
+        def poll() -> int:
+            return -sigkill
+
+        @staticmethod
+        def kill() -> None:
+            raise AssertionError("completed SIGKILL child must not be killed again")
+
+    def popen(command: tuple[str, ...], **_kwargs: object) -> Process:
+        observed["command"] = command
+        return Process()
+
+    monkeypatch.setattr(
+        harness,
+        "_crash_cell_coordinates",
+        lambda work, operation, cutpoint: ("cell", 180, work / "catalog.sqlite3"),
+    )
+    monkeypatch.setattr(harness.subprocess, "Popen", popen)
+    value = harness._run_crash_subprocess(
+        bundle=tmp_path,
+        work=tmp_path,
+        expected_manifest_sha256="a" * 64,
+        expected_commit="b" * 40,
+        operation="FINALIZE",
+        cutpoint="AFTER_INTENT",
+    )
+    command = cast(tuple[str, ...], observed["command"])
+    assert str(value) == intent.decode("ascii").strip()
+    assert command[:4] == (
+        sys.executable,
+        "-I",
+        str(tmp_path / "run.py"),
+        "--crash-cell",
+    )
+    assert command[command.index("--cell-operation") + 1] == "FINALIZE"
+    assert command[command.index("--cell-cutpoint") + 1] == "AFTER_INTENT"
+
+
+def test_after_complete_sigkill_occurs_before_catalog_context_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from uuid import UUID
+
+    import dashcam.catalog.database as database
+    import dashcam.catalog.filesystem as filesystem_module
+
+    events: list[str] = []
+    intent_id = UUID("12345678-1234-4abc-8def-1234567890ab")
+    clip = SimpleNamespace(clip_id=UUID(int=181))
+
+    class ProcessKilled(RuntimeError):
+        pass
+
+    class Catalog:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def __enter__(self) -> Catalog:
+            events.append("enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("exit")
+
+        def prepare_delete(self, *_args: object, **_kwargs: object) -> UUID:
+            events.append("prepare")
+            return intent_id
+
+        def reconcile_intent(self, *_args: object, **_kwargs: object) -> object:
+            events.append("reconcile")
+            return SimpleNamespace(complete=True, problems=())
+
+    class Filesystem:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    def killed(_pid: int, number: int) -> None:
+        assert number == harness.SIGKILL_NUMBER
+        events.append("kill")
+        raise ProcessKilled
+
+    monkeypatch.setattr(database, "ClipCatalog", Catalog)
+    monkeypatch.setattr(filesystem_module, "RootedFilesystem", Filesystem)
+    monkeypatch.setattr(
+        harness,
+        "_crash_fixture",
+        lambda _operation, _order: (clip, None, None),
+    )
+    monkeypatch.setattr(harness, "_device_id", lambda _root: "1:1")
+    monkeypatch.setattr(harness, "_write_all", lambda _descriptor, _payload: None)
+    monkeypatch.setattr(harness.os, "kill", killed)
+
+    with pytest.raises(ProcessKilled):
+        harness._prepare_crash_intent(
+            tmp_path / "cell.sqlite3",
+            tmp_path,
+            operation="DELETE",
+            cutpoint="AFTER_COMPLETE",
+            order=180,
+        )
+    assert events == ["enter", "prepare", "reconcile", "kill", "exit"]
+
+
+def test_crash_subprocess_timeout_kills_and_joins_exact_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[object] = []
+    sigkill = cast(int, harness.SIGKILL_NUMBER)
+
+    class Process:
+        stdout = io.BytesIO(b"")
+        stderr = io.BytesIO(b"")
+        finished = False
+
+        def wait(self, *, timeout: int) -> int:
+            calls.append(("wait", timeout))
+            if not self.finished:
+                raise subprocess.TimeoutExpired("crash-cell", timeout)
+            return -sigkill
+
+        def poll(self) -> int | None:
+            return -sigkill if self.finished else None
+
+        def kill(self) -> None:
+            calls.append("kill")
+            self.finished = True
+
+    process = Process()
+    monkeypatch.setattr(
+        harness,
+        "_crash_cell_coordinates",
+        lambda work, operation, cutpoint: ("cell", 180, work / "catalog.sqlite3"),
+    )
+    monkeypatch.setattr(harness.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    with pytest.raises(harness.HarnessError, match="timeout"):
+        harness._run_crash_subprocess(
+            bundle=tmp_path,
+            work=tmp_path,
+            expected_manifest_sha256="a" * 64,
+            expected_commit="b" * 40,
+            operation="DELETE",
+            cutpoint="AFTER_MEMBER2",
+        )
+    assert calls == [("wait", harness.CRASH_CELL_TIMEOUT_S), "kill", ("wait", 5)]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        (0, b"12345678-1234-4abc-8def-1234567890ab\n", b""),
+        (-9, b"not-a-uuid\n", b""),
+        (-9, b"12345678-1234-4abc-8def-1234567890ab\n", b"REFUSED: private\n"),
+    ],
+)
+def test_crash_subprocess_rejects_non_sigkill_malformed_or_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(stdout)
+            self.stderr = io.BytesIO(stderr)
+
+        def wait(self, *, timeout: int) -> int:
+            assert timeout == harness.CRASH_CELL_TIMEOUT_S
+            return returncode
+
+        def poll(self) -> int:
+            return returncode
+
+        @staticmethod
+        def kill() -> None:
+            raise AssertionError("completed child must not be killed again")
+
+    monkeypatch.setattr(
+        harness,
+        "_crash_cell_coordinates",
+        lambda work, operation, cutpoint: ("cell", 180, work / "catalog.sqlite3"),
+    )
+    monkeypatch.setattr(harness.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    with pytest.raises(harness.HarnessError, match="exact SIGKILL"):
+        harness._run_crash_subprocess(
+            bundle=tmp_path,
+            work=tmp_path,
+            expected_manifest_sha256="a" * 64,
+            expected_commit="b" * 40,
+            operation="PROTECT",
+            cutpoint="AFTER_COMPLETE",
+        )
 
 
 @pytest.mark.parametrize(
@@ -705,6 +1053,21 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     ) in source
     assert "MAX_FILLER_BYTES" in source
     assert "MAX_RECLAIM_STEPS" in source
+    assert "CRASH_CELL_COUNT" in source
+    assert '"--crash-cell"' in source
+    assert '"--cell-operation"' in source
+    assert '"--cell-cutpoint"' in source
+    assert "--cell-catalog" not in source
+    assert "--cell-root" not in source
+    assert source.count("os.kill(os.getpid(), SIGKILL_NUMBER)") == 3
+    assert '"sigkill-all-operation-cutpoint-matrix"' not in source
+    for function in (
+        '"crash_cell"',
+        '"prepare_crash_intent"',
+        '"run_crash_subprocess"',
+        '"validate_crash_cell_environment"',
+    ):
+        assert function in source
     assert "os.posix_fallocate" in source
     assert source.count("os.posix_fallocate") == 2
     assert "stream.write" not in source
@@ -730,4 +1093,7 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "production_release_tested=false" in readme
     assert "physical_power_loss_tested=false" in readme
     assert "m10_exit_gate_closed=false" in readme
+    assert "sixteen actual process-`SIGKILL` cells" in readme
+    assert "not physical-power-loss evidence" in readme
+    assert "900-second timeout" in readme
     assert "must not be committed" in readme

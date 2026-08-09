@@ -10,7 +10,7 @@ from typing import Final
 
 from dashcam.recorder.status import RecorderStatus
 
-RUNTIME_SNAPSHOT_SCHEMA_VERSION: Final = 2
+RUNTIME_SNAPSHOT_SCHEMA_VERSION: Final = 3
 DEFAULT_STATUS_PATH: Final = Path("/run/dashcam/status.json")
 MAX_SNAPSHOT_BYTES: Final = 32 * 1024
 MAX_SNAPSHOT_DEPTH: Final = 8

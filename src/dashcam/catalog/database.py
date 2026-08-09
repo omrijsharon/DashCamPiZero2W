@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final, cast
 from uuid import UUID, uuid4
@@ -52,7 +53,7 @@ from dashcam.storage.retention import (
     select_oldest_eligible,
 )
 
-SCHEMA_VERSION: Final = 4
+SCHEMA_VERSION: Final = 5
 MAX_PENDING_EVENT_WINDOWS: Final = 64
 MAX_QUERY_ROWS: Final = 10_000
 _MAX_REASON_CHARS: Final = 256
@@ -195,7 +196,40 @@ _MIGRATIONS: Final[tuple[tuple[int, str, tuple[str, ...]], ...]] = (
             """,
         ),
     ),
+    (
+        5,
+        "add_retention_threshold_latch",
+        (
+            """
+            CREATE TABLE retention_threshold_latch (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                volume_uuid TEXT NOT NULL,
+                capacity_bytes INTEGER NOT NULL CHECK (capacity_bytes > 0),
+                reclaim_latched INTEGER NOT NULL
+                    CHECK (reclaim_latched IN (0, 1))
+            )
+            """,
+        ),
+    ),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionThresholdLatch:
+    """Durable hysteresis state bound to one verified filesystem contract."""
+
+    volume_uuid: str
+    capacity_bytes: int
+    reclaim_latched: bool
+
+    def __post_init__(self) -> None:
+        if not self.volume_uuid or len(self.volume_uuid) > 128:
+            raise ValueError("volume_uuid must be a bounded non-empty string")
+        _non_negative_integer(self.capacity_bytes, "capacity_bytes")
+        if self.capacity_bytes == 0:
+            raise ValueError("capacity_bytes must be positive")
+        if not isinstance(self.reclaim_latched, bool):
+            raise TypeError("reclaim_latched must be boolean")
 
 
 class ClipCatalog:
@@ -252,6 +286,57 @@ class ClipCatalog:
         if not 0 <= value <= 9_223_372_036_854_775_807:
             raise CatalogConflictError("retention ordering space is exhausted")
         return value
+
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None:
+        """Load the singleton hysteresis latch without changing catalog state."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM retention_threshold_latch WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return RetentionThresholdLatch(
+            volume_uuid=str(row["volume_uuid"]),
+            capacity_bytes=int(row["capacity_bytes"]),
+            reclaim_latched=bool(row["reclaim_latched"]),
+        )
+
+    def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None:
+        """Persist one transition before a caller publishes or acts on it."""
+
+        if not isinstance(latch, RetentionThresholdLatch):
+            raise TypeError("latch must be RetentionThresholdLatch")
+        with self._transaction():
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO retention_threshold_latch (
+                    singleton, volume_uuid, capacity_bytes, reclaim_latched
+                ) VALUES (1, ?, ?, ?)
+                """,
+                (
+                    latch.volume_uuid,
+                    latch.capacity_bytes,
+                    int(latch.reclaim_latched),
+                ),
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE retention_threshold_latch
+                SET reclaim_latched = ?
+                WHERE singleton = 1
+                  AND volume_uuid = ? AND capacity_bytes = ?
+                """,
+                (
+                    int(latch.reclaim_latched),
+                    latch.volume_uuid,
+                    latch.capacity_bytes,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CatalogConflictError(
+                    "retention threshold latch binding differs from durable state"
+                )
 
     def register_clip(self, clip: CatalogClip, *, catalog_now_ns: int = 0) -> None:
         """Insert one new managed clip without overwriting existing durable state."""

@@ -51,7 +51,7 @@ from dashcam.storage.naming import ClipNameError, parse_clip_filename, provision
 PIPELINE_DESCRIPTION = (
     "libcamerasrc name=camera ! "
     'capsfilter name=overlay_input caps="video/x-raw,width=(int)1920,'
-    "height=(int)1080,format=(string)NV12,framerate=(fraction)30/1\" ! "
+    'height=(int)1080,format=(string)NV12,framerate=(fraction)30/1" ! '
     "v4l2h264enc name=encoder "
     'extra-controls="controls,repeat_sequence_header=1,video_bitrate=8000000,'
     'h264_i_frame_period=30" ! '
@@ -123,6 +123,10 @@ class AudioStartupError(RecoverablePipelineError):
     """A startup failure proven to be confined to the optional audio branch."""
 
 
+class RecordingStorageNoSpaceError(RecoverablePipelineError):
+    """The fixed recording sink reported structured target-volume exhaustion."""
+
+
 class AudioRestorationCriticalError(GStreamerDriverError):
     """Restoration crossed the route boundary without a proven safe rollback."""
 
@@ -156,6 +160,7 @@ class BusMessage:
     detail: str = ""
     fragment: FragmentMessage | None = None
     source_name: str | None = None
+    recording_storage_no_space: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,8 +380,7 @@ class ForcedIdrProof:
             != self.downstream_event_monotonic_ns - self.request_monotonic_ns
             or self.downstream_to_idr_ns
             != self.idr_arrival_monotonic_ns - self.downstream_event_monotonic_ns
-            or self.request_to_idr_ns
-            != self.idr_arrival_monotonic_ns - self.request_monotonic_ns
+            or self.request_to_idr_ns != self.idr_arrival_monotonic_ns - self.request_monotonic_ns
             or self.event_to_idr_media_ns
             != self.forced_idr_running_time_ns - self.downstream_running_time_ns
             or self.edge_skew_ns
@@ -1552,14 +1556,11 @@ def _validate_overlay_text(text: str | None) -> None:
     if not isinstance(text, str):
         raise ValueError("overlay text must be a string or None")
     lines = text.split("\n")
-    if (
-        len(lines) > _MAX_OVERLAY_LINES
-        or any(
-            len(line) > _MAX_OVERLAY_LINE_CHARS
-            or not line.isascii()
-            or any(not character.isprintable() for character in line)
-            for line in lines
-        )
+    if len(lines) > _MAX_OVERLAY_LINES or any(
+        len(line) > _MAX_OVERLAY_LINE_CHARS
+        or not line.isascii()
+        or any(not character.isprintable() for character in line)
+        for line in lines
     ):
         raise ValueError("overlay text exceeds the fixed two-line ASCII bounds")
     validate_native_overlay_text(text, OVERLAY_1080P_LAYOUT)
@@ -2290,8 +2291,7 @@ class GStreamerBackend:
                     )
                     exact_match_count += int(exact_match)
                     not_found = (
-                        outcome.status is AudioDiscoveryStatus.NOT_FOUND
-                        and outcome.device is None
+                        outcome.status is AudioDiscoveryStatus.NOT_FOUND and outcome.device is None
                     )
                     stable_not_found = stable_not_found and not_found
                     observations.append(
@@ -2469,6 +2469,10 @@ class GStreamerBackend:
                 await self._poll_audio_restoration(pipeline, driver)
                 continue
             if message.kind is BusMessageKind.ERROR:
+                if message.recording_storage_no_space:
+                    raise RecordingStorageNoSpaceError(
+                        "GStreamer recording sink reported no space left"
+                    )
                 raise RecoverablePipelineError(
                     f"GStreamer pipeline error: {_bounded_detail(message.detail)}"
                 )
@@ -2968,8 +2972,7 @@ class PyGObjectGStreamerDriver:
             )
         )
         video = (
-            gate
-            + f"valve name={prefix}_video_valve drop=true "
+            gate + f"valve name={prefix}_video_valve drop=true "
             "drop-mode=forward-sticky-events ! "
             f"queue name={prefix}_video_queue max-size-buffers=60 "
             "max-size-bytes=4000000 max-size-time=2000000000 leaky=no ! "
@@ -3013,9 +3016,7 @@ class PyGObjectGStreamerDriver:
         video_gate_queue = (
             None
             if has_audio
-            else self._method(generation_bin, "get_by_name")(
-                f"{prefix}_video_gate_queue"
-            )
+            else self._method(generation_bin, "get_by_name")(f"{prefix}_video_gate_queue")
         )
         audio_valve = (
             self._method(generation_bin, "get_by_name")(f"{prefix}_audio_valve")
@@ -3191,9 +3192,10 @@ class PyGObjectGStreamerDriver:
                                 )
                             else:
                                 generation.last_audio_end_running_time_ns = end_running_time
-                        if generation.streaming_error is None and len(
-                            generation.audio_running_times
-                        ) >= _MAX_AUDIO_TIMESTAMPS:
+                        if (
+                            generation.streaming_error is None
+                            and len(generation.audio_running_times) >= _MAX_AUDIO_TIMESTAMPS
+                        ):
                             generation.streaming_error = (
                                 "audio running-time observation exceeded its bound"
                             )
@@ -3310,10 +3312,7 @@ class PyGObjectGStreamerDriver:
         if generation.linked or generation.audio_valve is None:
             return False
         try:
-            return (
-                bool(self._method(generation.audio_valve, "get_property")("drop"))
-                is True
-            )
+            return bool(self._method(generation.audio_valve, "get_property")("drop")) is True
         except GStreamerDriverError:
             return False
 
@@ -3498,9 +3497,7 @@ class PyGObjectGStreamerDriver:
                     ),
                 }
             ):
-                raise GStreamerDriverError(
-                    "retiring generation EOS has no exact A/V closure proof"
-                )
+                raise GStreamerDriverError("retiring generation EOS has no exact A/V closure proof")
             done = Event()
             done.set()
             completed_thread = Thread(
@@ -3736,8 +3733,7 @@ class PyGObjectGStreamerDriver:
             raise GStreamerDriverError("forced-IDR request activation ownership drifted")
         if dispatch.error is not None:
             raise GStreamerDriverError(
-                "forced-IDR request dispatch failed: "
-                f"{_bounded_detail(dispatch.error)}"
+                f"forced-IDR request dispatch failed: {_bounded_detail(dispatch.error)}"
             )
         if dispatch.accepted is not True:
             raise GStreamerDriverError("encoder source refused forced-IDR request")
@@ -3847,33 +3843,27 @@ class PyGObjectGStreamerDriver:
         )
         boundary = generation.audio_eos.boundary_kind()
         after = generation.audio_eos.generation_snapshot()
-        if (
-            boundary != "GENERATION"
-            or after
-            not in {
-                (
-                    "GENERATION",
-                    1,
-                    generation_seqnum_raw,
-                    generation_seqnum_raw,
-                    0,
-                    False,
-                    True,
-                ),
-                (
-                    "GENERATION",
-                    1,
-                    generation_seqnum_raw,
-                    generation_seqnum_raw,
-                    1,
-                    False,
-                    True,
-                ),
-            }
-        ):
-            raise GStreamerDriverError(
-                "generation EOS has no exact A/V retirement acceptance"
-            )
+        if boundary != "GENERATION" or after not in {
+            (
+                "GENERATION",
+                1,
+                generation_seqnum_raw,
+                generation_seqnum_raw,
+                0,
+                False,
+                True,
+            ),
+            (
+                "GENERATION",
+                1,
+                generation_seqnum_raw,
+                generation_seqnum_raw,
+                1,
+                False,
+                True,
+            ),
+        }:
+            raise GStreamerDriverError("generation EOS has no exact A/V retirement acceptance")
         generation.video_retirement_eos_sent = True
         generation.generation_retirement_eos_seqnum = generation_seqnum_raw
         self._trace_handoff(
@@ -4632,21 +4622,14 @@ class PyGObjectGStreamerDriver:
                     )
             context.retirement_dispatches.clear()
             for audio_dispatch in context.audio_retirement_dispatches:
-                if not audio_dispatch.done.wait(
-                    max(dispatch_deadline - time.monotonic(), 0)
-                ):
+                if not audio_dispatch.done.wait(max(dispatch_deadline - time.monotonic(), 0)):
                     raise GStreamerDriverError(
                         f"{audio_dispatch.label} worker survived parent NULL"
                     )
                 if audio_dispatch.thread is not None:
                     audio_dispatch.thread.join(timeout=0)
-                if (
-                    audio_dispatch.thread is not None
-                    and audio_dispatch.thread.is_alive()
-                ):
-                    raise GStreamerDriverError(
-                        f"{audio_dispatch.label} worker did not terminate"
-                    )
+                if audio_dispatch.thread is not None and audio_dispatch.thread.is_alive():
+                    raise GStreamerDriverError(f"{audio_dispatch.label} worker did not terminate")
                 if audio_dispatch.error is not None:
                     raise GStreamerDriverError(
                         f"{audio_dispatch.label} worker failed: "
@@ -4654,21 +4637,14 @@ class PyGObjectGStreamerDriver:
                     )
             context.audio_retirement_dispatches.clear()
             for force_dispatch in context.force_key_dispatches:
-                if not force_dispatch.done.wait(
-                    max(dispatch_deadline - time.monotonic(), 0)
-                ):
+                if not force_dispatch.done.wait(max(dispatch_deadline - time.monotonic(), 0)):
                     raise GStreamerDriverError(
                         f"{force_dispatch.label} worker survived parent NULL"
                     )
                 if force_dispatch.thread is not None:
                     force_dispatch.thread.join(timeout=0)
-                if (
-                    force_dispatch.thread is not None
-                    and force_dispatch.thread.is_alive()
-                ):
-                    raise GStreamerDriverError(
-                        f"{force_dispatch.label} worker did not terminate"
-                    )
+                if force_dispatch.thread is not None and force_dispatch.thread.is_alive():
+                    raise GStreamerDriverError(f"{force_dispatch.label} worker did not terminate")
                 if force_dispatch.error is not None:
                     raise GStreamerDriverError(
                         f"{force_dispatch.label} worker failed: "
@@ -5748,6 +5724,23 @@ class PyGObjectGStreamerDriver:
             generation.audio_running_times.popleft()
         return units
 
+    def _is_recording_storage_no_space(self, error: object) -> bool:
+        """Match only Gst.ResourceError.NO_SPACE_LEFT without parsing text."""
+
+        matches = getattr(error, "matches", None)
+        resource_error = getattr(self._gst, "ResourceError", None)
+        if not callable(matches) or resource_error is None:
+            return False
+        quark = getattr(resource_error, "quark", None)
+        no_space_left = getattr(resource_error, "NO_SPACE_LEFT", None)
+        if not callable(quark) or no_space_left is None:
+            return False
+        try:
+            code = int(cast(SupportsInt, no_space_left))
+            return bool(matches(quark(), code))
+        except Exception:
+            return False
+
     def _poll_bus_native(self, pipeline: object, timeout_s: float) -> BusMessage:
         bus = self._method(pipeline, "get_bus")()
         if bus is None:
@@ -5795,6 +5788,7 @@ class PyGObjectGStreamerDriver:
                 error = parsed[0]
                 debug = parsed[1] if len(parsed) > 1 else ""
                 detail = _bounded_detail(f"{error}; debug={debug}")
+                recording_storage_no_space = self._is_recording_storage_no_space(error)
                 if context is not None:
                     self._trace_audio_error_source(
                         context,
@@ -5809,7 +5803,11 @@ class PyGObjectGStreamerDriver:
                     if quarantined is True:
                         return BusMessage(BusMessageKind.NONE)
                     if quarantined is False:
-                        return BusMessage(BusMessageKind.ERROR, detail)
+                        return BusMessage(
+                            BusMessageKind.ERROR,
+                            detail,
+                            recording_storage_no_space=recording_storage_no_space,
+                        )
                 source_name = self._exact_audio_message_source(
                     pipeline,
                     message,
@@ -5833,6 +5831,9 @@ class PyGObjectGStreamerDriver:
                     ),
                     detail,
                     source_name=source_name,
+                    recording_storage_no_space=(
+                        recording_storage_no_space if source_name is None else False
+                    ),
                 )
             if context is not None and context.audio_ingress_quarantine is not None:
                 return BusMessage(
@@ -6068,9 +6069,7 @@ class PyGObjectGStreamerDriver:
             )
             or context.active_generation_id != retiring.generation_id
         ):
-            raise GStreamerDriverError(
-                "critical loss shutdown has no exact retired A/V provenance"
-            )
+            raise GStreamerDriverError("critical loss shutdown has no exact retired A/V provenance")
         location = next(iter(retiring.opened))
         owner = (retiring.generation_id, retiring.activation_id)
         start_running_time_ns = retiring.opened.get(location)
@@ -6080,18 +6079,10 @@ class PyGObjectGStreamerDriver:
             or start_running_time_ns < 0
             or context.location_generation != {location: owner}
         ):
-            raise GStreamerDriverError(
-                "critical loss shutdown location ownership differs"
-            )
-        linked = [
-            candidate
-            for candidate in context.generations.values()
-            if candidate.linked
-        ]
+            raise GStreamerDriverError("critical loss shutdown location ownership differs")
+        linked = [candidate for candidate in context.generations.values() if candidate.linked]
         if len(linked) != 1:
-            raise GStreamerDriverError(
-                "critical loss shutdown has no unique closed successor"
-            )
+            raise GStreamerDriverError("critical loss shutdown has no unique closed successor")
         successor = linked[0]
         if (
             successor.generation_id not in {2, 3}
@@ -6105,9 +6096,7 @@ class PyGObjectGStreamerDriver:
                 if candidate is not retiring
             )
         ):
-            raise GStreamerDriverError(
-                "critical loss shutdown successor ownership differs"
-            )
+            raise GStreamerDriverError("critical loss shutdown successor ownership differs")
         return retiring
 
     def _shutdown_generation(
@@ -6860,9 +6849,7 @@ class PyGObjectGStreamerDriver:
         gate_queue = generation.video_gate_queue
         video_valve_sink = self._method(generation.video_valve, "get_static_pad")("sink")
         video_sink = (
-            None
-            if gate_queue is None
-            else self._method(gate_queue, "get_static_pad")("src")
+            None if gate_queue is None else self._method(gate_queue, "get_static_pad")("src")
         )
         if (
             encoder_source is None
@@ -6877,8 +6864,7 @@ class PyGObjectGStreamerDriver:
             or generation.activation_id is None
             or not generation.linked
             or generation.has_audio
-            or bool(self._method(generation.video_valve, "get_property")("drop"))
-            is not True
+            or bool(self._method(generation.video_valve, "get_property")("drop")) is not True
         ):
             raise GStreamerDriverError("forced-IDR successor ownership differs")
         if (
@@ -7042,9 +7028,7 @@ class PyGObjectGStreamerDriver:
                 if not nal5:
                     fail("correlated non-delta access unit lacks NAL type 5")
                     return probe_ok
-                downstream_running_time = int(
-                    cast(int, observed["downstream_running_time_ns"])
-                )
+                downstream_running_time = int(cast(int, observed["downstream_running_time_ns"]))
                 event_to_idr_media = running_time - downstream_running_time
                 if event_to_idr_media < 0:
                     fail("forced-IDR precedes its correlated downstream event in media time")
@@ -7120,11 +7104,7 @@ class PyGObjectGStreamerDriver:
                 video_sink,
                 video_probe_id,
                 encoder_source,
-                (
-                    None
-                    if observed.get("event_probe_removed") is True
-                    else event_probe_id
-                ),
+                (None if observed.get("event_probe_removed") is True else event_probe_id),
                 release,
                 reached,
                 completed,
@@ -7222,21 +7202,11 @@ class PyGObjectGStreamerDriver:
             request_seqnum=gate.request_seqnum,
             downstream_seqnum=int(cast(int, observed["downstream_seqnum"])),
             request_monotonic_ns=gate.request_monotonic_ns,
-            downstream_event_monotonic_ns=int(
-                cast(int, observed["downstream_event_monotonic_ns"])
-            ),
-            idr_arrival_monotonic_ns=int(
-                cast(int, observed["idr_arrival_monotonic_ns"])
-            ),
-            downstream_running_time_ns=int(
-                cast(int, observed["downstream_running_time_ns"])
-            ),
-            forced_idr_running_time_ns=int(
-                cast(int, observed["forced_idr_running_time_ns"])
-            ),
-            event_to_idr_media_ns=int(
-                cast(int, observed["event_to_idr_media_ns"])
-            ),
+            downstream_event_monotonic_ns=int(cast(int, observed["downstream_event_monotonic_ns"])),
+            idr_arrival_monotonic_ns=int(cast(int, observed["idr_arrival_monotonic_ns"])),
+            downstream_running_time_ns=int(cast(int, observed["downstream_running_time_ns"])),
+            forced_idr_running_time_ns=int(cast(int, observed["forced_idr_running_time_ns"])),
+            event_to_idr_media_ns=int(cast(int, observed["event_to_idr_media_ns"])),
         )
         self._trace_handoff(
             "forced_idr_held_after_route_unblock",
@@ -7262,8 +7232,7 @@ class PyGObjectGStreamerDriver:
             isinstance(final_audio_end_running_time_ns, bool)
             or not isinstance(final_audio_end_running_time_ns, int)
             or final_audio_end_running_time_ns < 0
-            or generation.last_audio_end_running_time_ns
-            != final_audio_end_running_time_ns
+            or generation.last_audio_end_running_time_ns != final_audio_end_running_time_ns
         ):
             raise GStreamerDriverError(
                 "final AAC access-unit end is unavailable or changed after audio drain"
@@ -7271,9 +7240,7 @@ class PyGObjectGStreamerDriver:
         held = gate.held
         if held is None:
             raise GStreamerDriverError("forced-IDR gate has no held IDR")
-        edge_skew_ns = (
-            held.forced_idr_running_time_ns - final_audio_end_running_time_ns
-        )
+        edge_skew_ns = held.forced_idr_running_time_ns - final_audio_end_running_time_ns
         if not 0 <= edge_skew_ns < _FORCED_IDR_EDGE_BOUND_NS:
             raise GStreamerDriverError(
                 "forced-IDR/audio edge skew violates the 100 ms production bound "
@@ -7297,12 +7264,9 @@ class PyGObjectGStreamerDriver:
                     held.downstream_event_monotonic_ns - held.request_monotonic_ns
                 ),
                 downstream_to_idr_ns=(
-                    held.idr_arrival_monotonic_ns
-                    - held.downstream_event_monotonic_ns
+                    held.idr_arrival_monotonic_ns - held.downstream_event_monotonic_ns
                 ),
-                request_to_idr_ns=(
-                    held.idr_arrival_monotonic_ns - held.request_monotonic_ns
-                ),
+                request_to_idr_ns=(held.idr_arrival_monotonic_ns - held.request_monotonic_ns),
                 last_audio_end_running_time_ns=final_audio_end_running_time_ns,
                 edge_skew_ns=edge_skew_ns,
             )
@@ -7370,8 +7334,7 @@ class PyGObjectGStreamerDriver:
     ) -> None:
         if (
             generation.streaming_error is not None
-            or generation.last_audio_end_running_time_ns
-            != proof.last_audio_end_running_time_ns
+            or generation.last_audio_end_running_time_ns != proof.last_audio_end_running_time_ns
         ):
             raise GStreamerDriverError(
                 generation.streaming_error
@@ -7500,10 +7463,7 @@ class PyGObjectGStreamerDriver:
 
             def freeze_inside_drain_proof_gap() -> None:
                 nonlocal frozen_audio_end, route_mutated
-                if (
-                    old.streaming_error is not None
-                    or old.last_audio_end_running_time_ns is None
-                ):
+                if old.streaming_error is not None or old.last_audio_end_running_time_ns is None:
                     raise GStreamerDriverError(
                         old.streaming_error
                         or "final AAC access-unit end is unavailable at first empty sample"
@@ -7536,8 +7496,7 @@ class PyGObjectGStreamerDriver:
                 or old.last_audio_end_running_time_ns != frozen_audio_end
             ):
                 raise GStreamerDriverError(
-                    old.streaming_error
-                    or "AAC access-unit end changed during drain proof gap"
+                    old.streaming_error or "AAC access-unit end changed during drain proof gap"
                 )
             self._trace_handoff(
                 "audio_queue_drained_before_retirement_boundary",
@@ -7625,7 +7584,7 @@ class PyGObjectGStreamerDriver:
                 raise GStreamerDriverError(
                     old.streaming_error
                     or "AAC access-unit end changed after audio retirement boundary"
-            )
+                )
             self._trace_handoff(
                 "audio_retirement_boundary_after_forced_idr_finalization",
                 last_audio_end_running_time_ns=frozen_audio_end,
@@ -7634,9 +7593,7 @@ class PyGObjectGStreamerDriver:
             self._set_generation_linked(context, old, False)
             audio_route_contained = self._audio_loss_route_is_contained(old)
             if not audio_route_contained:
-                raise GStreamerDriverError(
-                    "retiring audio route containment could not be proven"
-                )
+                raise GStreamerDriverError("retiring audio route containment could not be proven")
             self._trace_handoff("retiring_generation_unlinked_with_forced_idr_armed")
             context.loss_verified = True
             self._trace_handoff(
@@ -7819,9 +7776,7 @@ class PyGObjectGStreamerDriver:
                         self._set_generation_open(retiring, False)
                         if retiring.linked:
                             self._set_generation_linked(context, retiring, False)
-                        audio_route_contained = (
-                            self._audio_loss_route_is_contained(retiring)
-                        )
+                        audio_route_contained = self._audio_loss_route_is_contained(retiring)
                     except BaseException as containment_error:
                         self._trace_handoff_failure(
                             "audio_loss_route_containment_failed",
@@ -7836,10 +7791,7 @@ class PyGObjectGStreamerDriver:
                 and context.routing_phase != "LOSS_CONTAINMENT_CRITICAL"
                 and all(
                     dispatch.done.is_set()
-                    and (
-                        dispatch.thread is None
-                        or not dispatch.thread.is_alive()
-                    )
+                    and (dispatch.thread is None or not dispatch.thread.is_alive())
                     for dispatch in context.force_key_dispatches
                 )
             ):

@@ -138,9 +138,13 @@ def test_parser_defaults_and_explicit_paths() -> None:
 
 @pytest.mark.parametrize(
     ("outcome", "expected_exit"),
-    [(DaemonOutcome.STOPPED, 0), (DaemonOutcome.STARTUP_FAILED, 1)],
+    [
+        (DaemonOutcome.STOPPED, 0),
+        (DaemonOutcome.STORAGE_SAFETY_STOP, 0),
+        (DaemonOutcome.STARTUP_FAILED, 1),
+    ],
 )
-def test_run_daemon_maps_only_clean_stop_to_zero(
+def test_run_daemon_maps_clean_outcomes_to_zero(
     outcome: DaemonOutcome,
     expected_exit: int,
 ) -> None:

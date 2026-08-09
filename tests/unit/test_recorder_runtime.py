@@ -14,7 +14,15 @@ import pytest
 
 from dashcam.audio.alsa import AlsaCaptureDevice, AlsaIdentity
 from dashcam.audio.linux import AudioDiscoveryOutcome, AudioDiscoveryStatus
-from dashcam.config import AudioConfig, DashcamConfig, GpsConfig, VideoConfig, default_config
+from dashcam.catalog.database import RetentionThresholdLatch
+from dashcam.config import (
+    AudioConfig,
+    DashcamConfig,
+    GpsConfig,
+    StorageConfig,
+    VideoConfig,
+    default_config,
+)
 from dashcam.gps.clock import AnchorSource, UtcAnchor
 from dashcam.gps.nmea import NmeaSentence, SentenceType
 from dashcam.gps.service import GpsCounters, GpsService, GpsSnapshot
@@ -41,6 +49,7 @@ from dashcam.recorder.gstreamer import (
     FrameCounters,
     GStreamerBackend,
     OpenedFragment,
+    RecordingStorageNoSpaceError,
     SegmentedOutputConfig,
 )
 from dashcam.recorder.pipeline import (
@@ -59,10 +68,12 @@ from dashcam.recorder.runtime import (
     RecorderFinalizationFault,
     RecorderStorageFault,
     RuntimeAudioState,
+    RuntimeFinalizer,
     RuntimeLifecycleEvent,
     RuntimeLifecycleEventKind,
     RuntimeLimits,
     RuntimeObserverFault,
+    StorageSafetyStop,
     build_production_runtime,
     next_pending_sequence,
     read_short_boot_id,
@@ -81,6 +92,8 @@ from dashcam.storage.preflight import (
     RecordingRootFacts,
     SpaceFacts,
 )
+from dashcam.storage.retention import StorageThresholds
+from dashcam.storage.space import FilesystemSpaceObservation, StorageSpaceMonitor
 
 AsyncTest = Callable[[], Coroutine[Any, Any, None]]
 
@@ -180,10 +193,7 @@ class FakeBackend:
         if self.open_gate is not None:
             await self.open_gate.wait()
         return OpenedFragment(
-            Path(
-                f"/srv/dashcam/pending/boot-abcdef123456-"
-                f"{self.opened_sequence:06d}.partial.mp4"
-            ),
+            Path(f"/srv/dashcam/pending/boot-abcdef123456-{self.opened_sequence:06d}.partial.mp4"),
             self.opened_sequence,
             0,
         )
@@ -234,9 +244,7 @@ class AudioFakeBackend(FakeBackend):
 @dataclass
 class RecordingAudioFactory:
     backend: FakeBackend
-    calls: list[tuple[SegmentedOutputConfig, AudioCapturePlan]] = field(
-        default_factory=list
-    )
+    calls: list[tuple[SegmentedOutputConfig, AudioCapturePlan]] = field(default_factory=list)
 
     def __call__(
         self,
@@ -306,9 +314,7 @@ class ImmediateBackoff:
 
 @dataclass
 class CounterBackend(FakeBackend):
-    counters: FrameCounters = field(
-        default_factory=lambda: FrameCounters(0, 0, None, None)
-    )
+    counters: FrameCounters = field(default_factory=lambda: FrameCounters(0, 0, None, None))
 
     def frame_counters(self) -> FrameCounters:
         return self.counters
@@ -321,11 +327,10 @@ class FakeFinalizer:
     reconciled: int = 0
     calls: list[tuple[str, object, int]] = field(default_factory=list)
     completed: asyncio.Event = field(default_factory=asyncio.Event)
-    metadata_reconciliations: list[tuple[UUID, TimeAnchor, UUID]] = field(
-        default_factory=list
-    )
+    metadata_reconciliations: list[tuple[UUID, TimeAnchor, UUID]] = field(default_factory=list)
     metadata_attempts: int = 0
     metadata_candidate_scans: int = 0
+    retention_latch: RetentionThresholdLatch | None = None
 
     def reconcile_pending(self) -> FinalizationRecoveryReport:
         self.reconciled += 1
@@ -337,6 +342,12 @@ class FakeFinalizer:
 
     def next_retention_order(self) -> int:
         return 7
+
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None:
+        return self.retention_latch
+
+    def store_retention_threshold_latch(self, latch: RetentionThresholdLatch) -> None:
+        self.retention_latch = latch
 
     def metadata_reconciliation_candidates(
         self,
@@ -407,6 +418,40 @@ class FakeFinalizer:
 
 
 @dataclass
+class SpaceMonitorFactory:
+    observations: list[object]
+    calls: int = 0
+
+    def __call__(
+        self,
+        *,
+        storage: StorageConfig,
+        volume_uuid: str,
+        expected_device_id: str,
+        expected_capacity_bytes: int,
+        latch_store: RuntimeFinalizer,
+    ) -> StorageSpaceMonitor:
+        del storage
+        self.calls += 1
+
+        def observe() -> FilesystemSpaceObservation:
+            value = self.observations.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            assert isinstance(value, FilesystemSpaceObservation)
+            return value
+
+        return StorageSpaceMonitor(
+            volume_uuid=volume_uuid,
+            expected_device_id=expected_device_id,
+            expected_capacity_bytes=expected_capacity_bytes,
+            thresholds=StorageThresholds(15, 20, 2 * 1024**3, 256 * 1024**2),
+            observer=observe,
+            latch_store=latch_store,
+        )
+
+
+@dataclass
 class FakeGpsService:
     current_snapshot: GpsSnapshot = field(
         default_factory=lambda: GpsSnapshot(
@@ -442,9 +487,7 @@ class FakeGpsService:
         *,
         max_samples: int,
     ) -> GpsTelemetryWindow:
-        self.telemetry_requests.append(
-            (start_monotonic_ns, end_monotonic_ns, max_samples)
-        )
+        self.telemetry_requests.append((start_monotonic_ns, end_monotonic_ns, max_samples))
         if self.telemetry_error is not None:
             raise self.telemetry_error
         return GpsTelemetryWindow(
@@ -522,9 +565,7 @@ def scripted_runtime(
         boot_id_reader=lambda: "abcdef123456",
         boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
         sequence_planner=lambda root, pending, boot: next(sequences),
-        finalizer_factory=(
-            None if finalizer is None else lambda root, device: finalizer
-        ),
+        finalizer_factory=(None if finalizer is None else lambda root, device: finalizer),
         monotonic_ns=lambda: 1_000,
         ownership=CameraOwnership(),
         backoff_waiter=waiter,
@@ -559,6 +600,190 @@ def test_matching_ready_storage_is_bound_before_camera_and_first_fragment() -> N
         ]
         await runtime.stop()
         assert ownership.owner is None
+
+    run_async(scenario)
+
+
+def test_storage_monitor_retries_fresh_sample_before_reconcile_and_camera() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        backend_factory = RecordingFactory(backend)
+        finalizer = FakeFinalizer()
+        space_factory = SpaceMonitorFactory(
+            [
+                OSError("temporary stat failure"),
+                OSError("temporary stat failure"),
+                FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000),
+            ]
+        )
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=backend_factory,
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=space_factory,
+        )
+        config = default_config()
+
+        await runtime.check(config)
+        await runtime.start(config)
+
+        assert finalizer.reconciled == 1
+        assert backend.started_with == [VideoProfile()]
+        storage = runtime.runtime_snapshot()["storage_retention"]
+        assert isinstance(storage, dict)
+        assert storage["mode"] == "NORMAL"
+        assert storage["volume_uuid_suffix"] == "3EA7"
+        assert "7EED-3EA7" not in repr(storage)
+        await runtime.stop()
+
+    run_async(scenario)
+
+
+def test_startup_emergency_stops_before_reconcile_or_camera_and_stop_is_read_only() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [FilesystemSpaceObservation("179:3", 24_000_000_000, 100_000_000)]
+            ),
+        )
+        config = default_config()
+
+        await runtime.check(config)
+        with pytest.raises(StorageSafetyStop, match="EMERGENCY"):
+            await runtime.start(config)
+        await runtime.stop()
+
+        assert finalizer.reconciled == 0
+        assert finalizer.metadata_candidate_scans == 0
+        assert backend.started_with == []
+
+    run_async(scenario)
+
+
+def test_periodic_emergency_is_supervised_as_storage_safety_stop() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        finalizer = FakeFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000),
+                    FilesystemSpaceObservation("179:3", 24_000_000_000, 100_000_000),
+                ]
+            ),
+            limits=RuntimeLimits(storage_observation_interval_s=0.001),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+
+        with pytest.raises(StorageSafetyStop, match="EMERGENCY"):
+            await asyncio.wait_for(runtime.run(asyncio.Event()), timeout=0.2)
+        await runtime.stop()
+
+        storage = runtime.runtime_snapshot()["storage_retention"]
+        assert isinstance(storage, dict)
+        assert storage["stop_required"] is True
+        assert storage["reclaimer_enabled"] is False
+
+    run_async(scenario)
+
+
+def test_typed_gstreamer_no_space_is_persisted_and_stops_without_recovery() -> None:
+    async def scenario() -> None:
+        no_space = asyncio.Event()
+        backend = FakeBackend(
+            run_error=RecordingStorageNoSpaceError("recording sink exhausted"),
+            run_error_gate=no_space,
+        )
+        finalizer = FakeFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000)]
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+        await runtime.start(config)
+        no_space.set()
+
+        with pytest.raises(StorageSafetyStop, match="NO_SPACE_WRITE"):
+            await runtime.run(asyncio.Event())
+        await runtime.stop()
+
+        assert finalizer.retention_latch == RetentionThresholdLatch(
+            "7EED-3EA7", 24_000_000_000, True
+        )
+        assert runtime.runtime_snapshot()["pipeline_restart_count"] == 0
+
+    run_async(scenario)
+
+
+def test_typed_no_space_before_first_fragment_uses_storage_safety_stop() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend(run_error=RecordingStorageNoSpaceError("recording sink exhausted"))
+        finalizer = FakeFinalizer()
+        runtime = GStreamerRecorderRuntime(
+            config_path=Path("/etc/dashcam/config.toml"),
+            identity_path=Path("/etc/dashcam/storage-volume.env"),
+            backend_factory=RecordingFactory(backend),
+            preflight=FakePreflight(ready_storage_with_device()),
+            boot_id_reader=lambda: "abcdef123456",
+            boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
+            sequence_planner=lambda root, pending, boot: 0,
+            finalizer_factory=lambda root, device: finalizer,
+            ownership=CameraOwnership(),
+            storage_space_monitor_factory=SpaceMonitorFactory(
+                [FilesystemSpaceObservation("179:3", 24_000_000_000, 20_000_000_000)]
+            ),
+        )
+        config = default_config()
+        await runtime.check(config)
+
+        with pytest.raises(StorageSafetyStop, match="NO_SPACE_WRITE"):
+            await runtime.start(config)
+        await runtime.stop()
+
+        assert finalizer.retention_latch == RetentionThresholdLatch(
+            "7EED-3EA7", 24_000_000_000, True
+        )
+        assert runtime.runtime_snapshot()["pipeline_restart_count"] == 0
+        assert backend.stop_calls == 1
 
     run_async(scenario)
 
@@ -737,8 +962,7 @@ def test_overlay_uses_one_gps_anchor_model_and_hides_stale_navigation() -> None:
 
         await asyncio.wait_for(wait_for_updates(1), timeout=1)
         assert backend.overlay_texts[-1] == (
-            "2026-07-28 19:00:01  +03:00  REC\n"
-            "32.12345, 34.98765   19 km/h   ALT 12 m   SAT 8"
+            "2026-07-28 19:00:01  +03:00  REC\n32.12345, 34.98765   19 km/h   ALT 12 m   SAT 8"
         )
 
         gps.current_snapshot = replace(
@@ -747,9 +971,7 @@ def test_overlay_uses_one_gps_anchor_model_and_hides_stale_navigation() -> None:
             gps_time_state=GpsTimeState.GPS_TIME_STALE,
         )
         await asyncio.wait_for(wait_for_updates(2), timeout=1)
-        assert backend.overlay_texts[-1] == (
-            "2026-07-28 19:00:01  +03:00  REC\nGPS LOST"
-        )
+        assert backend.overlay_texts[-1] == ("2026-07-28 19:00:01  +03:00  REC\nGPS LOST")
         assert "32.12345" not in str(backend.overlay_texts[-1])
         assert runtime.runtime_snapshot()["overlay"] == {
             "enabled": True,
@@ -775,9 +997,7 @@ def test_overlay_unsynced_disabled_and_failure_paths_do_not_restart_video() -> N
         await unsynced.start(config)
         while not unsynced_backend.overlay_texts:
             await asyncio.sleep(0)
-        assert unsynced_backend.overlay_texts == [
-            "TIME UNSYNCED  REC\nGPS INVALID"
-        ]
+        assert unsynced_backend.overlay_texts == ["TIME UNSYNCED  REC\nGPS INVALID"]
         await unsynced.stop()
 
         disabled_backend = FakeBackend()
@@ -806,9 +1026,7 @@ def test_overlay_unsynced_disabled_and_failure_paths_do_not_restart_video() -> N
         )
         await failed.check(config)
         await failed.start(config)
-        while cast(dict[str, object], failed.runtime_snapshot()["overlay"])[
-            "state"
-        ] != "FAULTED":
+        while cast(dict[str, object], failed.runtime_snapshot()["overlay"])["state"] != "FAULTED":
             await asyncio.sleep(0)
         overlay_status = cast(dict[str, object], failed.runtime_snapshot()["overlay"])
         assert "overlay setter failed" in str(overlay_status["last_error"])
@@ -1044,9 +1262,7 @@ def test_trusted_gps_anchor_finalizes_canonical_sidecar_without_reconciliation(
                     provenance="NMEA:GNRMC:active-valid:complete-utc",
                 ),
             ),
-            telemetry_samples=(
-                GpsTelemetrySample(500_001_000, 32.1, 34.8, satellites=9),
-            ),
+            telemetry_samples=(GpsTelemetrySample(500_001_000, 32.1, 34.8, satellites=9),),
         )
         boot_uuid = UUID("abcdef12-3456-4789-9234-567812345678")
         runtime = GStreamerRecorderRuntime(
@@ -1079,10 +1295,7 @@ def test_trusted_gps_anchor_finalizes_canonical_sidecar_without_reconciliation(
         for sequence in range(1, 5):
             await backend.finalized.put(
                 FinalizedFragment(
-                    Path(
-                        "/srv/dashcam/pending/boot-abcdef123456-"
-                        f"{sequence:06d}.partial.mp4"
-                    ),
+                    Path(f"/srv/dashcam/pending/boot-abcdef123456-{sequence:06d}.partial.mp4"),
                     sequence,
                     (sequence + 1) * 1_000_000_000,
                 )
@@ -1090,18 +1303,10 @@ def test_trusted_gps_anchor_finalizes_canonical_sidecar_without_reconciliation(
         await asyncio.wait_for(backend.finalized.join(), timeout=1)
         sidecar = cast(ClipSidecar, finalizer.calls[0][1])
         assert sidecar.boot_id == boot_uuid
-        assert sidecar.video_file == (
-            "20260728T155959.500Z_abcdef123456_s000000.mp4"
-        )
-        assert sidecar.metadata_file == (
-            "20260728T155959.500Z_abcdef123456_s000000.json"
-        )
-        assert sidecar.start_utc == datetime(
-            2026, 7, 28, 15, 59, 59, 500_000, tzinfo=UTC
-        )
-        assert sidecar.end_utc == datetime(
-            2026, 7, 28, 16, 0, 0, 500_000, tzinfo=UTC
-        )
+        assert sidecar.video_file == ("20260728T155959.500Z_abcdef123456_s000000.mp4")
+        assert sidecar.metadata_file == ("20260728T155959.500Z_abcdef123456_s000000.json")
+        assert sidecar.start_utc == datetime(2026, 7, 28, 15, 59, 59, 500_000, tzinfo=UTC)
+        assert sidecar.end_utc == datetime(2026, 7, 28, 16, 0, 0, 500_000, tzinfo=UTC)
         assert sidecar.start_local is not None
         assert sidecar.start_local.isoformat() == "2026-07-28T18:59:59.500000+03:00"
         assert sidecar.timestamp_quality is TimestampQuality.GPS_ANCHORED
@@ -1110,9 +1315,7 @@ def test_trusted_gps_anchor_finalizes_canonical_sidecar_without_reconciliation(
         assert sidecar.time_anchor.source is TimeAnchorSource.GPS
         assert sidecar.time_anchor.monotonic_ns == 500_000_000
         assert sidecar.time_anchor.utc == datetime(2026, 7, 28, 16, 0, tzinfo=UTC)
-        assert sidecar.gps.first_fix_utc == datetime(
-            2026, 7, 28, 16, 0, tzinfo=UTC
-        )
+        assert sidecar.gps.first_fix_utc == datetime(2026, 7, 28, 16, 0, tzinfo=UTC)
         assert sidecar.gps.samples[0].utc == sidecar.gps.first_fix_utc
         assert sidecar.gps.samples[0].timestamp_quality is TimestampQuality.GPS_ANCHORED
         assert parse_sidecar_bytes(sidecar.to_canonical_json()) == sidecar
@@ -1120,8 +1323,7 @@ def test_trusted_gps_anchor_finalizes_canonical_sidecar_without_reconciliation(
         direct_sidecars = [cast(ClipSidecar, item[1]) for item in finalizer.calls]
         assert len({item.clip_id for item in direct_sidecars}) == 5
         assert all(
-            item.timestamp_quality is TimestampQuality.GPS_ANCHORED
-            for item in direct_sidecars
+            item.timestamp_quality is TimestampQuality.GPS_ANCHORED for item in direct_sidecars
         )
         assert finalizer.metadata_reconciliations == []
         assert finalizer.metadata_attempts == 0
@@ -1212,10 +1414,13 @@ def test_incoherent_close_anchor_falls_back_to_provisional_then_late_reconciles(
             time_anchor=anchor,
         )
         runtime._metadata_reconciliation_wakeup.set()
-        while cast(
-            dict[str, object],
-            runtime.runtime_snapshot()["metadata_reconciliation"],
-        )["completed"] == 0:
+        while (
+            cast(
+                dict[str, object],
+                runtime.runtime_snapshot()["metadata_reconciliation"],
+            )["completed"]
+            == 0
+        ):
             await asyncio.sleep(0)
 
         assert finalizer.metadata_reconciliations[0][0] == provisional.clip_id
@@ -1306,9 +1511,7 @@ def test_late_gps_lock_drains_bounded_same_boot_provisional_backlog(
             < 1
         ):
             await asyncio.sleep(0)
-        assert [item[0] for item in finalizer.metadata_reconciliations] == [
-            first_sidecar.clip_id
-        ]
+        assert [item[0] for item in finalizer.metadata_reconciliations] == [first_sidecar.clip_id]
 
         await backend.finalized.put(
             FinalizedFragment(
@@ -1389,9 +1592,7 @@ def test_shutdown_flushes_a_late_anchor_without_waiting_for_another_fragment() -
         )
         await runtime.stop()
 
-        assert [item[0] for item in finalizer.metadata_reconciliations] == [
-            sidecar.clip_id
-        ]
+        assert [item[0] for item in finalizer.metadata_reconciliations] == [sidecar.clip_id]
         assert runtime.runtime_snapshot()["metadata_reconciliation"] == {
             "completed": 1,
             "failures": 0,
@@ -1408,9 +1609,7 @@ def test_shutdown_flushes_a_late_anchor_without_waiting_for_another_fragment() -
 def test_metadata_reconciliation_failure_is_reported_but_video_remains_running() -> None:
     async def scenario() -> None:
         backend = FakeBackend()
-        finalizer = FakeFinalizer(
-            metadata_error=RuntimeError("optional metadata collision")
-        )
+        finalizer = FakeFinalizer(metadata_error=RuntimeError("optional metadata collision"))
         gps = FakeGpsService(
             current_snapshot=GpsSnapshot(
                 state=GpsState.NAVIGATION_VALID,
@@ -1447,10 +1646,13 @@ def test_metadata_reconciliation_failure_is_reported_but_video_remains_running()
                 1_000_000_000,
             )
         )
-        while cast(
-            dict[str, object],
-            runtime.runtime_snapshot()["metadata_reconciliation"],
-        )["failures"] == 0:
+        while (
+            cast(
+                dict[str, object],
+                runtime.runtime_snapshot()["metadata_reconciliation"],
+            )["failures"]
+            == 0
+        ):
             await asyncio.sleep(0)
 
         snapshot = runtime.runtime_snapshot()["metadata_reconciliation"]
@@ -1472,9 +1674,7 @@ def test_metadata_reconciliation_failure_is_reported_but_video_remains_running()
 def test_terminal_metadata_refusal_is_parked_without_repeated_media_work() -> None:
     async def scenario() -> None:
         backend = FakeBackend()
-        finalizer = FakeFinalizer(
-            metadata_error=MetadataReconciliationRefused("target collision")
-        )
+        finalizer = FakeFinalizer(metadata_error=MetadataReconciliationRefused("target collision"))
         gps = FakeGpsService(
             current_snapshot=GpsSnapshot(
                 state=GpsState.NAVIGATION_VALID,
@@ -1511,10 +1711,13 @@ def test_terminal_metadata_refusal_is_parked_without_repeated_media_work() -> No
                 1_000_000_000,
             )
         )
-        while cast(
-            dict[str, object],
-            runtime.runtime_snapshot()["metadata_reconciliation"],
-        )["parked"] == 0:
+        while (
+            cast(
+                dict[str, object],
+                runtime.runtime_snapshot()["metadata_reconciliation"],
+            )["parked"]
+            == 0
+        ):
             await asyncio.sleep(0)
         await asyncio.sleep(0.04)
 
@@ -1568,10 +1771,13 @@ def test_nonretryable_metadata_refusal_is_parked_without_media_restart() -> None
                 1_000_000_000,
             )
         )
-        while cast(
-            dict[str, object],
-            runtime.runtime_snapshot()["metadata_reconciliation"],
-        )["parked"] == 0:
+        while (
+            cast(
+                dict[str, object],
+                runtime.runtime_snapshot()["metadata_reconciliation"],
+            )["parked"]
+            == 0
+        ):
             await asyncio.sleep(0)
 
         assert runtime.runtime_snapshot()["metadata_reconciliation"] == {
@@ -1732,9 +1938,7 @@ def test_pending_sequence_scan_is_bounded_and_pair_collision_safe(tmp_path: Path
         directory.mkdir(parents=True, exist_ok=True)
     (pending / "boot-abcdef123456-000000.partial.mp4").write_bytes(b"")
     (pending / "boot-abcdef123456-000001.partial.json").write_bytes(b"")
-    (
-        clips / "20260726T120000.000Z_ABCDEF123456_s000005.MP4"
-    ).write_bytes(b"")
+    (clips / "20260726T120000.000Z_ABCDEF123456_s000005.MP4").write_bytes(b"")
     (protected / "BOOT-ABCDEF123456-000007.JSON").write_bytes(b"")
 
     assert next_pending_sequence(recording_root, pending, "abcdef123456") == 8
@@ -1882,12 +2086,8 @@ def test_recoverable_runtime_error_gets_fresh_storage_sequence_and_backend() -> 
             run_error_gate=failure_gate,
             counters=FrameCounters(90, 88, 2, "encoder_input_pts"),
         )
-        second = CounterBackend(
-            counters=FrameCounters(30, 30, 0, "encoder_input_pts")
-        )
-        preflight = ScriptedPreflight(
-            [ready_storage_with_device(), ready_storage_with_device()]
-        )
+        second = CounterBackend(counters=FrameCounters(30, 30, 0, "encoder_input_pts"))
+        preflight = ScriptedPreflight([ready_storage_with_device(), ready_storage_with_device()])
         waiter = ImmediateBackoff()
         runtime, factory = scripted_runtime(
             [first, second],
@@ -1966,9 +2166,7 @@ def test_recovery_is_bounded_to_exact_one_two_four_delays_then_exhausts() -> Non
         assert len(factory.outputs) == 4
         assert len(preflight.calls) == 4
         assert runtime.runtime_snapshot()["pipeline_restart_count"] == 3
-        assert [event.kind for event in events].count(
-            RuntimeLifecycleEventKind.RESTARTING
-        ) == 3
+        assert [event.kind for event in events].count(RuntimeLifecycleEventKind.RESTARTING) == 3
         assert events[-1].kind is RuntimeLifecycleEventKind.EXHAUSTED
         assert all(backend.stop_calls == 1 for backend in backends)
 
@@ -2478,9 +2676,7 @@ def test_invalid_selector_is_bounded_fault_and_never_reaches_discovery() -> None
 
 def test_typed_audio_startup_failure_falls_back_once_with_fresh_sequence() -> None:
     async def scenario() -> None:
-        audio_backend = AudioFakeBackend(
-            start_error=AudioStartupError("AAC negotiation failed")
-        )
+        audio_backend = AudioFakeBackend(start_error=AudioStartupError("AAC negotiation failed"))
         video_backend = FakeBackend()
         video_factory = RecordingFactory(video_backend)
         audio_factory = RecordingAudioFactory(audio_backend)
@@ -2496,9 +2692,7 @@ def test_typed_audio_startup_failure_falls_back_once_with_fresh_sequence() -> No
             identity_path=Path("/etc/dashcam/storage-volume.env"),
             backend_factory=video_factory,
             audio_backend_factory=cast(AudioBackendFactory, audio_factory),
-            audio_discovery=cast(
-                AudioDiscoverer, lambda _selector: matched_audio_outcome()
-            ),
+            audio_discovery=cast(AudioDiscoverer, lambda _selector: matched_audio_outcome()),
             preflight=FakePreflight(),
             boot_id_reader=lambda: "abcdef123456",
             sequence_planner=plan_sequence,
@@ -2535,12 +2729,8 @@ def test_unclassified_matched_graph_failure_does_not_weaken_camera_fault() -> No
             config_path=Path("/etc/dashcam/config.toml"),
             identity_path=Path("/etc/dashcam/storage-volume.env"),
             backend_factory=video_factory,
-            audio_backend_factory=cast(
-                AudioBackendFactory, RecordingAudioFactory(audio_backend)
-            ),
-            audio_discovery=cast(
-                AudioDiscoverer, lambda _selector: matched_audio_outcome()
-            ),
+            audio_backend_factory=cast(AudioBackendFactory, RecordingAudioFactory(audio_backend)),
+            audio_discovery=cast(AudioDiscoverer, lambda _selector: matched_audio_outcome()),
             preflight=FakePreflight(),
             boot_id_reader=lambda: "abcdef123456",
             sequence_planner=lambda root, pending, boot: 4,
@@ -2572,9 +2762,7 @@ def test_sidecar_audio_truth_requires_effective_caps_and_fragment_access_units(
             identity_path=Path("/etc/dashcam/storage-volume.env"),
             backend_factory=RecordingFactory(FakeBackend()),
             audio_backend_factory=cast(AudioBackendFactory, audio_factory),
-            audio_discovery=cast(
-                AudioDiscoverer, lambda _selector: matched_audio_outcome()
-            ),
+            audio_discovery=cast(AudioDiscoverer, lambda _selector: matched_audio_outcome()),
             preflight=FakePreflight(ready_storage_with_device()),
             boot_id_reader=lambda: "abcdef123456",
             boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
@@ -2623,12 +2811,8 @@ def test_generation_contract_keeps_audio_truth_and_timing_on_late_closures() -> 
             config_path=Path("/etc/dashcam/config.toml"),
             identity_path=Path("/etc/dashcam/storage-volume.env"),
             backend_factory=RecordingFactory(FakeBackend()),
-            audio_backend_factory=cast(
-                AudioBackendFactory, RecordingAudioFactory(backend)
-            ),
-            audio_discovery=cast(
-                AudioDiscoverer, lambda _selector: matched_audio_outcome()
-            ),
+            audio_backend_factory=cast(AudioBackendFactory, RecordingAudioFactory(backend)),
+            audio_discovery=cast(AudioDiscoverer, lambda _selector: matched_audio_outcome()),
             preflight=FakePreflight(ready_storage_with_device()),
             boot_id_reader=lambda: "abcdef123456",
             boot_uuid_reader=lambda: UUID("12345678-1234-5678-9234-567812345678"),
@@ -2714,12 +2898,8 @@ def test_runtime_imports_the_current_restored_endpoint_and_alsa_identity() -> No
             config_path=Path("/etc/dashcam/config.toml"),
             identity_path=Path("/etc/dashcam/storage-volume.env"),
             backend_factory=RecordingFactory(FakeBackend()),
-            audio_backend_factory=cast(
-                AudioBackendFactory, RecordingAudioFactory(backend)
-            ),
-            audio_discovery=cast(
-                AudioDiscoverer, lambda _selector: matched_audio_outcome()
-            ),
+            audio_backend_factory=cast(AudioBackendFactory, RecordingAudioFactory(backend)),
+            audio_discovery=cast(AudioDiscoverer, lambda _selector: matched_audio_outcome()),
             preflight=FakePreflight(),
             boot_id_reader=lambda: "abcdef123456",
             sequence_planner=lambda root, pending, boot: 0,

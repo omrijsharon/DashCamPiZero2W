@@ -23,6 +23,7 @@ from dashcam.recorder.runtime import (
     RuntimeLifecycleEventKind,
     RuntimeLifecycleObserver,
     RuntimeLimits,
+    StorageSafetyStop,
 )
 from dashcam.recorder.status import RecorderReason
 from dashcam.state import RecorderState, StorageState
@@ -573,6 +574,11 @@ def test_config_error_is_reported_without_starting_runtime(tmp_path: Path) -> No
             RecorderReason.STORAGE_FAULT,
         ),
         (
+            FakeRuntime(start_error=StorageSafetyStop("emergency reserve reached")),
+            DaemonOutcome.STORAGE_SAFETY_STOP,
+            RecorderReason.STORAGE_FAULT,
+        ),
+        (
             FakeRuntime(run_gate=asyncio.Event()),
             DaemonOutcome.RUNTIME_EXITED,
             RecorderReason.RUNTIME_EXITED,
@@ -605,6 +611,7 @@ def test_runtime_failure_paths_are_visible_and_bounded(
         assert result.final_status.state is RecorderState.FAULTED
         assert result.final_status.reason is reason
         assert runtime.stop_calls == 1
+        assert result.clean is (outcome is DaemonOutcome.STORAGE_SAFETY_STOP)
 
     run_async(scenario)
 
@@ -859,6 +866,35 @@ def test_terminal_runtime_faults_keep_their_stable_reason(
 
         assert result.outcome is DaemonOutcome.RUNTIME_FAILED
         assert result.final_status.reason is reason
+
+    run_async(scenario)
+
+
+def test_runtime_storage_safety_stop_is_critical_but_process_clean() -> None:
+    async def scenario() -> None:
+        run_gate = asyncio.Event()
+        runtime = FakeRuntime(
+            run_gate=run_gate,
+            run_error=StorageSafetyStop("emergency threshold reached"),
+        )
+        daemon = RecorderDaemon(
+            config_path="config.toml",
+            runtime=runtime,
+            config_loader=lambda path: default_config(),
+            limits=fast_limits(),
+        )
+        task = asyncio.create_task(daemon.run())
+        while daemon.status.state is not RecorderState.RECORDING:
+            await asyncio.sleep(0)
+        run_gate.set()
+
+        result = await task
+
+        assert result.outcome is DaemonOutcome.STORAGE_SAFETY_STOP
+        assert result.clean
+        assert result.final_status.state is RecorderState.FAULTED
+        assert result.final_status.reason is RecorderReason.STORAGE_FAULT
+        assert runtime.stop_calls == 1
 
     run_async(scenario)
 

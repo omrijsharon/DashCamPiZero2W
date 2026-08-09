@@ -481,14 +481,90 @@ def test_publication_occurs_after_cleanup_barrier_and_removes_failed_output(
     )
 
 
-def test_safe_worker_refusal_exposes_only_digest_and_size() -> None:
-    private = b"REFUSED: SSID MyHome PSK hunter2 coordinates 32.1,34.8\n"
-    detail = harness._safe_worker_refusal_detail(private)
-    assert detail == (
-        "worker-stderr-sha256=" + hashlib.sha256(private).hexdigest() + f",bytes={len(private)}"
-    )
-    for fragment in ("MyHome", "hunter2", "32.1", "34.8", "REFUSED"):
-        assert fragment not in detail
+def test_safe_worker_refusal_accepts_only_exact_category_line_and_digests_everything_else() -> None:
+    lines = harness._reviewed_function_lines()
+    valid_line = min(lines["worker_refusal_line"])
+    accepted = f"REFUSED: H_TYPE_Fworker_refusal_line_L{valid_line}\n".encode()
+    assert harness._safe_worker_refusal_detail(accepted) == accepted.decode().rstrip()
+
+    for private in (
+        b"REFUSED: SSID MyHome PSK hunter2 coordinates 32.1,34.8\n",
+        b"REFUSED: bearer token abcdef\n",
+        f"REFUSED: H_TYPE_Fworker_refusal_line_L{valid_line}".encode(),
+        accepted + b"second line\n",
+        b"REFUSED: H_TYPE_Fworker_refusal_line_L4097\n",
+        f"REFUSED: H_TYPE_Fworker_refusal_line_L{max(lines['worker_refusal_line']) + 1}\n".encode(),
+        f"REFUSED: H_TYPE_Fnot_reviewed_L{valid_line}\n".encode(),
+        f"REFUSED: H_UNKNOWN_Fworker_refusal_line_L{valid_line}\n".encode(),
+        b"x" * 600,
+    ):
+        detail = harness._safe_worker_refusal_detail(private)
+        assert detail == (
+            "worker-stderr-sha256=" + hashlib.sha256(private).hexdigest() + f",bytes={len(private)}"
+        )
+        for fragment in ("MyHome", "hunter2", "32.1", "34.8", "abcdef"):
+            assert fragment not in detail
+
+
+def test_worker_exception_line_never_contains_exception_message_or_traceback_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for error in (
+        ValueError("SSID MyHome PSK hunter2"),
+        OSError("coordinates 32.1,34.8 token abcdef"),
+        TypeError("/private/path"),
+    ):
+        payload = harness._worker_refusal_line(error)
+        assert payload == b"REFUSED: H_UNLOCATED\n"
+        assert harness.WORKER_REFUSAL_RE.fullmatch(payload) is None
+        for private in (b"MyHome", b"hunter2", b"32.1", b"abcdef", b"/private"):
+            assert private not in payload
+
+    try:
+        harness._fsync_directory(tmp_path / "secret-token-path")
+    except OSError as error:
+        payload = harness._worker_refusal_line(error)
+    else:
+        pytest.fail("missing directory unexpectedly opened")
+    assert payload == b"REFUSED: H_UNLOCATED\n"
+    assert b"secret-token-path" not in payload
+
+    def failing_statvfs(_path: Path) -> object:
+        raise OSError("private stat path and token")
+
+    monkeypatch.setattr(harness.os, "statvfs", failing_statvfs, raising=False)
+    try:
+        harness._stat_space(tmp_path)
+    except OSError as error:
+        exact_frame = harness._worker_refusal_line(error)
+    else:
+        pytest.fail("statvfs unexpectedly succeeded")
+    assert exact_frame.startswith(b"REFUSED: H_OS_Fstat_space_L")
+    assert harness.WORKER_REFUSAL_RE.fullmatch(exact_frame) is not None
+
+    try:
+        raise AttributeError("external filename frame with private token")
+    except AttributeError as error:
+        external = harness._worker_refusal_line(error)
+    assert external == b"REFUSED: H_UNLOCATED\n"
+    assert b"private token" not in external
+
+
+def test_parent_rejects_allowlisted_function_name_when_code_filename_is_external(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_lines = harness._reviewed_function_lines()["stat_space"]
+
+    def external_stat_space(_path: Path) -> tuple[int, int]:
+        return (1, 1)
+
+    monkeypatch.setattr(harness, "_stat_space", external_stat_space)
+    assert "stat_space" not in harness._reviewed_function_lines()
+    forged = f"REFUSED: H_OS_Fstat_space_L{min(original_lines)}\n".encode()
+    detail = harness._safe_worker_refusal_detail(forged)
+    assert detail.startswith("worker-stderr-sha256=")
+    assert "H_OS" not in detail
 
 
 def test_only_opted_in_worker_command_surfaces_safe_refusal(
@@ -498,16 +574,52 @@ def test_only_opted_in_worker_command_surfaces_safe_refusal(
         [harness.UNSHARE, "--"],
         2,
         stdout=b"",
-        stderr=b"REFUSED: exact safe worker reason\n",
+        stderr=(
+            f"REFUSED: H_ATTRIBUTE_Fworker_refusal_line_L"
+            f"{min(harness._reviewed_function_lines()['worker_refusal_line'])}\n"
+        ).encode("ascii"),
     )
     monkeypatch.setattr(harness.subprocess, "run", lambda *_args, **_kwargs: completed)
 
-    expected_digest = hashlib.sha256(completed.stderr).hexdigest()
-    with pytest.raises(harness.HarnessError, match=expected_digest):
+    with pytest.raises(harness.HarnessError, match="H_ATTRIBUTE_Fworker_refusal_line"):
         harness._run((harness.UNSHARE, "--"), safe_worker_refusal=True)
     with pytest.raises(harness.HarnessError) as ordinary:
         harness._run((harness.UNSHARE, "--"))
-    assert "exact safe worker reason" not in str(ordinary.value)
+    assert "H_ATTRIBUTE_Fworker_refusal_line" not in str(ordinary.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("SSID MyHome PSK hunter2"),
+        OSError("coordinates 32.1,34.8 token abcdef"),
+        AttributeError("unexpected private path /secret"),
+    ],
+)
+def test_worker_top_level_emits_only_category_function_and_reviewed_line(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    arguments = harness.argparse.Namespace(worker=True)
+    parser = type("Parser", (), {"parse_args": lambda self: arguments})()
+    monkeypatch.setattr(harness, "_parser", lambda: parser)
+    monkeypatch.setattr(harness, "_validate_arguments", lambda _arguments: None)
+
+    def refuse(_arguments: object) -> int:
+        raise error
+
+    monkeypatch.setattr(harness, "_worker", refuse)
+    assert harness.main() == 2
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    payload = captured.err.encode("ascii")
+    assert payload == b"REFUSED: H_UNLOCATED\n"
+    assert harness.WORKER_REFUSAL_RE.fullmatch(payload) is None
+    detail = harness._safe_worker_refusal_detail(payload)
+    assert detail.startswith("worker-stderr-sha256=")
+    for private in ("MyHome", "hunter2", "32.1", "abcdef", "/secret"):
+        assert private not in captured.err
 
 
 def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> None:

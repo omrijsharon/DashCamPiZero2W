@@ -48,6 +48,38 @@ COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
 SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 LOOP_RE: Final = re.compile(r"/dev/loop[0-9]{1,4}")
 DEVICE_RE: Final = re.compile(r"[0-9]{1,5}:[0-9]{1,10}")
+WORKER_REFUSAL_RE: Final = re.compile(
+    rb"REFUSED: H_(HARNESS|OS|UNICODE|ZIP|VALUE|ASSERT|ATTRIBUTE|KEY|RUNTIME|TYPE|"
+    rb"EXCEPTION)_F([a-z][a-z0-9_]*)_L([1-9][0-9]{0,3})\n"
+)
+MAX_REVIEWED_RUN_LINE: Final = 4096
+WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
+    "worker",
+    "matrix_a",
+    "matrix_b_c",
+    "matrix_d",
+    "matrix_e",
+    "matrix_g",
+    "write_result",
+    "load_commit_source",
+    "materialize_clip",
+    "write_member",
+    "stat_space",
+    "device_id",
+    "mount_loop",
+    "unmount_owned",
+    "detach_owned",
+    "attach_loop",
+    "require_owned_loop",
+    "loop_backing_file",
+    "blkid",
+    "findmnt",
+    "findmnt_backing",
+    "observe_root_backing",
+    "safe_worker_refusal_detail",
+    "worker_refusal_line",
+    "emit_worker_refusal",
+)
 MAX_BUNDLE_FILE_BYTES: Final = 16 * 1024 * 1024
 MAX_SOURCE_MEMBERS: Final = 512
 MAX_OUTPUT_BYTES: Final = 64 * 1024
@@ -492,7 +524,87 @@ def _run(
 def _safe_worker_refusal_detail(stderr: bytes) -> str:
     if not isinstance(stderr, bytes):
         return "worker-stderr-unavailable"
+    match = WORKER_REFUSAL_RE.fullmatch(stderr)
+    if match is not None:
+        function = match.group(2).decode("ascii")
+        line = int(match.group(3))
+        if line in _reviewed_function_lines().get(function, frozenset()):
+            return stderr[:-1].decode("ascii")
     return f"worker-stderr-sha256={_sha256(stderr)},bytes={len(stderr)}"
+
+
+def _worker_exception_category(error: Exception) -> str:
+    for expected, category in (
+        (HarnessError, "HARNESS"),
+        (UnicodeError, "UNICODE"),
+        (zipfile.BadZipFile, "ZIP"),
+        (OSError, "OS"),
+        (AssertionError, "ASSERT"),
+        (AttributeError, "ATTRIBUTE"),
+        (KeyError, "KEY"),
+        (RuntimeError, "RUNTIME"),
+        (TypeError, "TYPE"),
+        (ValueError, "VALUE"),
+    ):
+        if isinstance(error, expected):
+            return category
+    return "EXCEPTION"
+
+
+def _reviewed_function_lines() -> dict[str, frozenset[int]]:
+    result: dict[str, frozenset[int]] = {}
+    reviewed_path = Path(__file__).resolve(strict=True)
+    for function_code in WORKER_DIAGNOSTIC_FUNCTIONS:
+        function = globals().get("_" + function_code)
+        code = getattr(function, "__code__", None)
+        if code is None:
+            continue
+        try:
+            code_path = Path(code.co_filename).resolve(strict=True)
+        except OSError:
+            continue
+        if code_path != reviewed_path:
+            continue
+        lines = frozenset(
+            line
+            for _start, _end, line in code.co_lines()
+            if line is not None and 1 <= line <= MAX_REVIEWED_RUN_LINE
+        )
+        if lines:
+            result[function_code] = lines
+    return result
+
+
+def _reviewed_exception_location(error: Exception) -> tuple[str, int] | None:
+    reviewed_path = Path(__file__).resolve(strict=True)
+    line_map = _reviewed_function_lines()
+    selected: tuple[str, int] | None = None
+    traceback = error.__traceback__
+    while traceback is not None:
+        try:
+            frame_path = Path(traceback.tb_frame.f_code.co_filename).resolve(strict=True)
+        except OSError:
+            frame_path = Path()
+        function_name = traceback.tb_frame.f_code.co_name.removeprefix("_")
+        if frame_path == reviewed_path and traceback.tb_lineno in line_map.get(
+            function_name, frozenset()
+        ):
+            selected = (function_name, traceback.tb_lineno)
+        traceback = traceback.tb_next
+    return selected
+
+
+def _worker_refusal_line(error: Exception) -> bytes:
+    category = _worker_exception_category(error)
+    location = _reviewed_exception_location(error)
+    if location is None:
+        return b"REFUSED: H_UNLOCATED\n"
+    function, line = location
+    payload = f"REFUSED: H_{category}_F{function}_L{line}\n".encode("ascii")
+    match = WORKER_REFUSAL_RE.fullmatch(payload)
+    if match is None or line not in _reviewed_function_lines().get(function, frozenset()):
+        return b"REFUSED: H_UNLOCATED\n"
+    return payload
 
 
 def _findmnt(target: Path) -> dict[str, str] | None:
@@ -1997,13 +2109,25 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
         raise HarnessError("parent output path is required")
 
 
+def _emit_worker_refusal(error: Exception) -> int:
+    _write_all(sys.stderr.fileno(), _worker_refusal_line(error))
+    return 2
+
+
 def main() -> int:
     arguments = _parser().parse_args()
     try:
         _validate_arguments(arguments)
         return _worker(arguments) if arguments.worker else _parent(arguments)
     except (HarnessError, OSError, ValueError, UnicodeError, zipfile.BadZipFile) as error:
+        if arguments.worker:
+            return _emit_worker_refusal(error)
         print(f"REFUSED: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:
+        if arguments.worker:
+            return _emit_worker_refusal(error)
+        print("REFUSED: unexpected parent exception", file=sys.stderr)
         return 2
 
 

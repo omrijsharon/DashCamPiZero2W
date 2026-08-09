@@ -1565,6 +1565,7 @@ def _matrix_d(root: Path, catalog_path: Path) -> dict[str, object]:
     from dashcam.catalog.database import ClipCatalog
     from dashcam.catalog.filesystem import RootedFilesystem
     from dashcam.catalog.models import EventSource
+    from dashcam.storage.intents import IntentKind
 
     filesystem = RootedFilesystem(root)
     with ClipCatalog(catalog_path) as catalog:
@@ -1594,6 +1595,13 @@ def _matrix_d(root: Path, catalog_path: Path) -> dict[str, object]:
             monotonic_now_ns=50_002,
         )
         pending = catalog.list_pending_intents(limit=16)
+        if (
+            len(consumed) != 1
+            or tuple(intent.intent_id for intent in pending) != consumed
+            or pending[0].clip_id != clips[3].clip_id
+            or pending[0].kind is not IntentKind.PROTECT
+        ):
+            raise HarnessError("next-clip event intent selection differs")
         for intent in pending:
             result = catalog.reconcile_intent(
                 intent.intent_id, filesystem, monotonic_now_ns=50_003, max_actions=2
@@ -1602,7 +1610,7 @@ def _matrix_d(root: Path, catalog_path: Path) -> dict[str, object]:
                 raise HarnessError("next-clip protection intent did not converge")
         protected_ids = tuple(str(value) for value in event.protected_clip_ids)
         expected = tuple(str(clip.clip_id) for clip in clips[:3])
-        if protected_ids != expected or consumed != (event.event_id,):
+        if protected_ids != expected:
             raise HarnessError("event previous2/current/next1 selection differs")
         for clip in clips:
             stored = catalog.get_clip(clip.clip_id)

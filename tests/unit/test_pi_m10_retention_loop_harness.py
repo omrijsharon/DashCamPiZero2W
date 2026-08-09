@@ -712,6 +712,8 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "allocated.st_blocks * 512 < size" in source
     assert 'provisional_clip_pair(boot_id="m10loop", sequence=44)' in source
     assert 'finalized_unsynced_clip_pair(boot_id="m10loop", sequence=44)' in source
+    assert "tuple(intent.intent_id for intent in pending) != consumed" in source
+    assert "pending[0].kind is not IntentKind.PROTECT" in source
     assert 'invalid[0].fault.value != "INVALID_OBSERVATION"' in source
     assert 'failures[0].fault.value != "OBSERVATION_FAILED"' in source
     assert source.count('[-1].fault.value != "OBSERVATION_STALE"') == 2

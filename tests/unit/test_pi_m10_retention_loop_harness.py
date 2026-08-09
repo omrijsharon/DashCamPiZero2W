@@ -418,6 +418,49 @@ def test_crash_fixture_mount_refuses_active_or_non_owned_source(
         )
 
 
+def test_crash_fixture_mount_refusal_reports_only_its_exact_reviewed_line() -> None:
+    class InvalidImage:
+        @staticmethod
+        def stat() -> object:
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o600,
+                st_nlink=2,
+                st_size=4096,
+                st_blocks=8,
+            )
+
+    try:
+        harness._validate_crash_fixture_mount(
+            Path("/private/catalog-mount"),
+            cast(Any, InvalidImage()),
+            expected_size=4096,
+            filesystem="ext4",
+            label="M10CAT",
+        )
+    except harness.HarnessError as error:
+        payload = harness._worker_refusal_line(error)
+    else:
+        pytest.fail("invalid backing allocation unexpectedly passed")
+
+    match = harness.WORKER_REFUSAL_RE.fullmatch(payload)
+    assert match is not None
+    assert match.group(1) == b"HARNESS"
+    assert match.group(2) == b"validate_crash_fixture_mount"
+    line = int(match.group(3))
+    assert line in harness._reviewed_function_lines()["validate_crash_fixture_mount"]
+    assert b"private" not in payload
+    assert b"catalog" not in payload
+    assert b"M10CAT" not in payload
+
+    forged = (
+        f"REFUSED: H_HARNESS_Fvalidate_crash_fixture_mount_L"
+        f"{max(harness._reviewed_function_lines()['validate_crash_fixture_mount']) + 1}\n"
+    ).encode("ascii")
+    detail = harness._safe_worker_refusal_detail(forged)
+    assert detail.startswith("worker-stderr-sha256=")
+    assert "validate_crash_fixture_mount" not in detail
+
+
 def test_crash_cell_parser_is_closed_and_mutually_exclusive() -> None:
     arguments = harness._parser().parse_args(
         [
@@ -1197,6 +1240,7 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
         '"crash_cell"',
         '"prepare_crash_intent"',
         '"run_crash_subprocess"',
+        '"validate_crash_fixture_mount"',
         '"validate_crash_cell_environment"',
     ):
         assert function in source

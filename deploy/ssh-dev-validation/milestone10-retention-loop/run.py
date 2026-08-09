@@ -69,6 +69,7 @@ WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "crash_cell",
     "prepare_crash_intent",
     "run_crash_subprocess",
+    "validate_crash_fixture_mount",
     "validate_crash_cell_environment",
     "matrix_g",
     "write_result",

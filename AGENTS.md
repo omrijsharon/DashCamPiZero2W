@@ -96,6 +96,23 @@
   installed directory was recoverably removed; its bundle, Git commit, and
   privacy-safe evidence remain. Evidence:
   `docs/test-reports/2026-08-09-milestone9-fused-validation-rejected.md`.
+- The Milestone 9 functional overlay gates passed on the verified `.112` Pi
+  with the accepted installed `5f95` release. Hash-closed harness manifest
+  `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`
+  produced privacy-safe result SHA-256
+  `3f60f366555869c913be66e5535f22b9c62d69923beeb0abf15dc12cb025ef97`.
+  Five actual on-Pi decoded crops proved burned `TIME UNSYNCED`, valid
+  navigation/time, `GPS LOST` with navigation hidden on both sides of an exact
+  adjacent clip boundary, and recovered valid state in the successor. The two
+  canonical sidecars and selected frame PTS proved a shared GPS producer and
+  stable-anchor/monotonic model; never describe this as literal Python snapshot
+  identity. Sequences 46/47 had actual packet rates 30.005668/30.005591 fps,
+  zero live drops/restarts/renderer failures/throttle, and clean pre-analysis
+  service stop. Their sidecar `frames_written` observer values did not equal
+  MP4 packet counts (`1799/1800` and `1799/1771`); retain this truthful
+  diagnostic and do not claim counter equality. It does not waive or complete
+  the still-open Section C1 paired resource matrix or Milestone 9 exit gate.
+  Evidence: `docs/test-reports/2026-08-09-milestone9-functional-overlay-live.md`.
 - The last M8-qualified exact-Pi deployment ran hash-closed release
   `0.1.0.dev0-921164f96ad53e0b`; its manifest, final `SHA256SUMS`, and wheel
   SHA-256 values are respectively

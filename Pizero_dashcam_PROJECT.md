@@ -1513,10 +1513,17 @@ On 2026-08-03 the installed stock `textoverlay` production candidate was
 rejected after delivering only about 10.4 fps at the unchanged 1080p30
 hardware-H.264 profile; stock `gdkpixbufoverlay` reached only about 18.3 fps.
 An isolated native-NV12 fixed-luma-region transform then matched a no-overlay
-30.006 fps arm. That capability result selects the next implementation
-direction but does not close Phase 4 until dynamic GPS/audio/sidecar,
-clip-boundary, and resource gates pass. Evidence:
-`docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
+30.006 fps arm. The resulting recorder-owned native NV12/DMABUF renderer later
+passed the exact-Pi functional gates: five stored-video crops proved unsynced,
+valid, stale-before-boundary, stale-after-boundary, and recovered-valid text;
+two canonical sidecars and the selected frame PTS agreed through the shared GPS
+producer and stable-anchor/monotonic model; and the adjacent clips retained
+about 30.006 actual packet fps with zero live drops/restarts/renderer failures
+or throttling. This does not claim literal snapshot-object identity and does
+not close Phase 4: the prespecified Section C1 paired ten-clip resource matrix
+and exit gate remain open. Evidence:
+`docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md` and
+`docs/test-reports/2026-08-09-milestone9-functional-overlay-live.md`.
 
 ### Phase 4 — Overlay
 

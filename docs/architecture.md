@@ -34,7 +34,7 @@ Phone-preview transport remains open.
 | H.264 encoder and caps | Select dynamically discovered `v4l2h264enc` for Milestone 6 with an explicit level cap, High/4.1, 8 Mbit/s target, GOP 30, repeated headers, and the default hardware VBR mode; never request `video_bitrate_mode=1` on this stack | Control matrix plus installed continuous recorder/rollover evidence in `docs/test-reports/2026-07-26-gstreamer-explicit-caps.md` and `docs/test-reports/2026-07-26-milestone6-recorder-live.md` |
 | MP4 muxer/finalization profile | Select asynchronous `splitmuxsink` with `mp4mux` in explicit `dash-or-mss` fragmented mode at 1-second intervals; ordinary target is a 60-second IDR boundary | The installed service promoted a 59.988667-second IDR-started production pair, finalized its active 24.528667-second shutdown fragment, refused a collision, and reconciled an interrupted pair operation; evidence: `docs/test-reports/2026-07-26-milestone6-finalization-live.md` |
 | UART | Select PL011 `/dev/ttyAMA0` through `/dev/serial0`; disable Bluetooth and remove the serial console | Boot-file hashes, reboot, device-link and GPIO-function verification |
-| Burned-in overlay | Reject stock `textoverlay` and `gdkpixbufoverlay`; develop the measured in-process native-NV12 fixed-luma-region `GstBaseTransform` candidate | Installed `textoverlay` delivered about 10.4 fps and stock fixed-region composition about 18.3 fps. An isolated native transform matched the 30.006 fps no-overlay baseline while writing every frame, but production GPS/audio/dynamic/rollover qualification remains open; evidence: `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md` |
+| Burned-in overlay | Use the recorder-owned native NV12/DMABUF fixed-luma-region renderer before hardware encoding; reject stock `textoverlay` and `gdkpixbufoverlay` | Installed `textoverlay` delivered about 10.4 fps and stock fixed-region composition about 18.3 fps. The native path passed exact-Pi dynamic GPS state, stored-pixel, shared stable-anchor time-model, clip-boundary, and recovery qualification at about 30.006 actual packet fps with zero live drops/restarts/renderer failures. The separate Section C1 paired resource matrix remains open; evidence: `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md` and `docs/test-reports/2026-08-09-milestone9-functional-overlay-live.md` |
 | Preview camera path | Select a secondary 640x360 NV12 stream from the same `libcamerasrc`; request 30 fps and drop to 15 fps only after a bounded leaky queue | Dual-stream test retained the 1080p30 recording caps and one camera owner |
 | USB audio device identifier and AAC path | Select USB `08bb:2902` plus product/physical path; shared-pipeline-clock 48 kHz mono S16LE through `alsasrc`/bounded queue/`audioresample`/`voaacenc` 128 kbit/s/`aacparse`; production defaults retain bounded three-slot immutable-generation loss isolation and restoration | Ten integrated A/V clips passed IDR, independent decode, exact-zero boundaries, and 4.000–64.333 ms stream-edge skew. The final two-cycle logical loss/restoration run passed audio truth `[true,false,true,false,true]`, IDR-first hardware decode, 71.958–84.291 ms A/V skew, unchanged drops, and zero restart. Release `0.1.0.dev0-09a6dd3b374d3952` then passed ordinary startup without the microphone and finalized truthful video-only media. Physical hot-unplug/replug is not a current acceptance requirement. Evidence: `docs/test-reports/2026-07-27-milestone7-audio-live.md`, `docs/test-reports/2026-07-28-milestone7-production-restoration-live.md`, `docs/test-reports/2026-07-28-milestone7-absent-startup-live.md` |
 | GPS baud, NMEA reliability, UTC anchoring, clip telemetry, and wall-clock ownership | Select receive-only 115200-baud NMEA from the FlyFishRC M10 Mini on PL011; accept only checksum/parse-valid RMC/ZDA UTC through configured plausibility/continuity policy; coalesce RMC/GGA by receiver epoch into a bounded 10 Hz, three-minute monotonic history and half-open per-clip windows; retain stock `systemd-timesyncd` as the sole Linux wall-clock owner while all media timing remains pipeline/monotonic; reconcile provisional sidecars/names through a schema-4 durable intent and bounded same-boot UUID backlog | The production UART, no-GPS, anchor, sidecar, clock-step, late-lock reconciliation, and exact-exFAT collision gates passed. Release `0.1.0.dev0-7fd1e73debb731b6` retained exactly 600 unique samples in a full clip and 431 in its shutdown successor. Release `0.1.0.dev0-6f943f3a4edf7117` reconciled two no-GPS clips from one later trusted anchor while preserving UUIDs, truthful empty historical navigation, full hardware/AAC decode, and zero drops/restarts. A controlled +120-second wall-clock step left all sequence-390 video/audio PTS and DTS strictly increasing. Evidence: `docs/test-reports/2026-07-28-milestone8-gps-uart-live.md`, `docs/test-reports/2026-07-28-milestone8-no-gps-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-anchor-live.md`, `docs/test-reports/2026-07-28-milestone8-gps-sidecar-live.md`, `docs/test-reports/2026-07-28-milestone8-clock-step-live.md`, and `docs/test-reports/2026-07-28-milestone8-reconciliation-live.md` |
@@ -177,8 +177,10 @@ Phone-preview transport remains open.
   kept the real camera, hardware encoder, exFAT catalog, and reconciliation
   active through silence, conflict, transport replacement, and recovered
   navigation with zero drops/restarts; the validator is kernel-lock serialized.
-  Milestone 8 is accepted; overlay rendering and its shared-snapshot
-  performance gates remain Milestone 9 work.
+  Milestone 8 is accepted. Milestone 9 later proved that overlay rendering and
+  sidecar finalization share the GPS producer and stable-anchor/monotonic time
+  model; it does not claim literal Python snapshot identity. The paired
+  performance gate remains open.
 
 ### ADR-P0B-004: Optional USB audio branch
 
@@ -271,9 +273,17 @@ Phone-preview transport remains open.
   `docs/test-reports/2026-08-03-milestone9-overlay-candidate-failure.md`.
   The diagnostic active-GPS resource near-pass and its strict refusal are in
   `docs/test-reports/2026-08-03-milestone9-overlay-resource-limit.md`.
-  Dynamic production rendering is implemented, but shared-snapshot proof,
-  clip-boundary stress and the longer paired resource comparison remain
-  unchecked. The exact v7 wheel is now installed as hash-closed release
+  Dynamic production rendering is implemented. A hash-closed exact-Pi
+  functional run decoded five stored-video luma crops covering unsynced,
+  valid, stale on both sides of an exact adjacent clip boundary, and recovered
+  valid states. Both canonical sidecars used the same stable GPS anchor model,
+  frame PTS mapped into their half-open monotonic windows, and valid/stale
+  sample ownership matched the displayed state. Live drops, restarts, renderer
+  failures, and throttling remained zero; actual media rates were about
+  30.006 packets/s. This closes the functional and boundary gates, not the
+  longer paired resource comparison. Evidence is in
+  `docs/test-reports/2026-08-09-milestone9-functional-overlay-live.md`.
+  The exact v7 wheel is now installed as hash-closed release
   `0.1.0.dev0-5f95dd806342ac9e`; deployment does not change its strict resource
   refusal. A later hash-closed fused-validation candidate retained full
   per-buffer safety validation but did not clear the pre-matrix screening

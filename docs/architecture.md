@@ -364,6 +364,27 @@ interfaces:
 - The SQLite/WAL catalog on the future ext4 state volume coordinates bounded
   leases, retention eligibility, durable pair-operation intents, event windows,
   and bounded startup reconciliation against an injected recording filesystem.
+  Schema 5 additionally contains one UUID-and-capacity-bound threshold latch.
+  Before pending-pair reconciliation or camera/backend opening, the runtime
+  samples free (`f_bavail * f_frsize`) and total (`f_blocks * f_frsize`) space
+  from the same verified recording-volume descriptor, rejects identity/capacity
+  drift, and durably applies the configured low/high hysteresis. Equality is
+  deliberate: reclaim begins only below the low threshold, remains active below
+  the high threshold, and emergency begins only below its threshold; a
+  classified no-space write forces emergency. The present monitor provides a
+  bounded, privacy-safe advisory directive only (`reclaimer_enabled=false`):
+  it has no clip enumeration, unlink, or protected-media authority. A stale or
+  invalid bounded observation budget, latch failure, or recording-volume
+  `Gst.ResourceError.NO_SPACE_LEFT`/`ENOSPC`/`EDQUOT` leads to a clean
+  `STORAGE_SAFETY_STOP` and `FAULTED/STORAGE_FAULT`, deliberately exiting
+  successfully so `Restart=on-failure` cannot create a camera loop. A future
+  durable `DELETING` transaction must consume that directive, coordinate
+  protection and leases, and reconcile it before any media deletion. Current
+  storage preflight still refuses `free <= minimum_free_gib`, so it must be
+  integrated with this recovery path before low-space restart behavior can be
+  accepted. This local source slice has no exact-Pi validation and is not an
+  accepted release while Milestone 9 resource qualification remains open.
+  Runtime snapshot schema 3 carries the bounded monitor status.
 - Overlay formatting consumes one coherent telemetry snapshot and emits bounded
   text/layout data. The first pre-encoder `textoverlay` source slice bound
   initial state before PLAYING and used a queue-free optional worker, but its

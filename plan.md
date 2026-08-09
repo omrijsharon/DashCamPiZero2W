@@ -214,6 +214,9 @@ This is the execution checklist for `Pizero_dashcam_PROJECT.md`. The product spe
 - [ ] **Milestone 10 complete**
   - [x] **LOCAL:** Implement the durable clip catalog/migrations on ext4 and startup reconciliation against exFAT. Evidence: `docs/test-reports/2026-07-24-pre-pi-implementation.md`.
   - [ ] **LOCAL/PI:** Implement exact low/high/emergency free-space threshold behavior.
+    - [x] **LOCAL:** Add an identity-bound durable threshold latch, bounded live observer, advisory reclamation directive, and fail-closed `ENOSPC`/`EDQUOT` safety stop without deletion. Evidence: `docs/test-reports/2026-08-09-milestone10-threshold-monitor-local.md`.
+    - [ ] **LOCAL:** Integrate the durable `DELETING` reclaimer and revise startup preflight so the configured reserve does not preempt legitimate low-space recovery.
+    - [ ] **PI:** Validate exact threshold boundaries, stale-observation stop, and classified no-space behavior only on a disposable bounded exFAT fixture volume; never fill or delete active recordings without explicit authorization.
   - [ ] **LOCAL/PI:** Implement oldest-first retention using durable `DELETING` intent and idempotent two-file cleanup.
   - [ ] **LOCAL/PI:** Implement bounded download leases and expiry after crashed/abandoned clients.
   - [ ] **LOCAL/PI:** Implement event protection for previous 2, current, and next 1 clips with catalog/retention coordination.

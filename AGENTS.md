@@ -146,6 +146,25 @@
   directory was safely removed while its bundle remains
   at `/var/lib/dashcam/m9-direct-anchor-bundle-864bbef`. Evidence:
   `docs/test-reports/2026-08-09-milestone9-direct-anchor-finalization-rejected.md`.
+- Source commit `75ce2b8` adds only the local Milestone 10 threshold-monitor
+  groundwork; it is neither an exact-Pi result nor a deployable/accepted
+  release because the Milestone 9 resource gate remains rejected. Catalog
+  schema 5 stores a singleton UUID-and-capacity-bound reclaim latch. The
+  runtime samples `f_bavail * f_frsize` and `f_blocks * f_frsize` from one
+  verified descriptor, applies exact low/high/emergency hysteresis, and exposes
+  an advisory directive with `reclaimer_enabled=false`; it never selects or
+  deletes a clip. After the bounded repeated-observation budget is exhausted,
+  or immediately on identity/capacity/latch faults or classified
+  recording-volume `Gst.ResourceError.NO_SPACE_LEFT`, `ENOSPC`, or `EDQUOT`,
+  it takes a clean `STORAGE_SAFETY_STOP` (final
+  `FAULTED/STORAGE_FAULT`, process success to prevent a restart loop). The
+  initial fresh sample occurs before catalog reconciliation or camera opening.
+  Do not deploy or test this slice on the active recording volume. The next
+  local work is a durable `DELETING` reclaimer plus startup-preflight reserve
+  integration: the present preflight still refuses `free <= minimum_free_gib`
+  and can preempt recovery below low/emergency. Any live low-space/ENOSPC test
+  requires a disposable bounded exFAT fixture and explicit authorization.
+  Evidence: `docs/test-reports/2026-08-09-milestone10-threshold-monitor-local.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

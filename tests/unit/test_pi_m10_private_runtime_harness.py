@@ -2118,6 +2118,16 @@ def test_pre_ready_refusal_phases_launch_notify_units_nonblocking() -> None:
     assert "no_block=no_block" in candidate
 
 
+def test_phase_a_startup_bound_begins_before_transient_launch() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    phase_a = source[source.index("def _phase_a(") : source.index("def _rollback_phase(")]
+
+    assert phase_a.index("started_ns = time.monotonic_ns()") < phase_a.index(
+        "unit = _candidate_unit("
+    )
+    assert phase_a.index("unit = _candidate_unit(") < phase_a.index("_wait_recording(")
+
+
 def test_readme_states_private_scope_and_all_nonclaims() -> None:
     readme = (HARNESS / "README.md").read_text(encoding="utf-8")
 

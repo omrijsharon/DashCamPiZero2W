@@ -4665,6 +4665,7 @@ def _phase_a(
     low, high, _emergency = resolved_thresholds(cast(int, identity["capacity_bytes"]))
     reserve = math.ceil(MINIMUM_FREE_GIB * 1024**3)
     startup_filler, startup_filler_bytes = _allocate_filler(root, (low + reserve) // 2)
+    started_ns = time.monotonic_ns()
     unit = _candidate_unit(
         nonce,
         "a",
@@ -4674,7 +4675,6 @@ def _phase_a(
             preflight_failure=lambda: _run_preflight_diagnostic(nonce, paths),
         ),
     )
-    started_ns = time.monotonic_ns()
     stopped = False
     try:
         _wait_recording(

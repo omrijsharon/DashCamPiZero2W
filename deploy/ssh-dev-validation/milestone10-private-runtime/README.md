@@ -92,7 +92,8 @@ The fixed phase order is:
 
 The result is atomically no-replace published only at the exact direct-child
 `/var/tmp/m10-private-runtime-<12 lowercase hex>.json` grammar, after unit/cgroup drain, socket cleanup, loop
-unmount/detach, runtime-exclusion restoration, production-state comparison, root
+bounded 60-second exact-owned-mount unmount/detach, runtime-exclusion restoration,
+production-state comparison, root
 reserve validation, and `throttled=0x0` validation. On an ownership ambiguity,
 the harness refuses rather than deleting an unknown mount, loop, path or unit.
 The owned temporary file, final file, and `/var/tmp` directory receive the

@@ -2118,6 +2118,15 @@ def test_media_evidence_never_turns_unavailable_sidecar_drop_count_into_zero() -
     assert "timeout=MEDIA_DECODE_TIMEOUT_S" in source
 
 
+def test_each_live_crossing_starts_in_a_fresh_writing_interval() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    phase = source[source.index("def _phase_a(") : source.index("def _rollback_phase(")]
+
+    assert phase.count("_wait_fresh_writing(catalog, root)") == 3
+    assert "0 <= now - started <= maximum_age_ns" in source
+    assert "maximum_age_ns: int = 3_000_000_000" in source
+
+
 def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
     messages = (

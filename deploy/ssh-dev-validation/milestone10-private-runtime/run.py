@@ -259,6 +259,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "candidate_unit",
     "stop_clean",
     "wait_writing",
+    "wait_fresh_writing",
     "wait_delete_progress",
     "wait_reclaim_quiescent",
     "canonical_media_row",
@@ -3935,6 +3936,30 @@ def _wait_writing(catalog: Path, root: Path, timeout: float = 12) -> dict[str, o
     raise HarnessError("durable current WRITING identity was not observed")
 
 
+def _wait_fresh_writing(
+    catalog: Path,
+    root: Path,
+    *,
+    timeout: float = 65,
+    maximum_age_ns: int = 3_000_000_000,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row = _writing_clip(_query_catalog(catalog, root))
+        started = None if row is None else row.get("start_monotonic_ns")
+        now = time.monotonic_ns()
+        if (
+            row is not None
+            and row.get("video_present") is True
+            and isinstance(started, int)
+            and not isinstance(started, bool)
+            and 0 <= now - started <= maximum_age_ns
+        ):
+            return row
+        time.sleep(0.05)
+    raise HarnessError("fresh durable WRITING identity was not observed")
+
+
 def _wait_delete_progress(
     catalog: Path,
     root: Path,
@@ -4570,7 +4595,7 @@ def _phase_a(
             clip_id=fixture["leased_id"],
             lease_id=fixture["lease_id"],
         )
-        writing_before = _wait_writing(catalog, root)
+        writing_before = _wait_fresh_writing(catalog, root)
         before_live_count = _catalog_counts(catalog)["delete_complete"]
         live_filler, live_filler_bytes = _allocate_filler(
             root,
@@ -4614,7 +4639,7 @@ def _phase_a(
         ):
             raise HarnessError("production event retry identity differs")
 
-        second_writing = _wait_writing(catalog, root)
+        second_writing = _wait_fresh_writing(catalog, root)
         second_before = _catalog_counts(catalog)["delete_complete"]
         second_filler, second_filler_bytes = _allocate_filler(
             root,
@@ -4658,7 +4683,7 @@ def _phase_a(
         if not isinstance(following_lease_id, str):
             raise HarnessError("media preservation lease identity differs")
         next_before = _catalog_counts(catalog)["delete_complete"]
-        next_writing = _wait_writing(catalog, root)
+        next_writing = _wait_fresh_writing(catalog, root)
         next_filler, next_filler_bytes = _allocate_filler(
             root,
             low - 2 * 1024**2,

@@ -158,6 +158,20 @@ def test_builder_creates_exact_hash_closed_bundle_from_canonical_packages(
         }
 
 
+def test_builder_refuses_retired_socket_activation_source(tmp_path: Path) -> None:
+    builder = _load("rollback_socket_builder", SOURCE / "prepare-bundle.py")
+    repository = _minimal_repo(tmp_path)
+    retired = repository / "systemd/dashcamd.socket"
+    retired.write_text("[Socket]\nListenStream=/run/dashcam/control.sock\n", encoding="ascii")
+    with pytest.raises(ValueError, match="retired socket-activation source exists"):
+        builder.prepare(
+            repository.resolve(),
+            (tmp_path / "bundle").resolve(),
+            tmp_path / "unused-tzdata.whl",
+            app_wheel=tmp_path / "unused-app.whl",
+        )
+
+
 def test_current_repository_real_wheel_imports_the_production_smoke_modules(
     tmp_path: Path,
 ) -> None:

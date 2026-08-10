@@ -6,8 +6,10 @@ import hashlib
 import re
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Final, cast
 from uuid import UUID, uuid4
@@ -52,7 +54,7 @@ from dashcam.storage.retention import (
     select_oldest_eligible,
 )
 
-SCHEMA_VERSION: Final = 4
+SCHEMA_VERSION: Final = 5
 MAX_PENDING_EVENT_WINDOWS: Final = 64
 MAX_QUERY_ROWS: Final = 10_000
 _MAX_REASON_CHARS: Final = 256
@@ -195,7 +197,133 @@ _MIGRATIONS: Final[tuple[tuple[int, str, tuple[str, ...]], ...]] = (
             """,
         ),
     ),
+    (
+        5,
+        "add_retention_threshold_latch",
+        (
+            """
+            CREATE TABLE retention_threshold_latch (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                volume_uuid TEXT NOT NULL,
+                capacity_bytes INTEGER NOT NULL CHECK (capacity_bytes > 0),
+                reclaim_latched INTEGER NOT NULL
+                    CHECK (reclaim_latched IN (0, 1))
+            )
+            """,
+        ),
+    ),
 )
+
+_EXPECTED_SCHEMA_HISTORY: Final = (
+    (1, "create_clip_catalog"),
+    (2, "add_event_protection"),
+    (3, "add_protection_revisions"),
+    (4, "add_name_reconciliation_payload"),
+    (5, "add_retention_threshold_latch"),
+)
+_ROLLBACK_ACTIVE_LIFECYCLES: Final = (
+    ClipLifecycle.CREATING,
+    ClipLifecycle.WRITING,
+    ClipLifecycle.FINALIZING,
+    ClipLifecycle.DELETING,
+)
+def catalog_schema_layout_matches(connection: sqlite3.Connection, *, version: int) -> bool:
+    """Compare every application table/index definition with a canonical schema."""
+
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an integer")
+    if version not in {4, SCHEMA_VERSION}:
+        return False
+    return _catalog_schema_layout(connection) == _expected_catalog_schema_layout(version)
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionThresholdLatch:
+    """Durable reclaim hysteresis bound to one verified filesystem."""
+
+    volume_uuid: str
+    capacity_bytes: int
+    reclaim_latched: bool
+
+    def __post_init__(self) -> None:
+        if not self.volume_uuid or len(self.volume_uuid) > 128:
+            raise ValueError("volume_uuid must be a bounded non-empty string")
+        _non_negative_integer(self.capacity_bytes, "capacity_bytes")
+        if self.capacity_bytes == 0:
+            raise ValueError("capacity_bytes must be positive")
+        if not isinstance(self.reclaim_latched, bool):
+            raise TypeError("reclaim_latched must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackCatalogState:
+    """One bounded, transactionally stable rollback-safety observation."""
+
+    catalog_schema_version: int
+    schema_history: tuple[tuple[int, str], ...]
+    schema_layout_valid: bool
+    latch_rows_valid: bool
+    latch: RetentionThresholdLatch | None
+    pending_intents: int
+    active_lifecycles: tuple[tuple[str, int], ...]
+    unknown_lifecycles: int
+    download_leases: int
+    pending_next_windows: int
+    finalized_clips_examined: int
+    finalized_clips_truncated: bool
+    pair_problems: tuple[str, ...]
+
+    @property
+    def quiescent(self) -> bool:
+        return (
+            self.catalog_schema_version == SCHEMA_VERSION
+            and self.schema_history == _EXPECTED_SCHEMA_HISTORY
+            and self.schema_layout_valid
+            and self.latch_rows_valid
+            and self.pending_intents == 0
+            and not any(count for _, count in self.active_lifecycles)
+            and self.unknown_lifecycles == 0
+            and self.download_leases == 0
+            and self.pending_next_windows == 0
+            and not self.finalized_clips_truncated
+            and not self.pair_problems
+        )
+
+
+def inspect_rollback_state_read_only(
+    database_path: Path,
+    filesystem: CatalogFilesystem,
+    *,
+    max_finalized_clips: int = MAX_QUERY_ROWS,
+) -> RollbackCatalogState:
+    """Inspect rollback invariants through a query-only SQLite connection."""
+
+    if not isinstance(database_path, Path):
+        raise TypeError("database_path must be a pathlib.Path")
+    _row_limit(max_finalized_clips, "max_finalized_clips")
+    connection = sqlite3.connect(
+        f"file:{database_path.as_posix()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+        timeout=5.0,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        try:
+            state = _inspect_rollback_state(
+                connection,
+                filesystem,
+                max_finalized_clips=max_finalized_clips,
+            )
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
+        return state
+    finally:
+        connection.close()
 
 
 class ClipCatalog:
@@ -240,6 +368,88 @@ class ClipCatalog:
         with self._lock:
             self._connection.close()
 
+    def retention_threshold_latch(self) -> RetentionThresholdLatch | None:
+        """Read the exact schema-5 latch without changing durable state."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM retention_threshold_latch WHERE singleton = 1"
+            ).fetchone()
+        return None if row is None else _retention_threshold_latch_from_row(row)
+
+    def inspect_rollback_state(
+        self,
+        filesystem: CatalogFilesystem,
+        *,
+        max_finalized_clips: int = MAX_QUERY_ROWS,
+    ) -> RollbackCatalogState:
+        """Return one bounded read-only proof of catalog/media quiescence."""
+
+        _row_limit(max_finalized_clips, "max_finalized_clips")
+        with self._read_transaction():
+            return self._inspect_rollback_state_locked(
+                filesystem,
+                max_finalized_clips=max_finalized_clips,
+            )
+
+    def initialize_rollback_latch_if_quiescent(
+        self,
+        latch: RetentionThresholdLatch,
+        filesystem: CatalogFilesystem,
+        *,
+        minimum_free_bytes: int,
+        space_observer: Callable[[], tuple[int, int]] | None = None,
+        max_finalized_clips: int = MAX_QUERY_ROWS,
+    ) -> RollbackCatalogState:
+        """Initialize only a missing false latch after rechecking every guard.
+
+        This is intentionally narrower than the normal M10 latch writer.  It
+        exists only for the explicit rollback-quiesce command upgrading an
+        otherwise safe schema-4 catalog.  Existing latch state is never reset.
+        """
+
+        if not isinstance(latch, RetentionThresholdLatch):
+            raise TypeError("latch must be RetentionThresholdLatch")
+        if latch.reclaim_latched:
+            raise CatalogConflictError("rollback may initialize only a false latch")
+        _non_negative_integer(minimum_free_bytes, "minimum_free_bytes")
+        _row_limit(max_finalized_clips, "max_finalized_clips")
+        with self._transaction():
+            capacity, free = (
+                filesystem.space_bytes() if space_observer is None else space_observer()
+            )
+            _positive_integer(capacity, "observed capacity")
+            _non_negative_integer(free, "observed free space")
+            if capacity != latch.capacity_bytes or free > capacity:
+                raise CatalogConflictError("recording capacity changed before latch insert")
+            if free < minimum_free_bytes:
+                raise CatalogConflictError("recording free space fell below high watermark")
+            state = self._inspect_rollback_state_locked(
+                filesystem,
+                max_finalized_clips=max_finalized_clips,
+            )
+            if state.latch is not None:
+                raise CatalogConflictError("retention threshold latch already exists")
+            if not state.quiescent:
+                raise CatalogConflictError("catalog is not quiescent for latch initialization")
+            self._connection.execute(
+                """
+                INSERT INTO retention_threshold_latch (
+                    singleton, volume_uuid, capacity_bytes, reclaim_latched
+                ) VALUES (1, ?, ?, 0)
+                """,
+                (latch.volume_uuid, latch.capacity_bytes),
+            )
+            inserted = self._connection.execute(
+                "SELECT * FROM retention_threshold_latch WHERE singleton = 1"
+            ).fetchone()
+            if inserted is None or _retention_threshold_latch_from_row(inserted) != latch:
+                raise CatalogConflictError("retention threshold latch insert did not bind exactly")
+            return self._inspect_rollback_state_locked(
+                filesystem,
+                max_finalized_clips=max_finalized_clips,
+            )
+
     def next_retention_order(self) -> int:
         """Allocate the next single-owner global ordering value."""
 
@@ -260,6 +470,46 @@ class ClipCatalog:
         _non_negative_integer(catalog_now_ns, "catalog_now_ns")
         with self._transaction():
             self._insert_clip_locked(clip, catalog_now_ns=catalog_now_ns)
+
+    def list_writing_clips(self, *, limit: int) -> tuple[CatalogClip, ...]:
+        """Return a stable bounded view of interrupted active registrations."""
+
+        _row_limit(limit, "limit")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM clips WHERE lifecycle = ?
+                ORDER BY retention_order, clip_id LIMIT ?
+                """,
+                (ClipLifecycle.WRITING.value, limit),
+            ).fetchall()
+        return tuple(_clip_from_row(row) for row in rows)
+
+    def mark_writing_clip_orphaned(
+        self,
+        clip_id: UUID,
+        *,
+        monotonic_now_ns: int,
+    ) -> bool:
+        """Demote a prior-process WRITING row without deleting either member."""
+
+        _uuid(clip_id, "clip_id")
+        _non_negative_integer(monotonic_now_ns, "monotonic_now_ns")
+        with self._transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE clips SET lifecycle = ?, pair_reconciled = 0,
+                    updated_catalog_ns = ?
+                WHERE clip_id = ? AND lifecycle = ?
+                """,
+                (
+                    ClipLifecycle.MISSING_SIDECAR.value,
+                    monotonic_now_ns,
+                    str(clip_id),
+                    ClipLifecycle.WRITING.value,
+                ),
+            )
+            return cursor.rowcount == 1
 
     def register_finalizing_clip(
         self,
@@ -1078,6 +1328,18 @@ class ClipCatalog:
                         False,
                         (validation_problem,),
                     )
+            if intent.kind is IntentKind.DELETE:
+                existing_sources = frozenset(action.source for action in plan.actions)
+                for source in (
+                    intent.paths.video_source,
+                    intent.paths.sidecar_source,
+                ):
+                    if source not in existing_sources:
+                        # An absent member after interrupted unlink is not
+                        # durable evidence until its verified parent has been
+                        # synchronized.  unlink() performs that idempotent
+                        # confirmation before the catalog can complete DELETE.
+                        filesystem.unlink(source)
             actions_attempted = 0
             for action in plan.actions[:max_actions]:
                 if action.kind is ActionKind.MOVE:
@@ -1254,6 +1516,18 @@ class ClipCatalog:
                 current = version
 
     @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                yield
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+            else:
+                self._connection.execute("COMMIT")
+
+    @contextmanager
     def _transaction(self) -> Iterator[None]:
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -1264,6 +1538,18 @@ class ClipCatalog:
                 raise
             else:
                 self._connection.execute("COMMIT")
+
+    def _inspect_rollback_state_locked(
+        self,
+        filesystem: CatalogFilesystem,
+        *,
+        max_finalized_clips: int,
+    ) -> RollbackCatalogState:
+        return _inspect_rollback_state(
+            self._connection,
+            filesystem,
+            max_finalized_clips=max_finalized_clips,
+        )
 
     def _required_clip_row(self, clip_id: UUID) -> sqlite3.Row:
         _uuid(clip_id, "clip_id")
@@ -1833,6 +2119,206 @@ class ClipCatalog:
             sqlite3.IntegrityError,
         ) as exc:
             return f"unindexed:{sidecar_path}:{type(exc).__name__}"
+
+
+def _retention_threshold_latch_from_row(row: sqlite3.Row) -> RetentionThresholdLatch:
+    return RetentionThresholdLatch(
+        volume_uuid=str(row["volume_uuid"]),
+        capacity_bytes=int(row["capacity_bytes"]),
+        reclaim_latched=bool(row["reclaim_latched"]),
+    )
+
+
+def _count_query(
+    connection: sqlite3.Connection,
+    query: str,
+    parameters: tuple[object, ...] = (),
+) -> int:
+    row = connection.execute(query, parameters).fetchone()
+    assert row is not None
+    value = int(row[0])
+    if value < 0:
+        raise CatalogConflictError("catalog returned an invalid row count")
+    return value
+
+
+def _normalized_sql(value: str) -> str:
+    return " ".join(value.split()).removesuffix(";")
+
+
+def _catalog_schema_layout(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, str, str, str], ...]:
+    rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, sql FROM sqlite_master
+        WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """
+    ).fetchall()
+    return tuple(
+        (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            _normalized_sql(str(row[3])),
+        )
+        for row in rows
+    )
+
+
+@cache
+def _expected_catalog_schema_layout(
+    version: int,
+) -> tuple[tuple[str, str, str, str], ...]:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        for migration_version, migration_name, statements in _MIGRATIONS:
+            if migration_version > version:
+                break
+            for statement in statements:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+                (migration_version, migration_name),
+            )
+        return _catalog_schema_layout(connection)
+    finally:
+        connection.close()
+
+
+def _inspect_rollback_state(
+    connection: sqlite3.Connection,
+    filesystem: CatalogFilesystem,
+    *,
+    max_finalized_clips: int,
+) -> RollbackCatalogState:
+    filesystem.assert_bound()
+    version_row = connection.execute("PRAGMA user_version").fetchone()
+    if version_row is None:
+        raise CatalogConflictError("catalog omitted its schema version")
+    catalog_schema_version = int(version_row[0])
+    history_rows = connection.execute(
+        "SELECT version, name FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    history = tuple((int(row["version"]), str(row["name"])) for row in history_rows)
+    schema_layout_valid = catalog_schema_layout_matches(
+        connection,
+        version=SCHEMA_VERSION,
+    )
+    latch_rows = connection.execute(
+        "SELECT * FROM retention_threshold_latch ORDER BY singleton LIMIT 2"
+    ).fetchall()
+    latch_rows_valid = len(latch_rows) == 0 or (
+        len(latch_rows) == 1 and int(latch_rows[0]["singleton"]) == 1
+    )
+    latch = (
+        _retention_threshold_latch_from_row(latch_rows[0])
+        if latch_rows_valid and latch_rows
+        else None
+    )
+    pending_intents = _count_query(
+        connection,
+        "SELECT COUNT(*) FROM operation_intents WHERE status = 'PENDING'",
+    )
+    active_lifecycles = tuple(
+        (
+            lifecycle.value,
+            _count_query(
+                connection,
+                "SELECT COUNT(*) FROM clips WHERE lifecycle = ?",
+                (lifecycle.value,),
+            ),
+        )
+        for lifecycle in _ROLLBACK_ACTIVE_LIFECYCLES
+    )
+    known_lifecycles = tuple(lifecycle.value for lifecycle in ClipLifecycle)
+    placeholders = ",".join("?" for _ in known_lifecycles)
+    unknown_lifecycles = _count_query(
+        connection,
+        f"SELECT COUNT(*) FROM clips WHERE lifecycle NOT IN ({placeholders})",
+        cast(tuple[object, ...], known_lifecycles),
+    )
+    leases = _count_query(
+        connection,
+        """
+        SELECT COUNT(*) FROM clips
+        WHERE lease_holder IS NOT NULL OR lease_issued_ns IS NOT NULL
+           OR lease_expires_ns IS NOT NULL OR lease_boot_id IS NOT NULL
+        """,
+    )
+    pending_next = _count_query(
+        connection,
+        "SELECT COUNT(*) FROM protection_events WHERE remaining_next <> 0",
+    )
+    rows = connection.execute(
+        """
+        SELECT * FROM clips
+        WHERE managed = 1 AND lifecycle = ?
+        ORDER BY retention_order, clip_id LIMIT ?
+        """,
+        (ClipLifecycle.FINALIZED.value, max_finalized_clips + 1),
+    ).fetchall()
+    truncated = len(rows) > max_finalized_clips
+    rows = rows[:max_finalized_clips]
+    problems: list[str] = []
+    for row in rows:
+        problem = _rollback_pair_problem(_clip_from_row(row), filesystem)
+        if problem is not None:
+            problems.append(problem)
+    return RollbackCatalogState(
+        catalog_schema_version=catalog_schema_version,
+        schema_history=history,
+        schema_layout_valid=schema_layout_valid,
+        latch_rows_valid=latch_rows_valid,
+        latch=latch,
+        pending_intents=pending_intents,
+        active_lifecycles=active_lifecycles,
+        unknown_lifecycles=unknown_lifecycles,
+        download_leases=leases,
+        pending_next_windows=pending_next,
+        finalized_clips_examined=len(rows),
+        finalized_clips_truncated=truncated,
+        pair_problems=tuple(problems),
+    )
+
+
+def _rollback_pair_problem(
+    clip: CatalogClip,
+    filesystem: CatalogFilesystem,
+) -> str | None:
+    prefix = f"clip:{clip.clip_id}"
+    if not clip.pair_reconciled:
+        return f"{prefix}:PAIR_NOT_RECONCILED"
+    video = PurePosixPath(clip.video_path)
+    sidecar = PurePosixPath(clip.sidecar_path)
+    expected_directory = "protected" if clip.protected else "clips"
+    if video.parent.as_posix() != expected_directory:
+        return f"{prefix}:VIDEO_DIRECTORY_MISMATCH"
+    if sidecar.parent.as_posix() != expected_directory:
+        return f"{prefix}:SIDECAR_DIRECTORY_MISMATCH"
+    try:
+        ClipFilePair(video.name, sidecar.name)
+    except ClipNameError:
+        return f"{prefix}:PAIR_NAME_MISMATCH"
+    try:
+        video_exists = filesystem.exists(clip.video_path)
+        sidecar_exists = filesystem.exists(clip.sidecar_path)
+    except (OSError, ValueError):
+        return f"{prefix}:PAIR_IDENTITY_INVALID"
+    if not video_exists:
+        return f"{prefix}:VIDEO_MISSING"
+    if not sidecar_exists:
+        return f"{prefix}:SIDECAR_MISSING"
+    return None
 
 
 def _clip_from_row(row: sqlite3.Row) -> CatalogClip:

@@ -71,6 +71,7 @@ from dashcam.recorder.pipeline import (
     RestartPolicy,
     VideoProfile,
 )
+from dashcam.rollback import run_pre_camera_guard
 from dashcam.state import GpsState, GpsTimeState, SystemClockState, TimestampQuality
 from dashcam.storage.naming import (
     finalized_unsynced_clip_pair,
@@ -282,6 +283,10 @@ class LivePreflight(Protocol):
         *,
         identity_path: str,
     ) -> PreflightResult: ...
+
+
+class RollbackGuard(Protocol):
+    def __call__(self, config: DashcamConfig, preflight: PreflightResult) -> object: ...
 
 
 class RuntimeBackoffWaiter(Protocol):
@@ -556,6 +561,7 @@ class GStreamerRecorderRuntime:
         sequence_planner: Callable[[Path, Path, str], int] = next_pending_sequence,
         boot_uuid_reader: Callable[[], UUID] = read_boot_uuid,
         finalizer_factory: FinalizerFactory | None = None,
+        rollback_guard: RollbackGuard | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         ownership: CameraOwnership | None = None,
         limits: RuntimeLimits | None = None,
@@ -573,6 +579,7 @@ class GStreamerRecorderRuntime:
         self._sequence_planner = sequence_planner
         self._boot_uuid_reader = boot_uuid_reader
         self._finalizer_factory = finalizer_factory
+        self._rollback_guard = rollback_guard
         self._monotonic_ns = monotonic_ns
         self._ownership = ownership or _PROCESS_CAMERA_OWNERSHIP
         self._limits = limits or RuntimeLimits()
@@ -2198,6 +2205,21 @@ class GStreamerRecorderRuntime:
         ):
             raise RecorderStorageFault("runtime lacks matching READY storage evidence")
         recording_root = Path(config.storage.recording_root)
+        if self._rollback_guard is not None:
+            try:
+                await self._durable_worker(
+                    self._rollback_guard,
+                    config,
+                    self._preflight_result,
+                    deadline_detail="rollback guard exceeded its deadline",
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                raise RecorderStorageFault(
+                    "rollback pre-camera guard refused: "
+                    f"{_bounded_exception_detail(error)}"
+                ) from error
         self._boot_short_id = await asyncio.to_thread(self._boot_id_reader)
         self._config = config
         audio_plan = await self._resolve_audio(config.audio)
@@ -2562,6 +2584,7 @@ def build_production_runtime(
         ),
         audio_discovery=discover_capture_device,
         finalizer_factory=build_finalizer,
+        rollback_guard=run_pre_camera_guard,
         gps_service_factory=build_gps_service,
     )
 

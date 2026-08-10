@@ -44,6 +44,7 @@ SERVICE_HOME: Final = "/var/lib/dashcam"
 SERVICE_SHELL: Final = "/usr/sbin/nologin"
 MANAGED_UNITS: Final = (UNIT_NAME, NETWORK_FALLBACK_UNIT_NAME, RECORDER_UNIT_NAME)
 DORMANT_UNITS: Final = (
+    "dashcamd.socket",
     "dashcam-web.service",
     "dashcam-prepare-removal.service",
 )
@@ -81,7 +82,7 @@ APPLICATION_IMPORT_SMOKE: Final = (
     "venv=Path(sys.prefix).resolve();"
     "modules=tuple(importlib.import_module(name) for name in ("
     "'dashcam.daemon','dashcam.recorder.runtime','dashcam.catalog.database',"
-    "'dashcam.recorder.finalizer'));"
+    "'dashcam.recorder.finalizer','dashcam.rollback'));"
     "assert all(Path(module.__file__).resolve().is_relative_to(venv) for module in modules);"
 )
 GSTREAMER_IMPORT_SMOKE: Final = (
@@ -356,7 +357,10 @@ def _safe_read(path: Path, limit: int = MAX_FILE_BYTES) -> bytes:
         raise Refusal(f"file has an unsafe type or link count: {path}")
     if listed.st_size > limit:
         raise Refusal(f"file exceeds its size bound: {path}")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
         current = os.fstat(descriptor)
         if (

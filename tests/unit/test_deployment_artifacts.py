@@ -75,11 +75,12 @@ def test_recorder_unit_has_bounded_notify_restart_and_privilege_contract() -> No
     assert "invalid or absent volume is observable as STORAGE_FAULT" in unit
 
 
-def test_web_unit_cannot_open_camera_audio_or_uart_groups() -> None:
+def test_web_unit_is_dormant_and_has_no_recorder_or_storage_group() -> None:
     unit = _unit("dashcam-web.service")
 
     assert "User=dashcam-web" in unit
-    assert "SupplementaryGroups=dashcam-api" in unit
+    assert _directive_values(unit, "SupplementaryGroups") == []
+    assert "dashcamd.socket" not in unit
     assert "PrivateDevices=yes" in unit
     assert "CapabilityBoundingSet=\n" in unit
     for forbidden_group in ("video", "render", "dialout", "audio", "dashcam-storage"):
@@ -89,12 +90,8 @@ def test_web_unit_cannot_open_camera_audio_or_uart_groups() -> None:
     assert "StartLimitBurst=5" in unit
 
 
-def test_control_socket_is_group_restricted() -> None:
-    unit = _unit("dashcamd.socket")
-
-    assert "ListenStream=/run/dashcam/control.sock" in unit
-    assert "SocketGroup=dashcam-api" in unit
-    assert "SocketMode=0660" in unit
+def test_control_socket_activation_is_retired() -> None:
+    assert not (SYSTEMD_ROOT / "dashcamd.socket").exists()
 
 
 def test_prepare_removal_is_bounded_narrow_and_not_boot_enabled() -> None:

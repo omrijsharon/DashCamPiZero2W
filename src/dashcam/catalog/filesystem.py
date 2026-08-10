@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Callable
@@ -45,6 +46,12 @@ class CatalogFilesystem(Protocol):
     ) -> None:
         """Durably replace one bounded regular file without changing its path."""
 
+    def assert_bound(self) -> None:
+        """Refuse unless the filesystem root still has its expected identity."""
+
+    def space_bytes(self) -> tuple[int, int]:
+        """Return fresh total/free bytes from the verified root descriptor."""
+
 
 class RootedFilesystem:
     """Real filesystem adapter confined below one explicitly supplied root."""
@@ -67,8 +74,44 @@ class RootedFilesystem:
     def root(self) -> Path:
         return self._root
 
+    def assert_bound(self) -> None:
+        self._assert_bound()
+
+    def space_bytes(self) -> tuple[int, int]:
+        self._assert_bound()
+        statvfs = cast(Callable[[Path], object] | None, getattr(os, "statvfs", None))
+        if statvfs is None:
+            raise OSError("statvfs is unavailable")
+        observed = statvfs(self._root)
+        blocks = getattr(observed, "f_blocks", None)
+        available = getattr(observed, "f_bavail", None)
+        fragment_size = getattr(observed, "f_frsize", None)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (blocks, available, fragment_size)
+        ):
+            raise OSError("statvfs returned invalid values")
+        assert isinstance(blocks, int)
+        assert isinstance(available, int)
+        assert isinstance(fragment_size, int)
+        capacity = blocks * fragment_size
+        free = available * fragment_size
+        if capacity <= 0 or free > capacity:
+            raise OSError("statvfs returned invalid capacity")
+        return capacity, free
+
     def exists(self, relative_path: str) -> bool:
-        return self._resolve(relative_path).is_file()
+        path = self._resolve(relative_path)
+        try:
+            information = path.lstat()
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(information.st_mode)
+            or _device_id(information.st_dev) != self._expected_device_id
+        ):
+            raise OSError("managed member is not a regular file on the verified device")
+        return True
 
     def move(self, source: str, target: str) -> None:
         source_path = self._resolve(source)
@@ -79,8 +122,39 @@ class RootedFilesystem:
             _fsync_directory(target_path.parent)
 
     def unlink(self, relative_path: str) -> None:
-        with suppress(FileNotFoundError):
-            self._resolve(relative_path).unlink()
+        path = self._resolve(relative_path)
+        if os.name == "nt":
+            with suppress(FileNotFoundError):
+                path.unlink()
+            return
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path.parent, flags)
+        try:
+            directory = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(directory.st_mode)
+                or _device_id(directory.st_dev) != self._expected_device_id
+            ):
+                raise OSError("managed directory is no longer bound to verified device")
+            try:
+                member = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                os.fsync(descriptor)
+                return
+            if (
+                not stat.S_ISREG(member.st_mode)
+                or _device_id(member.st_dev) != self._expected_device_id
+            ):
+                raise OSError("managed unlink target is not a bound regular file")
+            os.unlink(path.name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def iter_files(self, directory: str, *, limit: int) -> tuple[tuple[str, ...], int, bool]:
         if directory not in self._DIRECTORIES:
@@ -174,6 +248,8 @@ class RootedFilesystem:
                 raise ValueError("managed directory escapes recording root") from exc
             if path.is_symlink():
                 raise ValueError("managed directories cannot be symbolic links")
+            if _device_id(path.stat().st_dev) != self._expected_device_id:
+                raise OSError("managed directory differs from verified device")
         return path
 
     def _resolve(self, relative_path: str) -> Path:

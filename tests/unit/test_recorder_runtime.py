@@ -67,6 +67,7 @@ from dashcam.recorder.runtime import (
     next_pending_sequence,
     read_short_boot_id,
 )
+from dashcam.rollback import run_pre_camera_guard
 from dashcam.state import GpsState, GpsTimeState, StorageState, SystemClockState
 from dashcam.storage.preflight import (
     MountFacts,
@@ -473,6 +474,7 @@ def runtime_for(
     limits: RuntimeLimits | None = None,
     gps_factory: RecordingGpsFactory | None = None,
     monotonic_ns: Callable[[], int] | None = None,
+    rollback_guard: Callable[[DashcamConfig, PreflightResult], object] | None = None,
 ) -> tuple[GStreamerRecorderRuntime, RecordingFactory]:
     factory = RecordingFactory(backend)
     runtime = GStreamerRecorderRuntime(
@@ -486,6 +488,7 @@ def runtime_for(
         limits=limits,
         gps_service_factory=gps_factory,
         monotonic_ns=monotonic_ns or time.monotonic_ns,
+        rollback_guard=rollback_guard,
     )
     return runtime, factory
 
@@ -545,6 +548,27 @@ def test_matching_ready_storage_is_bound_before_camera_and_first_fragment() -> N
         ]
         await runtime.stop()
         assert ownership.owner is None
+
+    run_async(scenario)
+
+
+def test_rollback_guard_refuses_before_backend_or_camera_start() -> None:
+    async def scenario() -> None:
+        backend = FakeBackend()
+        observed: list[tuple[DashcamConfig, PreflightResult]] = []
+
+        def refuse(config: DashcamConfig, preflight: PreflightResult) -> None:
+            observed.append((config, preflight))
+            raise RuntimeError("catalog is not quiescent")
+
+        runtime, factory = runtime_for(backend, rollback_guard=refuse)
+        config = default_config()
+        preflight = await runtime.check(config)
+        with pytest.raises(RecorderStorageFault, match="rollback pre-camera guard refused"):
+            await runtime.start(config)
+        assert observed == [(config, preflight)]
+        assert factory.outputs == []
+        assert backend.started_with == []
 
     run_async(scenario)
 
@@ -2051,6 +2075,7 @@ def test_factory_is_lazy_and_builds_without_loading_gi() -> None:
         identity_path=Path("/etc/dashcam/storage-volume.env"),
     )
     assert isinstance(runtime, GStreamerRecorderRuntime)
+    assert runtime._rollback_guard is run_pre_camera_guard
     gps_factory = runtime._gps_service_factory
     assert gps_factory is not None
     gps_service = cast(GpsService, gps_factory(default_config().gps))

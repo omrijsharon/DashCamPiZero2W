@@ -228,6 +228,7 @@ def test_metadata_candidates_page_all_current_boot_pairs_across_process_restart(
         (2, "add_event_protection"),
         (3, "add_protection_revisions"),
         (4, "add_name_reconciliation_payload"),
+        (5, "add_retention_threshold_latch"),
     ]
     assert journal_mode == ("wal",)
 

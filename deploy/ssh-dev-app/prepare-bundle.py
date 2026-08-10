@@ -24,6 +24,7 @@ SOURCE_FILES = {
     "dashcam-storage-check.service": Path("deploy/ssh-dev-app/dashcam-storage-check.service"),
     "dashcamd.service": Path("systemd/dashcamd.service"),
 }
+RETIRED_SOURCE_FILES = (Path("systemd/dashcamd.socket"),)
 APP_NAME = "dashcam-pizero2w"
 TZDATA_NAME = "tzdata"
 TZDATA_VERSION = "2026.3"
@@ -171,6 +172,9 @@ def prepare(
         raise ValueError("repository/output contract is unsafe")
     if repository in output.parents or output in repository.parents:
         raise ValueError("repository and bundle may not overlap")
+    retired = tuple(path for path in RETIRED_SOURCE_FILES if (repository / path).exists())
+    if retired:
+        raise ValueError(f"retired socket-activation source exists: {retired[0]}")
     tz_name, tz_version, tz_payload = wheel_identity(tzdata_wheel)
     if (tz_name, tz_version) != (TZDATA_NAME, TZDATA_VERSION):
         raise ValueError(f"tzdata wheel must be exactly {TZDATA_NAME} {TZDATA_VERSION}")

@@ -3132,7 +3132,7 @@ def _query_catalog(catalog_path: Path, root: Path) -> dict[str, object]:
         intents = connection.execute(
             """
             SELECT intent_id,kind,status,clip_id,completed_monotonic_ns FROM operation_intents
-            ORDER BY created_ns,intent_id LIMIT ?
+            ORDER BY created_monotonic_ns,intent_id LIMIT ?
             """,
             (MAX_FIXTURE_ROWS + 1,),
         ).fetchall()

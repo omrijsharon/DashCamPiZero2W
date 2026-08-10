@@ -785,10 +785,38 @@ def test_catalog_observer_requires_canonical_state_recording_siblings(
     recording.mkdir()
     state.mkdir()
     catalog = state / "catalog.sqlite3"
-    sqlite3.connect(catalog).close()
+    connection = sqlite3.connect(catalog)
+    connection.executescript(
+        """
+        CREATE TABLE clips (
+            clip_id TEXT, lifecycle TEXT, video_path TEXT, sidecar_path TEXT,
+            protected INTEGER, lease_holder TEXT, start_monotonic_ns INTEGER,
+            end_monotonic_ns INTEGER, retention_order INTEGER, size_bytes INTEGER,
+            protection_reason TEXT, pair_reconciled INTEGER, managed INTEGER
+        );
+        CREATE TABLE operation_intents (
+            intent_id TEXT, kind TEXT, status TEXT, clip_id TEXT,
+            completed_monotonic_ns INTEGER, created_monotonic_ns INTEGER
+        );
+        CREATE TABLE protection_events (
+            event_id TEXT, source TEXT, current_clip_id TEXT,
+            requested_previous INTEGER, requested_next INTEGER,
+            missing_previous INTEGER, remaining_next INTEGER,
+            triggered_monotonic_ns INTEGER
+        );
+        CREATE TABLE protection_event_targets (
+            event_id TEXT, clip_id TEXT, role TEXT, ordinal INTEGER
+        );
+        """
+    )
+    connection.close()
 
-    with pytest.raises(sqlite3.OperationalError, match="no such table"):
-        run._query_catalog(catalog, recording)
+    assert run._query_catalog(catalog, recording) == {
+        "clips": [],
+        "intents": [],
+        "events": [],
+        "targets": [],
+    }
     with pytest.raises(run.HarnessError, match="observer path"):
         run._query_catalog(tmp_path / "catalog.sqlite3", recording)
     with pytest.raises(run.HarnessError, match="observer path"):

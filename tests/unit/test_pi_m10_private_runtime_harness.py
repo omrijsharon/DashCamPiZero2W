@@ -1908,6 +1908,33 @@ def test_notify_launch_admits_simulated_21_second_reply_while_bind_does_not(
     assert removed == [bind_unit]
 
 
+def test_systemd_run_no_block_is_explicit_and_boolean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        run,
+        "_command",
+        lambda arguments, **_kwargs: observed.append(tuple(str(value) for value in arguments)),
+    )
+    unit = "dashcam-m10-private-123456789abc-b.service"
+
+    run._systemd_run(unit, (), ("/bin/true",), no_block=True)
+
+    assert observed == [
+        (
+            "/usr/bin/systemd-run",
+            "--no-block",
+            "--unit",
+            "dashcam-m10-private-123456789abc-b",
+            "--",
+            "/bin/true",
+        )
+    ]
+    with pytest.raises(run.HarnessError, match="no-block mode differs"):
+        run._systemd_run(unit, (), ("/bin/true",), no_block=1)  # type: ignore[arg-type]
+
+
 def test_candidate_unit_maps_only_notify_roles_to_50_second_client_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1919,7 +1946,9 @@ def test_candidate_unit_maps_only_notify_roles_to_50_second_client_timeout(
         _command: object,
         *,
         client_timeout_s: float,
+        no_block: bool,
     ) -> None:
+        assert no_block is False
         observed.append((unit, client_timeout_s))
 
     monkeypatch.setattr(run, "_systemd_run", systemd_run)
@@ -2061,6 +2090,21 @@ def test_parent_media_parser_imports_from_frozen_bundle_not_state_mount() -> Non
 
     assert '_source_environment(root.parent / "bundle" / "candidate-source.zip")' in phase_a
     assert '_source_environment(state / "candidate-source.zip")' not in phase_a
+
+
+def test_pre_ready_refusal_phases_launch_notify_units_nonblocking() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    protected = source[
+        source.index("def _protected_emergency_phase(") : source.index("def _startup_bound_phase(")
+    ]
+    bounded = source[
+        source.index("def _startup_bound_phase(") : source.index("def _fresh_phase(")
+    ]
+    candidate = source[source.index("def _candidate_unit(") : source.index("def _stop_clean(")]
+
+    assert protected.count("no_block=True") == 1
+    assert bounded.count("no_block=True") == 1
+    assert "no_block=no_block" in candidate
 
 
 def test_readme_states_private_scope_and_all_nonclaims() -> None:

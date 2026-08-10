@@ -2773,6 +2773,7 @@ def _systemd_run(
     command: Sequence[str | Path],
     *,
     client_timeout_s: float = SYSTEMD_RUN_CLIENT_TIMEOUT_S,
+    no_block: bool = False,
 ) -> None:
     if UNIT_RE.fullmatch(unit) is None:
         raise HarnessError("transient unit name differs")
@@ -2784,7 +2785,11 @@ def _systemd_run(
         or client_timeout_s > SYSTEMD_RUN_NOTIFY_TIMEOUT_S
     ):
         raise HarnessError("systemd-run client timeout differs")
+    if not isinstance(no_block, bool):
+        raise HarnessError("systemd-run no-block mode differs")
     arguments: list[str | Path] = ["/usr/bin/systemd-run", "--unit", unit.removesuffix(".service")]
+    if no_block:
+        arguments.insert(1, "--no-block")
     for prop in properties:
         arguments.extend(("--property", prop))
     arguments.append("--")
@@ -3912,6 +3917,7 @@ def _candidate_unit(
     single_start: bool = False,
     before_launch: Callable[[], None] | None = None,
     launch_failure: Callable[[], None] | None = None,
+    no_block: bool = False,
 ) -> str:
     unit = f"dashcam-m10-private-{nonce}-{suffix}.service"
     properties = list(
@@ -3949,6 +3955,7 @@ def _candidate_unit(
                 if role in {"candidate", "rollback-recorder"}
                 else SYSTEMD_RUN_CLIENT_TIMEOUT_S
             ),
+            no_block=no_block,
         )
     except BaseException:
         if launch_failure is not None:
@@ -5079,6 +5086,7 @@ def _protected_emergency_phase(
         single_start=True,
         before_launch=observer.start,
         launch_failure=observer.stop,
+        no_block=True,
     )
     try:
         terminal = _wait_unit_terminal(unit, UNIT_START_TIMEOUT_S)
@@ -5134,6 +5142,7 @@ def _startup_bound_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, obj
         single_start=True,
         before_launch=observer.start,
         launch_failure=observer.stop,
+        no_block=True,
     )
     try:
         terminal = _wait_unit_terminal(unit, UNIT_START_TIMEOUT_S)

@@ -67,6 +67,7 @@ MEDIA_DECODE_TIMEOUT_S: Final = 75
 SYSTEMD_RUN_CLIENT_TIMEOUT_S: Final = 20.0
 SYSTEMD_RUN_NOTIFY_TIMEOUT_S: Final = 50.0
 OBSERVATION_INTERVAL_S: Final = 0.1
+UNMOUNT_RETRY_LIMIT: Final = 100
 CONTROL_RESPONSE_BYTES: Final = 16 * 1024
 CONTROL_TIMEOUT_S: Final = 9.0
 RUNTIME_STATUS_BYTES: Final = 32 * 1024
@@ -2396,7 +2397,7 @@ def _detach(loop: Path, image: Path) -> None:
 
 
 def _unmount(target: Path, loop: Path) -> None:
-    for attempt in range(20):
+    for attempt in range(UNMOUNT_RETRY_LIMIT):
         row = _findmnt(target)
         if (
             row.get("source") != loop.as_posix()
@@ -2409,7 +2410,7 @@ def _unmount(target: Path, loop: Path) -> None:
         )
         if result.returncode == 0:
             return
-        if attempt < 19:
+        if attempt + 1 < UNMOUNT_RETRY_LIMIT:
             time.sleep(0.1)
     raise HarnessError("owned private mount remained busy after its retry bound")
 

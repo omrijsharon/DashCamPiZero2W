@@ -1967,6 +1967,7 @@ def test_source_has_owned_loop_cleanup_and_no_broad_destructive_actions() -> Non
         "nodiscard,lazy_itable_init=0,lazy_journal_init=0",
         '"rw,nosuid,nodev,noexec,noatime,nodiscard"',
         "owned private mount remained busy after its retry bound",
+        "UNMOUNT_RETRY_LIMIT: Final = 100",
         "_require_dense_image",
         "_require_owned_loop",
     ):

@@ -847,7 +847,7 @@ def render_transient_properties(
     else:
         groups = "audio video render dialout dashcam-storage dashcam-api"
     camera = role in {"candidate", "rollback-recorder"}
-    needs_devices = camera or role == "preflight-diagnostic"
+    needs_devices = camera or role in {"preflight-diagnostic", "rollback-recovery"}
     bind_paths = (
         f"BindPaths={sources[0]}:/srv/dashcam "
         f"{sources[1]}:/var/lib/dashcam {sources[2]}:/run/dashcam"

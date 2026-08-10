@@ -656,8 +656,8 @@ def test_rollback_recovery_is_camera_closed_and_rollback_recorder_is_minimal(
     assert "Type=oneshot" in recovery
     assert "Restart=no" in recovery
     assert "SupplementaryGroups=dashcam-storage" in recovery
-    assert "PrivateDevices=yes" in recovery
-    assert "DevicePolicy=closed" in recovery
+    assert "PrivateDevices=no" in recovery
+    assert "DevicePolicy=auto" in recovery
     for group in ("audio", "video", "render", "dialout", "dashcam-api"):
         assert group not in recovery_text
     assert "SupplementaryGroups=video render dialout dashcam-storage" in recorder

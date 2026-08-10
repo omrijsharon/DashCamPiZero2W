@@ -2081,6 +2081,71 @@ def test_phase_a_launch_failure_malformed_and_unknown_values_have_closed_lines(
             assert private not in refusal
 
 
+def test_wait_recording_timeout_uses_closed_status_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Path("/run/dashcam-m10-private.123456789abc")
+    status = runtime / "status.json"
+    payload = _launch_status_payload("FAULTED", "PIPELINE_NO_PROGRESS")
+    monotonic = iter((0.0, 1.0))
+    monkeypatch.setattr(run.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(run.Path, "is_file", lambda self: self == status)
+    monkeypatch.setattr(run.Path, "is_symlink", lambda _self: False)
+    monkeypatch.setattr(run, "_bounded_read", lambda _path, _maximum: payload)
+
+    try:
+        run._wait_recording(runtime, timeout=0.5)
+    except run.HarnessError as error:
+        refusal = run._refusal_line(error)
+    else:
+        pytest.fail("recording-status timeout unexpectedly returned")
+
+    assert refusal.startswith(b"REFUSED: H_HARNESS_Fphase_a_launch_failure_status_L")
+    assert run._validated_refusal_location(refusal) == refusal
+    for private in (
+        b"MyHome",
+        b"hunter2",
+        b"/private",
+        b"abcdef",
+        b"32.1",
+        b"34.8",
+        b"/srv",
+        b"detail",
+        b"runtime",
+        b"reason",
+    ):
+        assert private not in refusal
+
+
+def test_wait_recording_success_does_not_run_failure_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Path("/run/dashcam-m10-private.123456789abc")
+    status = runtime / "status.json"
+    payload = _launch_status_payload("RECORDING", None)
+    monotonic = iter((0.0, 0.1))
+    classified: list[Path] = []
+    monkeypatch.setattr(run.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(run.Path, "is_file", lambda self: self == status)
+    monkeypatch.setattr(run.Path, "is_symlink", lambda _self: False)
+    monkeypatch.setattr(run, "_bounded_read", lambda _path, _maximum: payload)
+    monkeypatch.setattr(
+        run,
+        "_phase_a_launch_failure_status",
+        lambda path: classified.append(path),
+    )
+
+    assert run._wait_recording(runtime, timeout=0.5)["lifecycle"] == {
+        "state": "RECORDING",
+        "reason": None,
+        "detail": "SSID MyHome PSK hunter2 /private/path token abcdef",
+        "sequence": 7,
+        "config_schema_version": 1,
+        "notification_failures": 0,
+    }
+    assert classified == []
+
+
 def test_phase_a_wires_launch_failure_status_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

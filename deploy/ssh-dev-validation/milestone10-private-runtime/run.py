@@ -2391,7 +2391,8 @@ def _wait_recording(runtime: Path, timeout: float = UNIT_START_TIMEOUT_S) -> dic
             if isinstance(lifecycle, dict) and lifecycle.get("state") in {"RECORDING", "DEGRADED"}:
                 return status
         time.sleep(0.1)
-    raise HarnessError("candidate did not publish recording status within its deadline")
+    _phase_a_launch_failure_status(runtime)
+    raise HarnessError("candidate recording status classification unexpectedly returned")
 
 
 def _remove_unit(unit: str) -> None:

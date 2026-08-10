@@ -108,7 +108,6 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "require_root_identity",
     "findmnt",
     "service_properties",
-    "command",
     "create_runtime_exclusion",
     "remove_owned_runtime_exclusion",
     "write_recovery_journal",

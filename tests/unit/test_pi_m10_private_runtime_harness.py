@@ -1535,23 +1535,44 @@ def test_refusal_location_accepts_only_reviewed_function_and_executable_line() -
         assert run._validated_refusal_location(refused) is None
 
 
-def test_refusal_line_uses_deepest_exact_reviewed_frame_without_private_text(
+def test_refusal_line_skips_command_frame_for_exact_reviewed_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_command(*_args: object, **_kwargs: object) -> object:
-        raise OSError("SSID MyHome PSK hunter2 coordinates 32.1,34.8 /private/path")
-
-    monkeypatch.setattr(run, "_command", fail_command)
+    completed = run.subprocess.CompletedProcess(
+        ["/private/tool", "--token", "abcdef"],
+        9,
+        stdout=b"SSID MyHome coordinates 32.1,34.8",
+        stderr=b"PSK hunter2 /private/path",
+    )
+    monkeypatch.setattr(run.subprocess, "run", lambda *_args, **_kwargs: completed)
     try:
         run._findmnt(Path("/"))
-    except OSError as error:
+    except run.HarnessError as error:
+        traceback = error.__traceback__
+        frames: list[tuple[str, int]] = []
+        while traceback is not None:
+            frames.append((traceback.tb_frame.f_code.co_name, traceback.tb_lineno))
+            traceback = traceback.tb_next
+        caller_line = next(line for name, line in frames if name == "_findmnt")
         payload = run._refusal_line(error)
     else:
-        pytest.fail("injected command failure was not raised")
+        pytest.fail("nonzero command unexpectedly succeeded")
 
-    assert payload.startswith(b"REFUSED: H_OS_Ffindmnt_L")
+    assert any(name == "_command" for name, _line in frames)
+    assert "command" not in run._reviewed_function_lines()
+    assert payload == f"REFUSED: H_HARNESS_Ffindmnt_L{caller_line}\n".encode("ascii")
     assert run._validated_refusal_location(payload) == payload
-    for private in (b"MyHome", b"hunter2", b"32.1", b"34.8", b"/private"):
+    for private in (
+        b"MyHome",
+        b"hunter2",
+        b"32.1",
+        b"34.8",
+        b"/private",
+        b"abcdef",
+        b"returncode",
+        b"stdout",
+        b"stderr",
+    ):
         assert private not in payload
 
 

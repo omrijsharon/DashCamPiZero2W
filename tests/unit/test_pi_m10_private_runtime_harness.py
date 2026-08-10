@@ -2655,6 +2655,35 @@ def test_wait_recording_success_does_not_run_failure_classifier(
     assert classified == []
 
 
+def test_wait_recording_routes_preflight_failure_to_private_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Path("/run/dashcam-m10-private.123456789abc")
+    status = runtime / "status.json"
+    payload = _storage_fault_status_payload(
+        preflight=None,
+        detail="storage preflight failed",
+    )
+    monotonic = iter((0.0, 1.0))
+    called: list[bool] = []
+    monkeypatch.setattr(run.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(run.Path, "is_file", lambda self: self == status)
+    monkeypatch.setattr(run.Path, "is_symlink", lambda _self: False)
+    monkeypatch.setattr(run, "_bounded_read", lambda _path, _maximum: payload)
+
+    def diagnostic() -> None:
+        called.append(True)
+        raise run.HarnessError("fixed diagnostic refusal")
+
+    with pytest.raises(run.HarnessError, match="fixed diagnostic refusal"):
+        run._wait_recording(
+            runtime,
+            timeout=0.5,
+            preflight_failure=diagnostic,
+        )
+    assert called == [True]
+
+
 def test_phase_a_wires_launch_failure_status_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

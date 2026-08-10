@@ -2501,7 +2501,12 @@ def _wait_unit_terminal(unit: str, timeout: float) -> dict[str, str]:
     raise HarnessError("transient unit did not reach a terminal state")
 
 
-def _wait_recording(runtime: Path, timeout: float = UNIT_START_TIMEOUT_S) -> dict[str, object]:
+def _wait_recording(
+    runtime: Path,
+    timeout: float = UNIT_START_TIMEOUT_S,
+    *,
+    preflight_failure: Callable[[], None] | None = None,
+) -> dict[str, object]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         path = runtime / "status.json"
@@ -2511,7 +2516,7 @@ def _wait_recording(runtime: Path, timeout: float = UNIT_START_TIMEOUT_S) -> dic
             if isinstance(lifecycle, dict) and lifecycle.get("state") in {"RECORDING", "DEGRADED"}:
                 return status
         time.sleep(0.1)
-    _phase_a_launch_failure_status(runtime)
+    _phase_a_launch_failure_status(runtime, preflight_failure=preflight_failure)
     raise HarnessError("candidate recording status classification unexpectedly returned")
 
 
@@ -4052,7 +4057,10 @@ def _phase_a(
     started_ns = time.monotonic_ns()
     stopped = False
     try:
-        _wait_recording(runtime)
+        _wait_recording(
+            runtime,
+            preflight_failure=lambda: _run_preflight_diagnostic(nonce, paths),
+        )
         ready_ns = time.monotonic_ns()
         if ready_ns - started_ns >= 40_000_000_000 or _space(root)[1] < high:
             raise HarnessError(

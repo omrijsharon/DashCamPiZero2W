@@ -1076,7 +1076,11 @@ def test_candidate_selection_waits_for_reclaimer_quiescence(
         tmp_path / "recording",
     ) is expected
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
-    assert "live_snapshot = _wait_reclaim_quiescent(runtime, catalog, root)" in source
+    quiescent = "_wait_reclaim_quiescent(runtime, catalog, root)"
+    candidates = "candidates = _wait_listener_candidates(catalog, root)"
+    assert quiescent in source
+    assert candidates in source
+    assert source.index(quiescent) < source.index(candidates)
 
 
 def test_strict_idr_parser_rejects_keyframe_without_idr() -> None:
@@ -2130,6 +2134,9 @@ def test_each_live_crossing_starts_in_a_fresh_writing_interval() -> None:
     assert "timeout: float = 95" in source
     assert 'if len(writing) > 2:' in source
     assert 'if len(early) > 1:' in source
+    assert "_wait_listener_candidates(catalog, root)" in phase
+    assert 'row["pair_reconciled"] is True' in source
+    assert 'row["managed"] is True' in source
 
 
 def test_fresh_writing_selection_accepts_one_small_successor_during_overlap(

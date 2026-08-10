@@ -262,6 +262,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "wait_fresh_writing",
     "wait_delete_progress",
     "wait_reclaim_quiescent",
+    "wait_listener_candidates",
     "canonical_media_row",
     "wait_event_media",
     "media_evidence",
@@ -4058,6 +4059,32 @@ def _wait_reclaim_quiescent(
     raise HarnessError("runtime reclaimer did not quiesce after filler removal")
 
 
+def _wait_listener_candidates(
+    catalog: Path,
+    root: Path,
+    *,
+    timeout: float = 70,
+) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshot = _query_catalog(catalog, root)
+        candidates = [
+            row
+            for row in cast(list[dict[str, object]], snapshot["clips"])
+            if row["lifecycle"] == "FINALIZED"
+            and row["protected"] is False
+            and row["leased"] is False
+            and row["video_present"] is True
+            and row["sidecar_present"] is True
+            and row["pair_reconciled"] is True
+            and row["managed"] is True
+        ]
+        if len(candidates) >= 2:
+            return candidates
+        time.sleep(0.1)
+    raise HarnessError("too few reconciled candidates for listener exclusion phase")
+
+
 def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, object]:
     from dashcam.metadata.reconcile import parse_sidecar_bytes
 
@@ -4657,22 +4684,13 @@ def _phase_a(
             low - 2 * 1024**2,
             allow_concurrent_reclaim=True,
         )
-        live_snapshot, writing_after = _wait_delete_progress(
+        _live_snapshot, writing_after = _wait_delete_progress(
             catalog, root, before_live_count, writing_before
         )
         _remove_filler(live_filler, root)
-        live_snapshot = _wait_reclaim_quiescent(runtime, catalog, root)
+        _wait_reclaim_quiescent(runtime, catalog, root)
 
-        candidates = [
-            row
-            for row in cast(list[dict[str, object]], live_snapshot["clips"])
-            if row["lifecycle"] == "FINALIZED"
-            and row["protected"] is False
-            and row["leased"] is False
-            and row["video_present"] is True
-        ]
-        if len(candidates) < 2:
-            raise HarnessError("too few retained candidates for listener exclusion phase")
+        candidates = _wait_listener_candidates(catalog, root)
         leased = candidates[-1]
         manual = candidates[-2]
         acquired = _raw_control(

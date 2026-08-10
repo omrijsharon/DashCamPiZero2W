@@ -158,6 +158,10 @@ HIGH_PERCENT: Final = 35
 MINIMUM_FREE_GIB: Final = 0.1
 EMERGENCY_FREE_MIB: Final = 16
 STARTUP_DELETE_BUDGET: Final = 64
+PRIVATE_MINIMUM_CAPACITY_BYTES: Final = 128 * 1024 * 1024
+PREFLIGHT_DIAGNOSTIC_STAGES: Final = frozenset(
+    {"IMPORT", "CONFIG", "IDENTITY", "POLICY", "COLLECT", "PARSE", "FILESYSTEM", "RUN", "RESULT"}
+)
 
 RECORDING_LABEL: Final = "DASHCAM"
 CATALOG_LABEL: Final = "M10STATE"
@@ -1935,6 +1939,54 @@ def _validate_runtime_recovery_identity(runtime: Path, dashcam_uid: int) -> os.s
     return runtime_metadata
 
 
+def _consume_preflight_diagnostic_at(
+    runtime_descriptor: int,
+    runtime_metadata: os.stat_result,
+    dashcam_uid: int,
+) -> dict[str, object]:
+    import pwd
+
+    name = "preflight-diagnostic.json"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=runtime_descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != dashcam_uid
+            or metadata.st_gid != pwd.getpwnam("dashcam").pw_gid  # type: ignore[attr-defined]
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_dev != runtime_metadata.st_dev
+            or metadata.st_size <= 0
+            or metadata.st_size > 4096
+        ):
+            raise HarnessError("preflight diagnostic member identity differs")
+        chunks = bytearray()
+        while len(chunks) <= 4096:
+            chunk = os.read(descriptor, min(4097 - len(chunks), 4096))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        payload = bytes(chunks)
+        document = _strict_json(payload, "preflight diagnostic")
+        if (
+            len(payload) > 4096
+            or set(document) != {"schema_version", "stage"}
+            or document.get("schema_version") != 1
+            or document.get("stage") not in PREFLIGHT_DIAGNOSTIC_STAGES
+        ):
+            raise HarnessError("preflight diagnostic result differs")
+        current = os.stat(name, dir_fd=runtime_descriptor, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise HarnessError("preflight diagnostic member changed")
+    finally:
+        os.close(descriptor)
+    os.unlink(name, dir_fd=runtime_descriptor)
+    os.fsync(runtime_descriptor)
+    return document
+
+
 def _cleanup_runtime_recovery_directory(runtime: Path, dashcam_uid: int) -> bool:
     """Remove one exact private runtime tree through verified parent descriptors."""
 
@@ -1982,6 +2034,13 @@ def _cleanup_runtime_recovery_directory(runtime: Path, dashcam_uid: int) -> bool
                         or stat.S_IMODE(metadata.st_mode) != 0o660
                     ):
                         raise HarnessError("recovery control endpoint type differs")
+                elif name == "preflight-diagnostic.json":
+                    _consume_preflight_diagnostic_at(
+                        runtime_descriptor,
+                        runtime_metadata,
+                        dashcam_uid,
+                    )
+                    continue
                 elif name not in {
                     "bind-proof.json",
                     "status.json",
@@ -2335,6 +2394,8 @@ def _cleanup_fixture(paths: Mapping[str, Path]) -> None:
 
 
 def _discard_fixture(paths: Mapping[str, Path]) -> None:
+    import pwd
+
     work = paths["recording"].parent
     if work.parent != Path("/var/tmp") or NONCE_RE.fullmatch(work.name) is None:
         raise HarnessError("fixture discard root differs")
@@ -2348,6 +2409,25 @@ def _discard_fixture(paths: Mapping[str, Path]) -> None:
         "rollback-quiesce-1.json",
         "rollback-quiesce-2.json",
     }
+    runtime_metadata = _validate_runtime_recovery_identity(
+        runtime,
+        pwd.getpwnam("dashcam").pw_uid,  # type: ignore[attr-defined]
+    )
+    if runtime_metadata is None:
+        raise HarnessError("runtime directory disappeared before fixture discard")
+    runtime_descriptor = os.open(
+        runtime,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if "preflight-diagnostic.json" in os.listdir(runtime_descriptor):
+            _consume_preflight_diagnostic_at(
+                runtime_descriptor,
+                runtime_metadata,
+                pwd.getpwnam("dashcam").pw_uid,  # type: ignore[attr-defined]
+            )
+    finally:
+        os.close(runtime_descriptor)
     for child in runtime.iterdir():
         if child.name not in allowed_runtime or child.is_dir() or child.is_symlink():
             raise HarnessError("runtime directory contains an unexpected entry")
@@ -2418,7 +2498,7 @@ def _install_private_state(
         "DASHCAM_STORAGE_ROOT_END_SECTOR=4095\n"
         "DASHCAM_STORAGE_DATA_START_SECTOR=4096\n"
         "DASHCAM_STORAGE_DATA_END_SECTOR=999999\n"
-        "DASHCAM_STORAGE_MINIMUM_CAPACITY_BYTES=1\n"
+        f"DASHCAM_STORAGE_MINIMUM_CAPACITY_BYTES={PRIVATE_MINIMUM_CAPACITY_BYTES}\n"
     ).encode("ascii")
     _write_exfat_sentinel_exclusive(
         recording / ".dashcam-volume",
@@ -3417,6 +3497,8 @@ def _phase_a_launch_failure_status(
 
 
 def _run_preflight_diagnostic(nonce: str, paths: Mapping[str, Path]) -> None:
+    import pwd
+
     output = paths["runtime"] / "preflight-diagnostic.json"
     if output.exists() or output.is_symlink():
         raise HarnessError("preflight diagnostic output already exists")
@@ -3436,7 +3518,26 @@ def _run_preflight_diagnostic(nonce: str, paths: Mapping[str, Path]) -> None:
         values = _wait_unit_terminal(unit, 20)
         if values.get("Result") != "success" or values.get("ExecMainStatus") != "0":
             raise HarnessError("preflight diagnostic unit failed")
-        result = _strict_json(_bounded_read(output, 4096), "preflight diagnostic")
+        runtime_metadata = _validate_runtime_recovery_identity(
+            paths["runtime"],
+            pwd.getpwnam("dashcam").pw_uid,  # type: ignore[attr-defined]
+        )
+        if runtime_metadata is None:
+            raise HarnessError("preflight diagnostic runtime disappeared")
+        runtime_descriptor = os.open(
+            paths["runtime"],
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            result = _consume_preflight_diagnostic_at(
+                runtime_descriptor,
+                runtime_metadata,
+                pwd.getpwnam("dashcam").pw_uid,  # type: ignore[attr-defined]
+            )
+        finally:
+            os.close(runtime_descriptor)
     finally:
         _remove_unit(unit)
     if set(result) != {"schema_version", "stage"} or result.get("schema_version") != 1:

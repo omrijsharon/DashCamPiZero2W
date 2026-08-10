@@ -313,6 +313,10 @@ def test_private_state_routes_only_exfat_sentinel_to_fixed_ownership_writer() ->
     assert '_write_exclusive(recording / ".dashcam-volume"' not in install
     assert "dashcam_uid=dashcam_uid" in install
     assert "storage_gid=storage_gid" in install
+    assert int(
+        run.MINIMUM_FREE_GIB * 1024**3
+    ) < run.PRIVATE_MINIMUM_CAPACITY_BYTES
+    assert run.PRIVATE_MINIMUM_CAPACITY_BYTES < run.EXFAT_IMAGE_BYTES
 
 
 def test_pending_finalizing_sidecar_writer_inherits_exfat_identity_without_mutation(
@@ -2400,6 +2404,26 @@ def test_preflight_execution_diagnostic_has_closed_unique_stage_lines(
         "runtime": runtime,
     }
     monkeypatch.setattr(run, "render_transient_properties", lambda **_kwargs: ())
+    monkeypatch.setitem(
+        sys.modules,
+        "pwd",
+        SimpleNamespace(getpwnam=lambda _name: SimpleNamespace(pw_uid=1234)),
+    )
+    monkeypatch.setattr(
+        run,
+        "_validate_runtime_recovery_identity",
+        lambda _runtime, _uid: runtime.stat(),
+    )
+    monkeypatch.setattr(run.os, "open", lambda *_args, **_kwargs: 99)
+    monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
+    monkeypatch.setattr(
+        run,
+        "_consume_preflight_diagnostic_at",
+        lambda *_args: run._strict_json(
+            (runtime / "preflight-diagnostic.json").read_bytes(),
+            "preflight diagnostic",
+        ),
+    )
     monkeypatch.setattr(
         run,
         "_wait_unit_terminal",

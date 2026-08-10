@@ -2115,6 +2115,8 @@ def test_media_evidence_never_turns_unavailable_sidecar_drop_count_into_zero() -
 
     assert '"sidecar_drop_counter_available": not counter_warning' in source
     assert '0 if row.get("sidecar_drop_counter_available") is True else None' in source
+    assert "MEDIA_DECODE_TIMEOUT_S: Final = 75" in source
+    assert "timeout=MEDIA_DECODE_TIMEOUT_S" in source
 
 
 def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:

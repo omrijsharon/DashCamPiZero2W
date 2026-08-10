@@ -63,6 +63,7 @@ QUALIFICATION_TIMEOUT_S: Final = 900
 UNIT_START_TIMEOUT_S: Final = 48
 UNIT_STOP_TIMEOUT_S: Final = 35
 ROLLBACK_TIMEOUT_S: Final = 60
+MEDIA_DECODE_TIMEOUT_S: Final = 75
 SYSTEMD_RUN_CLIENT_TIMEOUT_S: Final = 20.0
 SYSTEMD_RUN_NOTIFY_TIMEOUT_S: Final = 50.0
 OBSERVATION_INTERVAL_S: Final = 0.1
@@ -4249,7 +4250,7 @@ def _media_evidence(rows: Sequence[Mapping[str, object]]) -> list[dict[str, obje
                 "null",
                 "-",
             ),
-            timeout=30,
+            timeout=MEDIA_DECODE_TIMEOUT_S,
         )
         probe = _command(
             (

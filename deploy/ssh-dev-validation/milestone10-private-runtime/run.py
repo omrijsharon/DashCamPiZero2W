@@ -4641,7 +4641,7 @@ def _phase_a(
     dashcam_uid: int,
 ) -> dict[str, object]:
     root, state, runtime = paths["recording"], paths["state"], paths["runtime"]
-    _source_environment(state / "candidate-source.zip")
+    _source_environment(root.parent / "bundle" / "candidate-source.zip")
     catalog = state / "catalog.sqlite3"
     boot_id = _read_boot_id()
     fixture = _fixture_subprocess("A", root, catalog, boot_id, state / "candidate-source.zip")

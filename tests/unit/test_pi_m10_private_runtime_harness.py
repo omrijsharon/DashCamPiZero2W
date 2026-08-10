@@ -2055,6 +2055,14 @@ def test_fixture_mounts_are_made_private_with_exact_propagation_proof(
     ]
 
 
+def test_parent_media_parser_imports_from_frozen_bundle_not_state_mount() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    phase_a = source[source.index("def _phase_a(") : source.index("def _rollback_phase(")]
+
+    assert '_source_environment(root.parent / "bundle" / "candidate-source.zip")' in phase_a
+    assert '_source_environment(state / "candidate-source.zip")' not in phase_a
+
+
 def test_readme_states_private_scope_and_all_nonclaims() -> None:
     readme = (HARNESS / "README.md").read_text(encoding="utf-8")
 

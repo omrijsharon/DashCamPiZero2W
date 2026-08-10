@@ -1576,6 +1576,164 @@ def test_refusal_line_skips_command_frame_for_exact_reviewed_caller(
         assert private not in payload
 
 
+def test_fixture_subprocess_relays_only_exact_self_validated_child_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    line = min(run._reviewed_function_lines()["seed_fixture"])
+    child = f"REFUSED: H_HARNESS_Fseed_fixture_L{line}\n".encode("ascii")
+    completed = run.subprocess.CompletedProcess([], 2, stdout=b"", stderr=child)
+    monkeypatch.setitem(sys.modules, "pwd", SimpleNamespace())
+    monkeypatch.setattr(run.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    try:
+        run._fixture_subprocess(
+            "A", Path("/fixture"), Path("/state/catalog.sqlite3"), "boot", Path("/source.zip")
+        )
+    except run.FixtureChildRefusal as error:
+        payload = run._refusal_line(error)
+    else:
+        pytest.fail("exact fixture child refusal was not relayed")
+
+    expected = f"REFUSED: H_FIXTURE_CHILD child=H_HARNESS_Fseed_fixture_L{line}\n".encode(
+        "ascii"
+    )
+    assert payload == expected
+    assert run._validated_fixture_child_refusal(payload) == payload
+
+
+def test_fixture_subprocess_rejects_every_nonexact_child_refusal_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lines = run._reviewed_function_lines()
+    line = min(lines["seed_fixture"])
+    child = f"REFUSED: H_HARNESS_Fseed_fixture_L{line}\n".encode("ascii")
+    wrong_line = max(lines["seed_fixture"]) + 1
+    cases = (
+        (1, b"", child),
+        (2, b"private stdout", child),
+        (2, b"", child.removesuffix(b"\n")),
+        (2, b"", child + b"private second line\n"),
+        (2, b"", f"REFUSED: H_HARNESS_Fseed_fixture_L{wrong_line}\n".encode("ascii")),
+        (2, b"", f"REFUSED: H_HARNESS_Fexternal_L{line}\n".encode("ascii")),
+        (2, b"", b"SSID MyHome PSK hunter2 coordinates 32.1,34.8 /private/path\n"),
+        (2, b"", b"x" * (run.MAX_COMMAND_OUTPUT + 1)),
+    )
+    monkeypatch.setitem(sys.modules, "pwd", SimpleNamespace())
+
+    for returncode, stdout, stderr in cases:
+        completed = run.subprocess.CompletedProcess(
+            ["/private/tool", "--token", "abcdef"],
+            returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        monkeypatch.setattr(
+            run.subprocess,
+            "run",
+            lambda *_args, _completed=completed, **_kwargs: _completed,
+        )
+        try:
+            run._fixture_subprocess(
+                "A",
+                Path("/fixture"),
+                Path("/state/catalog.sqlite3"),
+                "boot",
+                Path("/source.zip"),
+            )
+        except run.HarnessError as error:
+            assert not isinstance(error, run.FixtureChildRefusal)
+            payload = run._refusal_line(error)
+        else:
+            pytest.fail("nonexact fixture child refusal was admitted")
+
+        assert payload.startswith(b"REFUSED: H_HARNESS_Ffixture_subprocess_L")
+        assert run._validated_refusal_location(payload) == payload
+        assert run._validated_fixture_child_refusal(payload) is None
+        for private in (
+            b"MyHome",
+            b"hunter2",
+            b"32.1",
+            b"34.8",
+            b"/private",
+            b"abcdef",
+            b"stdout",
+            b"stderr",
+        ):
+            assert private not in payload
+
+
+def test_fixture_child_refusal_is_opt_in_to_fixture_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    line = min(run._reviewed_function_lines()["seed_fixture"])
+    child = f"REFUSED: H_HARNESS_Fseed_fixture_L{line}\n".encode("ascii")
+    completed = run.subprocess.CompletedProcess([], 2, stdout=b"", stderr=child)
+    monkeypatch.setattr(run.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(run.HarnessError) as captured:
+        run._command(("/private/tool",))
+
+    assert not isinstance(captured.value, run.FixtureChildRefusal)
+    assert run._refusal_line(captured.value) == b"REFUSED: HarnessError\n"
+
+
+def test_parent_top_level_emits_only_closed_fixture_child_token(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    line = min(run._reviewed_function_lines()["seed_fixture"])
+    child = f"REFUSED: H_VALUE_Fseed_fixture_L{line}\n".encode("ascii")
+    arguments = run.argparse.Namespace(
+        recover_work=None,
+        fixture=None,
+        bundle="bundle",
+        expected_manifest_sha256="0" * 64,
+        expected_harness_commit="1" * 40,
+        expected_candidate_commit=run.EXPECTED_CANDIDATE,
+        rollback_commit=run.EXPECTED_ROLLBACK,
+        expected_board_serial="00000000db28ffe4",
+        output="/var/tmp/result.json",
+        fixture_root=None,
+        fixture_catalog=None,
+        fixture_boot_id=None,
+        fixture_source=None,
+    )
+    parser = SimpleNamespace(parse_args=lambda _argv: arguments)
+    monkeypatch.setattr(run, "_parser", lambda: parser)
+
+    def refuse(_arguments: object) -> dict[str, object]:
+        raise run.FixtureChildRefusal(child)
+
+    monkeypatch.setattr(run, "qualify", refuse)
+
+    assert run.main([]) == 2
+    captured = capsys.readouterr()
+    expected = f"REFUSED: H_FIXTURE_CHILD child=H_VALUE_Fseed_fixture_L{line}\n"
+    assert captured.out == ""
+    assert captured.err == expected
+    assert run._validated_fixture_child_refusal(captured.err.encode("ascii")) is not None
+
+
+def test_nested_fixture_child_validator_rejects_malformed_or_forged_tokens() -> None:
+    lines = run._reviewed_function_lines()
+    line = min(lines["seed_fixture"])
+    accepted = f"REFUSED: H_FIXTURE_CHILD child=H_OS_Fseed_fixture_L{line}\n".encode(
+        "ascii"
+    )
+    assert run._validated_fixture_child_refusal(accepted) == accepted
+
+    for refused in (
+        accepted.removesuffix(b"\n"),
+        accepted + b"private second line\n",
+        accepted.replace(b"H_FIXTURE_CHILD", b"H_OTHER_CHILD"),
+        f"REFUSED: H_FIXTURE_CHILD child=H_OS_Fseed_fixture_L"
+        f"{max(lines['seed_fixture']) + 1}\n".encode("ascii"),
+        f"REFUSED: H_FIXTURE_CHILD child=H_OS_Fexternal_L{line}\n".encode("ascii"),
+        b"REFUSED: H_FIXTURE_CHILD child=SSID MyHome PSK hunter2\n",
+    ):
+        assert run._validated_fixture_child_refusal(refused) is None
+
+
 @pytest.mark.parametrize(
     ("error", "plain"),
     [

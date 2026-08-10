@@ -91,9 +91,13 @@ LIVE_LOCKS: Final = (
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
 SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 LOOP_RE: Final = re.compile(r"/dev/loop[0-9]{1,4}")
-REFUSAL_LOCATION_RE: Final = re.compile(
-    rb"REFUSED: H_(HARNESS|SQLITE|OS|UNICODE|ZIP|VALUE|ASSERT|ATTRIBUTE|KEY|"
-    rb"RUNTIME|TYPE|EXCEPTION)_F([a-z][a-z0-9_]*)_L([1-9][0-9]{0,3})\n"
+REFUSAL_TOKEN_PATTERN: Final = (
+    rb"H_(HARNESS|SQLITE|OS|UNICODE|ZIP|VALUE|ASSERT|ATTRIBUTE|KEY|RUNTIME|"
+    rb"TYPE|EXCEPTION)_F([a-z][a-z0-9_]*)_L([1-9][0-9]{0,3})"
+)
+REFUSAL_LOCATION_RE: Final = re.compile(rb"REFUSED: " + REFUSAL_TOKEN_PATTERN + rb"\n")
+FIXTURE_CHILD_REFUSAL_RE: Final = re.compile(
+    rb"REFUSED: H_FIXTURE_CHILD child=(" + REFUSAL_TOKEN_PATTERN + rb")\n"
 )
 MAX_REVIEWED_RUN_LINE: Final = 8192
 DIAGNOSTIC_FUNCTIONS: Final = (
@@ -121,7 +125,9 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "wait_recording",
     "remove_unit",
     "run_bind_probe",
+    "source_environment",
     "fixture_subprocess",
+    "seed_fixture",
     "query_catalog",
     "managed_manifest",
     "allocate_filler",
@@ -171,6 +177,14 @@ MANIFEST_MEMBERS: Final = frozenset(
 
 class HarnessError(RuntimeError):
     """The qualification cannot safely establish one required fact."""
+
+
+class FixtureChildRefusal(HarnessError):
+    """One isolated fixture child emitted an exact reviewed refusal token."""
+
+    def __init__(self, child_refusal: bytes) -> None:
+        super().__init__("isolated fixture child safely refused")
+        self.child_refusal = child_refusal
 
 
 _qualification_deadline_ns: int | None = None
@@ -732,6 +746,7 @@ def _command(
     *,
     timeout: float = 30,
     allowed: frozenset[int] = frozenset({0}),
+    safe_fixture_refusal: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     if _qualification_deadline_ns is not None:
         remaining = (_qualification_deadline_ns - time.monotonic_ns()) / 1_000_000_000
@@ -753,6 +768,13 @@ def _command(
     if len(result.stdout) > MAX_COMMAND_OUTPUT or len(result.stderr) > MAX_COMMAND_OUTPUT:
         raise HarnessError("command output exceeded its bound")
     if result.returncode not in allowed:
+        if (
+            safe_fixture_refusal
+            and result.returncode == 2
+            and result.stdout == b""
+            and _validated_refusal_location(result.stderr) == result.stderr
+        ):
+            raise FixtureChildRefusal(result.stderr)
         raise HarnessError(f"command refused: {Path(command[0]).name}")
     return result
 
@@ -2316,6 +2338,7 @@ def _fixture_subprocess(
             source_archive,
         ),
         timeout=60,
+        safe_fixture_refusal=True,
     )
     seeded = _strict_json(result.stdout, "fixture seed result")
     owner = pwd.getpwnam("dashcam")  # type: ignore[attr-defined]
@@ -4516,7 +4539,24 @@ def _validated_refusal_location(payload: bytes) -> bytes | None:
     return payload
 
 
+def _validated_fixture_child_refusal(payload: bytes) -> bytes | None:
+    match = FIXTURE_CHILD_REFUSAL_RE.fullmatch(payload)
+    if match is None:
+        return None
+    child = b"REFUSED: " + match.group(1) + b"\n"
+    if _validated_refusal_location(child) != child:
+        return None
+    return payload
+
+
 def _refusal_line(error: Exception) -> bytes:
+    if isinstance(error, FixtureChildRefusal):
+        child = _validated_refusal_location(error.child_refusal)
+        if child is not None:
+            payload = b"REFUSED: H_FIXTURE_CHILD child=" + child[9:-1] + b"\n"
+            validated_child = _validated_fixture_child_refusal(payload)
+            if validated_child is not None:
+                return validated_child
     category = _exception_category(error)
     location = _reviewed_exception_location(error)
     if location is not None:

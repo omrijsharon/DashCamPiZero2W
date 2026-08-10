@@ -1126,7 +1126,7 @@ def test_runtime_health_requires_exact_hardware_and_known_zero_drops() -> None:
     for mutation in (None, True, 1):
         status = _healthy_status()
         status["runtime"]["frames"]["dropped"] = mutation  # type: ignore[index]
-        with pytest.raises(run.HarnessError, match="health"):
+        with pytest.raises(run.HarnessError, match="runtime"):
             run._runtime_health(status)
     status = _healthy_status()
     status["runtime"]["video"]["encoder_identity"]["factory_name"] = "x264enc"  # type: ignore[index]
@@ -2112,6 +2112,34 @@ def test_media_evidence_never_turns_unavailable_sidecar_drop_count_into_zero() -
 
     assert '"sidecar_drop_counter_available": not counter_warning' in source
     assert '0 if row.get("sidecar_drop_counter_available") is True else None' in source
+
+
+def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    messages = (
+        "runtime aggregate drop counter shape differs",
+        "runtime recorded aggregate dropped frames",
+        "runtime raw frame progress differs",
+        "runtime encoded frame progress differs",
+        "runtime drop counter source differs",
+        "runtime pipeline restart count differs",
+        "runtime overlay reported an error",
+        "runtime renderer reported an error",
+        "runtime renderer update rejection count differs",
+        "runtime renderer contract mismatch count differs",
+        "runtime renderer transform failure count differs",
+        "runtime renderer mapping rejection count differs",
+        "runtime renderer synchronization failure count differs",
+    )
+    observed = [
+        index + 1
+        for index, line in enumerate(source.splitlines())
+        if any(message in line for message in messages)
+    ]
+
+    assert len(observed) == len(messages)
+    assert len(set(observed)) == len(messages)
+    assert set(observed).issubset(run._reviewed_function_lines()["runtime_health"])
 
 
 def test_control_wrapper_is_not_a_reviewed_diagnostic_location() -> None:

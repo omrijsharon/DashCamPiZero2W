@@ -4413,24 +4413,32 @@ def _runtime_health(status: Mapping[str, object]) -> dict[str, object]:
         "mapping_limit_rejections",
         "sync_failures",
     )
-    if (
-        not isinstance(dropped, int)
-        or isinstance(dropped, bool)
-        or dropped != 0
-        or not isinstance(raw, int)
-        or isinstance(raw, bool)
-        or raw <= 0
-        or not isinstance(encoded, int)
-        or isinstance(encoded, bool)
-        or encoded <= 0
-        or not isinstance(drop_source, str)
-        or not drop_source
-        or runtime.get("pipeline_restart_count") != 0
-        or overlay.get("last_error") is not None
-        or renderer.get("last_error") is not None
-        or any(renderer.get(name) != 0 for name in zero_renderer)
-    ):
-        raise HarnessError("runtime drop/restart/renderer health gate failed")
+    if not isinstance(dropped, int) or isinstance(dropped, bool) or dropped < 0:
+        raise HarnessError("runtime aggregate drop counter shape differs")
+    if dropped != 0:
+        raise HarnessError("runtime recorded aggregate dropped frames")
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+        raise HarnessError("runtime raw frame progress differs")
+    if not isinstance(encoded, int) or isinstance(encoded, bool) or encoded <= 0:
+        raise HarnessError("runtime encoded frame progress differs")
+    if not isinstance(drop_source, str) or not drop_source:
+        raise HarnessError("runtime drop counter source differs")
+    if runtime.get("pipeline_restart_count") != 0:
+        raise HarnessError("runtime pipeline restart count differs")
+    if overlay.get("last_error") is not None:
+        raise HarnessError("runtime overlay reported an error")
+    if renderer.get("last_error") is not None:
+        raise HarnessError("runtime renderer reported an error")
+    if renderer.get("update_rejections") != 0:
+        raise HarnessError("runtime renderer update rejection count differs")
+    if renderer.get("contract_mismatches") != 0:
+        raise HarnessError("runtime renderer contract mismatch count differs")
+    if renderer.get("transform_failures") != 0:
+        raise HarnessError("runtime renderer transform failure count differs")
+    if renderer.get("mapping_limit_rejections") != 0:
+        raise HarnessError("runtime renderer mapping rejection count differs")
+    if renderer.get("sync_failures") != 0:
+        raise HarnessError("runtime renderer synchronization failure count differs")
     if (
         video.get("width") != 1920
         or video.get("height") != 1080

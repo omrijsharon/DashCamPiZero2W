@@ -624,6 +624,8 @@ def test_candidate_transient_unit_matches_private_production_contract(tmp_path: 
     assert f"{recording.as_posix()}:/srv/dashcam" in text
     assert f"{state.as_posix()}:/var/lib/dashcam" in text
     assert f"{runtime.as_posix()}:/run/dashcam" in text
+    assert sum(prop.startswith("BindPaths=") for prop in properties) == 1
+    assert not any(prop.startswith("ReadWritePaths=") for prop in properties)
     assert "StateDirectory=" not in text
     assert "RuntimeDirectory=" not in text
 

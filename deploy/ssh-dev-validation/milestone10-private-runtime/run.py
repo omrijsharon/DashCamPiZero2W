@@ -875,7 +875,6 @@ def render_transient_properties(
         "LockPersonality=yes",
         "MemoryDenyWriteExecute=yes",
         "RestrictAddressFamilies=AF_UNIX",
-        "ReadWritePaths=/var/lib/dashcam /srv/dashcam /run/dashcam",
         bind_paths,
         "WorkingDirectory=/var/lib/dashcam",
     ]

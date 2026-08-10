@@ -1924,6 +1924,11 @@ def test_canonical_media_refusals_use_the_reviewed_function_lines() -> None:
     assert set(observed).issubset(run._reviewed_function_lines()["canonical_media_row"])
 
 
+def test_control_wrapper_is_not_a_reviewed_diagnostic_location() -> None:
+    assert "raw_control" not in run.DIAGNOSTIC_FUNCTIONS
+    assert "raw_control" not in run._reviewed_function_lines()
+
+
 def test_rollback_output_is_opened_inside_private_namespace() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 

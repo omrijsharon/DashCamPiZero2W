@@ -250,7 +250,6 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "managed_manifest",
     "allocate_filler",
     "remove_filler",
-    "raw_control",
     "listener_identity",
     "phase_a_launch_failure_status",
     "run_preflight_diagnostic",

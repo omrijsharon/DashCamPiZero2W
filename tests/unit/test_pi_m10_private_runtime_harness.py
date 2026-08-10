@@ -1968,6 +1968,35 @@ def test_canonical_media_refusals_use_the_reviewed_function_lines() -> None:
     assert set(observed).issubset(run._reviewed_function_lines()["canonical_media_row"])
 
 
+def test_canonical_media_accepts_production_sidecar_without_result_newline(
+    tmp_path: Path,
+) -> None:
+    _clip, paths, sidecar = run._finalizing_fixture(22, 13)
+    sidecar_path = tmp_path / PurePosixPath(paths.sidecar_target)
+    video_path = tmp_path / PurePosixPath(paths.video_target)
+    sidecar_path.parent.mkdir(parents=True)
+    sidecar_path.write_bytes(sidecar)
+    video_path.write_bytes(b"M10-PRIVATE\n")
+    row = {
+        "clip_id": str(run.UUID(int=23)),
+        "lifecycle": "FINALIZED",
+        "video_path": paths.video_target,
+        "sidecar_path": paths.sidecar_target,
+        "protected": False,
+        "start_monotonic_ns": 22_000_000_000,
+        "end_monotonic_ns": 23_000_000_000,
+        "size_bytes": len(b"M10-PRIVATE\n"),
+        "managed": True,
+        "pair_reconciled": True,
+    }
+
+    observed = run._canonical_media_row(tmp_path, row)
+
+    assert not sidecar.endswith(b"\n")
+    assert observed["clip_id"] == row["clip_id"]
+    assert observed["frames_written"] == 30
+
+
 def test_control_wrapper_is_not_a_reviewed_diagnostic_location() -> None:
     assert "raw_control" not in run.DIAGNOSTIC_FUNCTIONS
     assert "raw_control" not in run._reviewed_function_lines()

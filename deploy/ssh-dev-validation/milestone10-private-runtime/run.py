@@ -3947,7 +3947,7 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
     payload = _bounded_read(sidecar_path, 512 * 1024)
     value = _strict_json(payload, "clip sidecar")
     parsed = parse_sidecar_bytes(payload)
-    if payload != parsed.to_canonical_json() or payload != canonical_json(value):
+    if payload != parsed.to_canonical_json():
         raise HarnessError("clip sidecar is not canonical JSON")
     video_summary = value.get("video")
     warnings = value.get("warnings", [])

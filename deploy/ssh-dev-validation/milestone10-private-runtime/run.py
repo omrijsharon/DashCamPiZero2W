@@ -257,6 +257,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "stop_clean",
     "wait_writing",
     "wait_delete_progress",
+    "wait_reclaim_quiescent",
     "canonical_media_row",
     "wait_event_media",
     "media_evidence",
@@ -3946,6 +3947,38 @@ def _wait_delete_progress(
     raise HarnessError("runtime reclaim made no progress during one WRITING interval")
 
 
+def _wait_reclaim_quiescent(
+    runtime: Path,
+    catalog: Path,
+    root: Path,
+    timeout: float = 15,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        document = _strict_json(
+            _bounded_read(runtime / "status.json", 128 * 1024),
+            "runtime status",
+        )
+        runtime_status = document.get("runtime")
+        retention = (
+            runtime_status.get("storage_retention")
+            if isinstance(runtime_status, dict)
+            else None
+        )
+        if not isinstance(retention, dict) or set(retention) != RETENTION_STATUS_KEYS:
+            raise HarnessError("runtime retention quiescence status differs")
+        if (
+            retention.get("mode") == "NORMAL"
+            and retention.get("fault") is None
+            and retention.get("trigger") is None
+            and retention.get("stop_required") is False
+            and _catalog_counts(catalog)["delete_pending"] == 0
+        ):
+            return _query_catalog(catalog, root)
+        time.sleep(0.1)
+    raise HarnessError("runtime reclaimer did not quiesce after filler removal")
+
+
 def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, object]:
     from dashcam.metadata.reconcile import parse_sidecar_bytes
 
@@ -4517,6 +4550,7 @@ def _phase_a(
             catalog, root, before_live_count, writing_before
         )
         _remove_filler(live_filler, root)
+        live_snapshot = _wait_reclaim_quiescent(runtime, catalog, root)
 
         candidates = [
             row

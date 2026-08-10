@@ -1041,6 +1041,41 @@ def test_only_live_fillers_allow_catalog_proven_reclaim_increase() -> None:
     assert "startup_filler, startup_filler_bytes = _allocate_filler(" in source
 
 
+def test_candidate_selection_waits_for_reclaimer_quiescence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    retention = {key: None for key in run.RETENTION_STATUS_KEYS}
+    retention.update(
+        {
+            "mode": "NORMAL",
+            "fault": None,
+            "trigger": None,
+            "stop_required": False,
+        }
+    )
+    (runtime / "status.json").write_bytes(
+        run.canonical_json({"runtime": {"storage_retention": retention}})
+    )
+    expected = {"clips": [{"clip_id": "fresh"}]}
+    monkeypatch.setattr(run, "_catalog_counts", lambda _catalog: {"delete_pending": 0})
+    monkeypatch.setattr(
+        run,
+        "_query_catalog",
+        lambda _catalog, _root: expected,
+    )
+
+    assert run._wait_reclaim_quiescent(
+        runtime,
+        tmp_path / "catalog.sqlite3",
+        tmp_path / "recording",
+    ) is expected
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    assert "live_snapshot = _wait_reclaim_quiescent(runtime, catalog, root)" in source
+
+
 def test_strict_idr_parser_rejects_keyframe_without_idr() -> None:
     assert run._contains_idr(b"\x00\x00\x00\x01\x65\x88")
     assert run._contains_idr((2).to_bytes(4, "big") + b"\x65\x88")

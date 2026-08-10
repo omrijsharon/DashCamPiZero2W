@@ -965,8 +965,25 @@ def test_filler_allows_only_one_chunk_of_concurrent_recording_decline(
         assert path.is_file()
         assert allocated > 0
     else:
-        with pytest.raises(run.HarnessError, match="bounded target"):
+        with pytest.raises(run.HarnessError, match="below its bounded target"):
             run._allocate_filler(tmp_path, target)
+
+
+def test_filler_target_direction_refusals_are_distinct_reviewed_lines() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    messages = (
+        "filler ended above its bounded target",
+        "filler ended below its bounded target",
+    )
+    observed = [
+        index + 1
+        for index, line in enumerate(source.splitlines())
+        if any(message in line for message in messages)
+    ]
+
+    assert len(observed) == 2
+    assert len(set(observed)) == 2
+    assert set(observed).issubset(run._reviewed_function_lines()["allocate_filler"])
 
 
 def test_strict_idr_parser_rejects_keyframe_without_idr() -> None:

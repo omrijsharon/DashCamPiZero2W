@@ -160,7 +160,26 @@ EMERGENCY_FREE_MIB: Final = 16
 STARTUP_DELETE_BUDGET: Final = 64
 PRIVATE_MINIMUM_CAPACITY_BYTES: Final = 128 * 1024 * 1024
 PREFLIGHT_DIAGNOSTIC_STAGES: Final = frozenset(
-    {"IMPORT", "CONFIG", "IDENTITY", "POLICY", "COLLECT", "PARSE", "FILESYSTEM", "RUN", "RESULT"}
+    {
+        "IMPORT",
+        "CONFIG",
+        "IDENTITY",
+        "POLICY",
+        "COLLECT_ROOT",
+        "COLLECT_FINDMNT",
+        "COLLECT_TARGET",
+        "COLLECT_SOURCE",
+        "COLLECT_FIELDS",
+        "COLLECT_DIRECTORY",
+        "COLLECT_DEVICE",
+        "COLLECT_RELATION",
+        "COLLECT_SPACE",
+        "COLLECT_SENTINEL",
+        "PARSE",
+        "FILESYSTEM",
+        "RUN",
+        "RESULT",
+    }
 )
 
 RECORDING_LABEL: Final = "DASHCAM"
@@ -708,7 +727,48 @@ load_config,p=attempt("IMPORT",imports)
 config=attempt("CONFIG",lambda:load_config("/var/lib/dashcam/config.toml"))
 identity=attempt("IDENTITY",lambda:p.load_storage_identity("/var/lib/dashcam/storage-volume.env"))
 policy=attempt("POLICY",lambda:p.policy_from_identity(config,identity))
-raw=attempt("COLLECT",lambda:p.PosixFactsCollector().collect(policy.recording_root))
+collector=p.PosixFactsCollector()
+root_id=attempt("COLLECT_ROOT",lambda:p._directory_device_id("/"))
+row=attempt("COLLECT_FINDMNT",lambda:collector._find_mount(policy.recording_root))
+if row is None:
+ raw={"mount":{"target":policy.recording_root,"mounted":False,"source":None,"filesystem":None,"label":None,"uuid":None,"mount_options":[],"device_id":None,"os_root_device_id":root_id},"space":{"capacity_bytes":None,"free_bytes":None},"sentinel":None}
+else:
+ target=attempt("COLLECT_TARGET",lambda:p._required_findmnt_string(row,"target"))
+ source=attempt(
+  "COLLECT_SOURCE",
+  lambda:p._canonical_block_source(p._required_findmnt_string(row,"source")),
+ )
+ def fields():
+  filesystem=p._optional_findmnt_string(row,"fstype")
+  label=p._optional_findmnt_string(row,"label")
+  uuid=p._optional_findmnt_string(row,"uuid")
+  options_text=p._required_findmnt_string(row,"options")
+  options=options_text.split(",") if options_text else []
+  if len(options)>p.MAX_MOUNT_OPTIONS: raise RuntimeError("options bound")
+  return filesystem,label,uuid,options
+ filesystem_name,label,uuid,options=attempt("COLLECT_FIELDS",fields)
+ device_id=attempt(
+  "COLLECT_DIRECTORY",
+  lambda:p._directory_device_id(policy.recording_root),
+ )
+ observed_device=attempt(
+  "COLLECT_DEVICE",
+  lambda:p._required_findmnt_string(row,"maj:min"),
+ )
+ if target!=policy.recording_root or observed_device!=device_id:
+  emit("COLLECT_RELATION");raise SystemExit(0)
+ def space():
+  observed=os.statvfs(policy.recording_root)
+  return (
+   p._checked_product(observed.f_blocks,observed.f_frsize),
+   p._checked_product(observed.f_bavail,observed.f_frsize),
+  )
+ capacity,free=attempt("COLLECT_SPACE",space)
+ sentinel=attempt(
+  "COLLECT_SENTINEL",
+  lambda:p._read_canonical_sentinel(policy.recording_root,device_id),
+ )
+ raw={"mount":{"target":target,"mounted":True,"source":source,"filesystem":filesystem_name,"label":label,"uuid":uuid,"mount_options":options,"device_id":device_id,"os_root_device_id":root_id},"space":{"capacity_bytes":capacity,"free_bytes":free},"sentinel":sentinel}
 parsed=attempt("PARSE",lambda:p.recording_root_facts_from_mapping(raw))
 filesystem=attempt("FILESYSTEM",lambda:p.PosixPreflightFilesystem(
  recording_root=policy.recording_root,
@@ -3551,8 +3611,26 @@ def _run_preflight_diagnostic(nonce: str, paths: Mapping[str, Path]) -> None:
         raise HarnessError("preflight diagnostic classified identity")
     if stage == "POLICY":
         raise HarnessError("preflight diagnostic classified policy")
-    if stage == "COLLECT":
-        raise HarnessError("preflight diagnostic classified fact collection")
+    if stage == "COLLECT_ROOT":
+        raise HarnessError("preflight diagnostic classified root device collection")
+    if stage == "COLLECT_FINDMNT":
+        raise HarnessError("preflight diagnostic classified findmnt collection")
+    if stage == "COLLECT_TARGET":
+        raise HarnessError("preflight diagnostic classified mount target collection")
+    if stage == "COLLECT_SOURCE":
+        raise HarnessError("preflight diagnostic classified mount source collection")
+    if stage == "COLLECT_FIELDS":
+        raise HarnessError("preflight diagnostic classified mount field collection")
+    if stage == "COLLECT_DIRECTORY":
+        raise HarnessError("preflight diagnostic classified mount directory collection")
+    if stage == "COLLECT_DEVICE":
+        raise HarnessError("preflight diagnostic classified mount device collection")
+    if stage == "COLLECT_RELATION":
+        raise HarnessError("preflight diagnostic classified mount relation")
+    if stage == "COLLECT_SPACE":
+        raise HarnessError("preflight diagnostic classified filesystem space collection")
+    if stage == "COLLECT_SENTINEL":
+        raise HarnessError("preflight diagnostic classified sentinel collection")
     if stage == "PARSE":
         raise HarnessError("preflight diagnostic classified fact parsing")
     if stage == "FILESYSTEM":

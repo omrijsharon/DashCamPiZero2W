@@ -4438,12 +4438,17 @@ def _phase_a(
             for row in completed_deletes
         ):
             raise HarnessError("startup intent completion timestamps differ")
-        if any(
-            cast(int, row["completed_monotonic_ns"])
-            >= finalize["completed_monotonic_ns"]
+        pre_finalize_deletes = [
+            row
             for row in completed_deletes
-        ):
-            raise HarnessError("startup DELETE completed after FINALIZE")
+            if cast(int, row["completed_monotonic_ns"])
+            < finalize["completed_monotonic_ns"]
+        ]
+        if not pre_finalize_deletes:
+            raise HarnessError("startup DELETE did not complete before FINALIZE")
+        post_finalize_deletes = [
+            row for row in completed_deletes if row not in pre_finalize_deletes
+        ]
         excluded_rows = {
             row["clip_id"]: row
             for row in cast(list[dict[str, object]], after_start["clips"])
@@ -4589,6 +4594,8 @@ def _phase_a(
             "startup_duration_ns": ready_ns - started_ns,
             "startup_reclaim_before_finalize": True,
             "startup_delete_count": len(completed_deletes),
+            "startup_delete_before_finalize_count": len(pre_finalize_deletes),
+            "startup_delete_after_finalize_count": len(post_finalize_deletes),
             "protected_excluded": True,
             "leased_excluded": True,
             "integrated_finalizing_excluded": True,

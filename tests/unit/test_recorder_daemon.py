@@ -717,6 +717,38 @@ def test_runtime_failure_paths_are_visible_and_bounded(
     run_async(scenario)
 
 
+def test_startup_storage_safety_stop_completes_notify_without_control_endpoint() -> None:
+    async def scenario() -> None:
+        runtime = ControlRuntime(start_error=StorageSafetyStop("emergency reserve reached"))
+        notifier = RecordingNotifier()
+        daemon = RecorderDaemon(
+            config_path="config.toml",
+            runtime=runtime,
+            config_loader=lambda path: default_config(),
+            notifier=notifier,
+            limits=fast_limits(),
+        )
+
+        result = await asyncio.wait_for(daemon.run(), timeout=0.3)
+
+        assert result.outcome is DaemonOutcome.STORAGE_SAFETY_STOP
+        assert result.clean
+        operations = [operation for operation, _ in notifier.messages]
+        assert operations.count("ready") == 1
+        assert operations.index("ready") < operations.index("stopping")
+        ready_status = next(
+            status for operation, status in notifier.messages if operation == "ready"
+        )
+        assert ready_status is not None
+        assert "state=FAULTED" in ready_status
+        assert "reason=STORAGE_FAULT" in ready_status
+        assert runtime.lifecycle == ["runtime_start", "control_stop", "runtime_stop"]
+        assert "control_start" not in runtime.lifecycle
+        assert runtime.run_calls == 0
+
+    run_async(scenario)
+
+
 def test_startup_timeout_cancels_start_and_runs_bounded_cleanup() -> None:
     async def scenario() -> None:
         runtime = FakeRuntime(start_gate=asyncio.Event())

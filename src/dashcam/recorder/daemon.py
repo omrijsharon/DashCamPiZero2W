@@ -560,6 +560,11 @@ class RecorderDaemon:
                 reason=reason,
                 detail=_exception_detail(startup_error),
             )
+            if outcome is DaemonOutcome.STORAGE_SAFETY_STOP:
+                # A clean pre-camera safety stop is a successful systemd
+                # transaction. Complete Type=notify startup before bounded
+                # cleanup/exit so Restart=on-failure cannot resurrect it.
+                self._notify(lambda: self._notifier.ready(self._format_status(self.status)))
             await self._cleanup_after_failure(None)
             return DaemonResult(outcome, self.status)
 

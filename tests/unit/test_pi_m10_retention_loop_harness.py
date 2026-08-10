@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import io
@@ -8,10 +9,13 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
+from uuid import UUID
 
 import pytest
 
@@ -181,11 +185,59 @@ def _result() -> dict[str, object]:
                 "passed": True,
                 "private_mount_namespace": True,
                 "network_namespace_unchanged": True,
+                "control_component": _control_component_evidence(),
             },
         },
-        "production_release_tested": False,
-        "physical_power_loss_tested": False,
-        "m10_exit_gate_closed": False,
+        **harness.RESULT_FALSE_CLAIMS,
+    }
+
+
+def _control_component_evidence() -> dict[str, object]:
+    return {
+        name: True
+        for name in (
+            "socket_is_unix",
+            "socket_mode_0660",
+            "socket_gid_dashcam_api",
+            "socket_owner_root",
+            "hard_admission_refused",
+            "bounded_drain_completed",
+            "raw_protocol_used",
+            "lease_authority_opaque",
+            "response_paths_absent",
+            "abandoned_client_sigkill_observed",
+            "lease_survived_client_loss",
+            "listener_dispatcher_restart_preserved_lease",
+            "restart_release_authority_succeeded",
+            "wrong_release_authority_refused",
+            "idempotent_second_release",
+            "global_cap_refused",
+            "same_boot_preexpiry_excluded",
+            "same_boot_exact_expiry_cleared",
+            "postexpiry_retention_eligible",
+            "previous_boot_lease_cleared",
+            "manual_lease_path_frozen",
+            "manual_post_release_protect_converged",
+            "manual_protect_pair_converged",
+            "manual_unprotect_pair_converged",
+            "event_lease_path_frozen",
+            "event_expiry_repair_converged",
+            "event_runtime_callback_seam_used",
+            "event_retry_without_active_idempotent",
+            "event_pair_intents_converged",
+        )
+    } | {
+        "active_lease_cap": harness.CONTROL_MAX_ACTIVE_LEASES,
+        "listener_admission_cap": 8,
+        "configured_lease_timeout_s": 1,
+        "event_previous_count": 2,
+        "event_current_count": 1,
+        "event_next_count": 1,
+        "component_scope": "commit-source-private-loop",
+        "production_listener_service_tested": False,
+        "download_data_plane_tested": False,
+        "production_runtime_tested": False,
+        "production_camera_tested": False,
     }
 
 
@@ -339,6 +391,234 @@ def test_result_validator_does_not_trust_matrix_pass_boolean() -> None:
     matrices["C"]["active_lease_excluded"] = False
     with pytest.raises(harness.HarnessError, match="semantic"):
         harness.validate_result_evidence(result)
+
+    leaked = _result()
+    leaked["lease_id"] = "a" * 32
+    with pytest.raises(harness.HarnessError, match="privacy"):
+        harness.validate_result_evidence(leaked)
+
+
+def test_control_component_evidence_requires_exact_scope_and_semantics() -> None:
+    evidence = _control_component_evidence()
+    harness.validate_control_component_evidence(evidence)
+
+    for field, value in (
+        ("abandoned_client_sigkill_observed", False),
+        ("active_lease_cap", harness.CONTROL_MAX_ACTIVE_LEASES - 1),
+        ("download_data_plane_tested", True),
+        ("event_next_count", 0),
+    ):
+        forged = dict(evidence)
+        forged[field] = value
+        with pytest.raises(harness.HarnessError, match="control component"):
+            harness.validate_control_component_evidence(forged)
+
+    extra = dict(evidence, lease_identifier="forbidden-contradiction")
+    with pytest.raises(harness.HarnessError, match="fields"):
+        harness.validate_control_component_evidence(extra)
+
+
+def test_control_response_validator_is_opaque_bounded_and_path_free() -> None:
+    request_id = UUID(int=71)
+    accepted = harness.canonical_json(
+        {
+            "version": 1,
+            "request_id": str(request_id),
+            "ok": True,
+            "result": {"lease_id": "a" * 32, "member": "video"},
+        }
+    )
+    assert harness._validate_control_response(
+        accepted, request_id=request_id, expect_ok=True
+    )["lease_id"] == "a" * 32
+
+    leaked = accepted.replace(b'"member":"video"', b'"path":"/srv/dashcam"')
+    with pytest.raises(harness.HarnessError, match="privacy"):
+        harness._validate_control_response(leaked, request_id=request_id, expect_ok=True)
+
+
+def test_control_deadlines_are_strictly_nested_and_cancellation_joins_worker() -> None:
+    assert (
+        harness.CONTROL_DURABLE_TIMEOUT_S
+        < harness.CONTROL_DISPATCHER_TIMEOUT_S
+        < harness.CONTROL_HANDLER_TIMEOUT_S
+        < harness.CONTROL_PROTOCOL_CLIENT_TIMEOUT_S
+        < harness.CONTROL_CLIENT_TIMEOUT_S
+    )
+
+    async def scenario() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking() -> str:
+            entered.set()
+            assert release.wait(timeout=2)
+            return "done"
+
+        task = asyncio.create_task(harness._joined_durable_worker(blocking))
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_lease_client_argv_is_closed_to_one_fixture_clip() -> None:
+    parser = harness._parser()
+    arguments = parser.parse_args(
+        [
+            "--bundle",
+            "bundle",
+            "--expected-manifest-sha256",
+            "d" * 64,
+            "--expected-commit",
+            COMMIT,
+            "--lease-client",
+            "--work",
+            "/var/tmp/dashcam-m10-retention-loop.abcdef",
+            "--lease-clip-id",
+            str(UUID(int=harness.CONTROL_FIXTURE_BASE_ORDER + 1)),
+        ]
+    )
+    harness._validate_arguments(arguments)
+    arguments.lease_clip_id = str(UUID(int=1))
+    with pytest.raises(harness.HarnessError, match="lease-client"):
+        harness._validate_arguments(arguments)
+
+
+def test_control_finalization_sidecar_is_canonical_and_target_bound() -> None:
+    from dashcam.metadata.reconcile import parse_sidecar_bytes
+    from dashcam.state import ClipLifecycle
+
+    writing = harness._writing_fixture(342)
+    closing = replace(
+        writing,
+        lifecycle=ClipLifecycle.FINALIZING,
+        end_monotonic_ns=writing.start_monotonic_ns + 1_000_000_000,
+        size_bytes=32 * 1024,
+        protected=True,
+        protection_reason="event:fixture:pending-window",
+    )
+    payload = harness._canonical_control_sidecar(
+        closing,
+        target_video_name="boot-m10control-000342.mp4",
+        target_sidecar_name="boot-m10control-000342.json",
+    )
+    parsed = parse_sidecar_bytes(payload)
+    assert parsed.to_canonical_json() == payload
+    assert parsed.clip_id == closing.clip_id
+    assert parsed.video_file == "boot-m10control-000342.mp4"
+    assert parsed.metadata_file == "boot-m10control-000342.json"
+    assert parsed.protected is True
+
+
+@pytest.mark.skipif(
+    not hasattr(asyncio, "open_unix_connection") or not hasattr(os, "getuid"),
+    reason="actual AF_UNIX component integration requires POSIX",
+)
+def test_raw_protocol_uses_real_server_dispatcher_catalog_and_restart_authority(
+    tmp_path: Path,
+) -> None:
+    from dashcam.catalog.database import ClipCatalog
+    from dashcam.config import default_config
+    from dashcam.control.dispatcher import RecorderControlDispatcher
+    from dashcam.control.socket_server import BoundedConnectionHandler, RecorderUnixServer
+
+    async def scenario() -> None:
+        catalog_path = tmp_path / "catalog.sqlite3"
+        socket_path = tmp_path / "control.sock"
+        clip = harness._fixture_clip(1)
+        config = default_config()
+        config = replace(
+            config,
+            storage=replace(config.storage, download_lease_timeout_s=1),
+        )
+
+        async def no_intent(_intent_id: UUID) -> None:
+            return None
+
+        async def no_event(*_args: object) -> None:
+            return None
+
+        async def unavailable() -> None:
+            return None
+
+        with ClipCatalog(catalog_path) as catalog:
+            catalog.register_clip(clip)
+
+            def endpoint() -> RecorderUnixServer:
+                dispatcher = RecorderControlDispatcher(
+                    catalog=catalog,
+                    config_provider=lambda: config,
+                    config_writer=lambda _value: None,
+                    status_provider=lambda: {},
+                    health_provider=lambda: {},
+                    intent_executor=no_intent,
+                    event_executor=no_event,  # type: ignore[arg-type]
+                    restart_callback=unavailable,
+                    prepare_removal_callback=unavailable,
+                    monotonic_ns=lambda: 10,
+                    boot_id="unit-boot",
+                    max_active_download_leases=2,
+                )
+                return RecorderUnixServer(
+                    BoundedConnectionHandler(dispatcher, request_timeout_s=1.0),
+                    path=socket_path,
+                    socket_group_id=os.getgid(),  # type: ignore[attr-defined]
+                    owner_uid=os.getuid(),  # type: ignore[attr-defined]
+                    drain_timeout_s=0.1,
+                )
+
+            first = endpoint()
+            await first.start()
+            acquired = await harness._raw_control_request(
+                socket_path,
+                request_id=UUID(int=81),
+                command="acquire_download",
+                arguments={
+                    "clip_id": str(clip.clip_id),
+                    "member": "video",
+                    "holder": "unit-client",
+                },
+            )
+            lease_id = cast(str, acquired["lease_id"])
+            assert len(lease_id) == 32
+            assert "path" not in json.dumps(acquired)
+            await first.stop()
+
+            restarted = endpoint()
+            await restarted.start()
+            wrong_id = ("0" if lease_id[0] != "0" else "1") + lease_id[1:]
+            wrong = await harness._raw_control_request(
+                socket_path,
+                request_id=UUID(int=82),
+                command="release_download",
+                arguments={"clip_id": str(clip.clip_id), "lease_id": wrong_id},
+                expect_ok=False,
+            )
+            assert wrong["code"] == "CLIP_BUSY"
+            released = await harness._raw_control_request(
+                socket_path,
+                request_id=UUID(int=83),
+                command="release_download",
+                arguments={"clip_id": str(clip.clip_id), "lease_id": lease_id},
+            )
+            assert released["released"] is True
+            repeated = await harness._raw_control_request(
+                socket_path,
+                request_id=UUID(int=84),
+                command="release_download",
+                arguments={"clip_id": str(clip.clip_id), "lease_id": lease_id},
+            )
+            assert repeated["released"] is False
+            await restarted.stop()
+            assert not socket_path.exists()
+
+    asyncio.run(scenario())
 
 
 def test_sigkill_matrix_validator_requires_every_exact_unique_cell() -> None:
@@ -1361,7 +1641,9 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     assert "--cell-catalog" not in source
     assert "--cell-root" not in source
     assert "max_active_leases=" not in source
-    assert source.count("os.kill(os.getpid(), SIGKILL_NUMBER)") == 3
+    assert source.count("os.kill(os.getpid(), SIGKILL_NUMBER)") == 4
+    assert "PR_SET_PDEATHSIG" in source
+    assert "signal.alarm" in source
     assert '"sigkill-all-operation-cutpoint-matrix"' not in source
     for function in (
         '"crash_cell"',
@@ -1412,7 +1694,12 @@ def test_checked_harness_declares_hard_bounds_and_honest_deferred_gates() -> Non
     parent_source = source[source.index("def _parent(") :]
     assert parent_source.index(
         "root_backing_before = _observe_root_backing()"
+    ) < parent_source.index(
+        "expected_api_group_id = _dashcam_api_group_id()"
     ) < parent_source.index("lock_path =")
+    assert parent_source.index("expected_api_group_id =") < parent_source.index(
+        "tempfile.mkdtemp(prefix=\"dashcam-m10-retention-loop.\""
+    )
     assert parent_source.index('cleanup_errors.append(f"root-reserve:') < parent_source.index(
         "_publish_result(output, completed_result)"
     )

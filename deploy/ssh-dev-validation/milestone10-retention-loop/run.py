@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -16,9 +19,11 @@ import sys
 import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
+from uuid import UUID
 
 SCHEMA_VERSION: Final = 2
 EXPECTED_RELEASE: Final = "0.1.0.dev0-5f95dd806342ac9e"
@@ -42,6 +47,11 @@ RESULT_FALSE_CLAIMS: Final = {
     "production_release_tested": False,
     "physical_power_loss_tested": False,
     "m10_exit_gate_closed": False,
+    "production_daemon_tested": False,
+    "production_camera_tested": False,
+    "production_gstreamer_no_space_tested": False,
+    "production_control_listener_service_tested": False,
+    "download_data_plane_tested": False,
 }
 MATRIX_NAMES: Final = tuple("ABCDEFGH")
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
@@ -59,7 +69,7 @@ CRASH_CELL_REFUSAL_RE: Final = re.compile(
     rb"stdout_sha256=([0-9a-f]{64}) stderr_bytes=([0-9]{1,3}) "
     rb"stderr_sha256=([0-9a-f]{64}) failed=([01]{4})\n"
 )
-MAX_REVIEWED_RUN_LINE: Final = 4096
+MAX_REVIEWED_RUN_LINE: Final = 8192
 WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "worker",
     "matrix_a",
@@ -71,6 +81,13 @@ WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "run_crash_subprocess",
     "validate_crash_fixture_mount",
     "validate_crash_cell_environment",
+    "matrix_control_component",
+    "validate_control_client_environment",
+    "run_abandoned_lease_client",
+    "raw_control_request",
+    "validate_control_response",
+    "cleanup_control_runtime_directory",
+    "arm_parent_death_sigkill",
     "matrix_g",
     "write_result",
     "load_commit_source",
@@ -125,6 +142,65 @@ SIGKILL_NUMBER: Final = 9
 CRASH_INTENT_LINE_RE: Final = re.compile(
     rb"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
     rb"[89ab][0-9a-f]{3}-[0-9a-f]{12}\n"
+)
+CONTROL_RUNTIME_PREFIX: Final = "dashcam-m10-control."
+CONTROL_SOCKET_NAME: Final = "control.sock"
+CONTROL_BOOT_ID: Final = "m10-control-boot-a"
+CONTROL_NEXT_BOOT_ID: Final = "m10-control-boot-b"
+CONTROL_LEASE_DURATION_NS: Final = 1_000_000_000
+CONTROL_DURABLE_TIMEOUT_S: Final = 3.0
+CONTROL_DISPATCHER_TIMEOUT_S: Final = 5.0
+CONTROL_HANDLER_TIMEOUT_S: Final = 7.0
+CONTROL_PROTOCOL_CLIENT_TIMEOUT_S: Final = 9.0
+CONTROL_CLIENT_TIMEOUT_S: Final = 12
+CONTROL_CLIENT_CONFIRMATION: Final = b"LEASE_ACQUIRED\n"
+CONTROL_FIXTURE_BASE_ORDER: Final = 300
+CONTROL_FIXTURE_CLIP_COUNT: Final = 38
+CONTROL_MAX_ACTIVE_LEASES: Final = 32
+PR_SET_PDEATHSIG: Final = 1
+CONTROL_EVIDENCE_FIELDS: Final = frozenset(
+    {
+        "socket_is_unix",
+        "socket_mode_0660",
+        "socket_gid_dashcam_api",
+        "socket_owner_root",
+        "hard_admission_refused",
+        "bounded_drain_completed",
+        "raw_protocol_used",
+        "lease_authority_opaque",
+        "response_paths_absent",
+        "abandoned_client_sigkill_observed",
+        "lease_survived_client_loss",
+        "listener_dispatcher_restart_preserved_lease",
+        "restart_release_authority_succeeded",
+        "wrong_release_authority_refused",
+        "idempotent_second_release",
+        "active_lease_cap",
+        "listener_admission_cap",
+        "configured_lease_timeout_s",
+        "global_cap_refused",
+        "same_boot_preexpiry_excluded",
+        "same_boot_exact_expiry_cleared",
+        "postexpiry_retention_eligible",
+        "previous_boot_lease_cleared",
+        "manual_lease_path_frozen",
+        "manual_post_release_protect_converged",
+        "manual_protect_pair_converged",
+        "manual_unprotect_pair_converged",
+        "event_lease_path_frozen",
+        "event_expiry_repair_converged",
+        "event_previous_count",
+        "event_current_count",
+        "event_next_count",
+        "event_runtime_callback_seam_used",
+        "event_retry_without_active_idempotent",
+        "event_pair_intents_converged",
+        "component_scope",
+        "production_listener_service_tested",
+        "download_data_plane_tested",
+        "production_runtime_tested",
+        "production_camera_tested",
+    }
 )
 
 FINDMNT: Final = "/usr/bin/findmnt"
@@ -469,7 +545,20 @@ def validate_cleanup_identity(
 
 
 def validate_privacy(value: object) -> None:
-    forbidden_keys = {"latitude", "longitude", "coordinates", "nmea", "ssid", "psk"}
+    forbidden_keys = {
+        "latitude",
+        "longitude",
+        "coordinates",
+        "nmea",
+        "ssid",
+        "psk",
+        "lease_id",
+        "lease_holder",
+        "holder",
+        "approved_path",
+        "video_path",
+        "sidecar_path",
+    }
     forbidden_fragments = ("$GPGGA", "$GPRMC", "$GNGGA", "$GNRMC")
     stack = [value]
     visited = 0
@@ -559,6 +648,7 @@ def validate_result_evidence(result: Mapping[str, object]) -> None:
         if not isinstance(matrix, dict) or matrix.get("passed") is not True:
             raise HarnessError(f"matrix {name} did not pass its declared component scope")
     matrices = cast(dict[str, dict[str, object]], result["matrices"])
+    validate_control_component_evidence(matrices["H"].get("control_component"))
     validate_threshold_evidence(cast(Sequence[Mapping[str, object]], matrices["A"].get("cases")))
     validate_sigkill_matrix_evidence(matrices["E"])
     semantic_checks = (
@@ -595,6 +685,63 @@ def validate_result_evidence(result: Mapping[str, object]) -> None:
         if result.get(name) is not expected:
             raise HarnessError(f"unsafe acceptance claim: {name}")
     validate_privacy(result)
+
+
+def validate_control_component_evidence(raw: object) -> None:
+    """Require semantic control/lease evidence without retaining authorities or paths."""
+
+    if not isinstance(raw, dict):
+        raise HarnessError("control component evidence is absent")
+    evidence = cast(dict[str, object], raw)
+    if set(evidence) != CONTROL_EVIDENCE_FIELDS:
+        raise HarnessError("control component evidence fields differ")
+    expected_true = (
+        "socket_is_unix",
+        "socket_mode_0660",
+        "socket_gid_dashcam_api",
+        "socket_owner_root",
+        "hard_admission_refused",
+        "bounded_drain_completed",
+        "raw_protocol_used",
+        "lease_authority_opaque",
+        "response_paths_absent",
+        "abandoned_client_sigkill_observed",
+        "lease_survived_client_loss",
+        "listener_dispatcher_restart_preserved_lease",
+        "restart_release_authority_succeeded",
+        "wrong_release_authority_refused",
+        "idempotent_second_release",
+        "global_cap_refused",
+        "same_boot_preexpiry_excluded",
+        "same_boot_exact_expiry_cleared",
+        "postexpiry_retention_eligible",
+        "previous_boot_lease_cleared",
+        "manual_lease_path_frozen",
+        "manual_post_release_protect_converged",
+        "manual_protect_pair_converged",
+        "manual_unprotect_pair_converged",
+        "event_lease_path_frozen",
+        "event_expiry_repair_converged",
+        "event_runtime_callback_seam_used",
+        "event_retry_without_active_idempotent",
+        "event_pair_intents_converged",
+    )
+    if any(evidence.get(name) is not True for name in expected_true):
+        raise HarnessError("control component semantic evidence differs")
+    if (
+        evidence.get("active_lease_cap") != CONTROL_MAX_ACTIVE_LEASES
+        or evidence.get("listener_admission_cap") != 8
+        or evidence.get("configured_lease_timeout_s") != 1
+        or evidence.get("event_previous_count") != 2
+        or evidence.get("event_current_count") != 1
+        or evidence.get("event_next_count") != 1
+        or evidence.get("component_scope") != "commit-source-private-loop"
+        or evidence.get("production_listener_service_tested") is not False
+        or evidence.get("download_data_plane_tested") is not False
+        or evidence.get("production_runtime_tested") is not False
+        or evidence.get("production_camera_tested") is not False
+    ):
+        raise HarnessError("control component scope evidence differs")
 
 
 def _run(
@@ -1295,12 +1442,29 @@ def _load_commit_source(archive: Path, expected_members: Mapping[str, object]) -
     import dashcam.catalog.filesystem as filesystem
     import dashcam.catalog.models as models
     import dashcam.catalog.policy as policy
+    import dashcam.config as config
+    import dashcam.control.dispatcher as dispatcher
+    import dashcam.control.socket_server as socket_server
+    import dashcam.recorder.finalizer as finalizer
     import dashcam.state as state
     import dashcam.storage.reclaimer as reclaimer
     import dashcam.storage.retention as retention
     import dashcam.storage.space as space
 
-    required = (database, filesystem, models, policy, reclaimer, retention, space, state)
+    required = (
+        database,
+        filesystem,
+        models,
+        policy,
+        config,
+        dispatcher,
+        socket_server,
+        finalizer,
+        reclaimer,
+        retention,
+        space,
+        state,
+    )
     if any(module.__name__ not in sys.modules for module in required):
         raise HarnessError("required commit-source module import is incomplete")
     provenance: dict[str, str] = {}
@@ -2389,6 +2553,922 @@ def _matrix_e(
     }
 
 
+def _control_runtime_directory(work: Path) -> Path:
+    resolved = work.resolve(strict=True)
+    match = re.fullmatch(
+        r"dashcam-m10-retention-loop\.([A-Za-z0-9_-]{6,32})", resolved.name
+    )
+    if resolved.parent != Path("/var/tmp") or match is None:
+        raise HarnessError("control fixture work identity differs")
+    return Path("/run") / f"{CONTROL_RUNTIME_PREFIX}{match.group(1)}"
+
+
+def _dashcam_api_group_id() -> int:
+    import grp
+
+    try:
+        getgrnam = cast(Any, grp.getgrnam)  # type: ignore[attr-defined]
+        group_id = int(getgrnam("dashcam-api").gr_gid)
+    except (KeyError, OSError) as error:
+        raise HarnessError("dashcam-api group is unavailable") from error
+    if group_id < 0:
+        raise HarnessError("dashcam-api group identity differs")
+    return group_id
+
+
+def _cleanup_control_runtime_directory(work: Path, *, group_id: int) -> None:
+    directory = _control_runtime_directory(work)
+    try:
+        directory_info = os.lstat(directory)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or stat.S_ISLNK(directory_info.st_mode)
+        or directory_info.st_uid != 0
+        or (
+            (directory_info.st_gid, stat.S_IMODE(directory_info.st_mode))
+            not in {(0, 0o700), (group_id, 0o700), (group_id, 0o750)}
+        )
+    ):
+        raise HarnessError("control runtime cleanup directory identity differs")
+    entries = tuple(directory.iterdir())
+    if len(entries) > 1:
+        raise HarnessError("control runtime cleanup contains unexpected members")
+    if entries:
+        leaf = entries[0]
+        leaf_info = os.lstat(leaf)
+        if (
+            leaf.name != CONTROL_SOCKET_NAME
+            or not stat.S_ISSOCK(leaf_info.st_mode)
+            or leaf_info.st_uid != 0
+            or leaf_info.st_nlink != 1
+            or leaf_info.st_dev != directory_info.st_dev
+        ):
+            raise HarnessError("control runtime cleanup socket identity differs")
+        os.unlink(leaf)
+    os.rmdir(directory)
+
+
+def _writing_fixture(order: int) -> Any:
+    from dashcam.catalog.models import CatalogClip
+    from dashcam.state import ClipLifecycle
+    from dashcam.storage.naming import provisional_clip_pair
+
+    pair = provisional_clip_pair(boot_id="m10control", sequence=order)
+    return CatalogClip(
+        clip_id=UUID(int=order + 1),
+        lifecycle=ClipLifecycle.WRITING,
+        video_path=f"pending/{pair.video_name}",
+        sidecar_path=f"pending/{pair.metadata_name}",
+        start_monotonic_ns=order * 1_000_000_000,
+        end_monotonic_ns=None,
+        retention_order=order,
+        size_bytes=0,
+        protected=False,
+        protection_reason=None,
+        pair_reconciled=False,
+        managed=True,
+    )
+
+
+def _canonical_control_sidecar(
+    clip: Any, *, target_video_name: str, target_sidecar_name: str
+) -> bytes:
+    from dashcam.metadata.schema import AudioSummary, ClipSidecar, GpsSummary, VideoSummary
+    from dashcam.state import GpsTimeState, SystemClockState, TimestampQuality
+
+    if not clip.protected or clip.protection_reason is None:
+        raise HarnessError("control finalization sidecar lacks durable protection")
+    return ClipSidecar(
+        schema_version=1,
+        clip_id=clip.clip_id,
+        boot_id=UUID(int=2),
+        sequence=clip.retention_order,
+        video_file=target_video_name,
+        metadata_file=target_sidecar_name,
+        start_utc=None,
+        end_utc=None,
+        start_monotonic_ns=clip.start_monotonic_ns,
+        end_monotonic_ns=clip.end_monotonic_ns,
+        gps_time_state=GpsTimeState.UNSYNCED,
+        system_clock_state=SystemClockState.UNSET,
+        timestamp_quality=TimestampQuality.MONOTONIC_ONLY,
+        time_anchor=None,
+        timezone="UTC",
+        start_local=None,
+        video=VideoSummary("h264", 1920, 1080, 30.0, 8_000_000, 8_000_000, 30, 0),
+        audio=AudioSummary(False, None, None, None, None),
+        gps=GpsSummary(False, None),
+        protected=True,
+        protection_reason=clip.protection_reason,
+        software_version="m10-control-loop",
+    ).to_canonical_json()
+
+
+def _validate_control_socket(path: Path, *, group_id: int) -> None:
+    info = os.lstat(path)
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != group_id
+        or stat.S_IMODE(info.st_mode) != 0o660
+    ):
+        raise HarnessError("control fixture socket identity differs")
+
+
+def _control_request_payload(request_id: UUID, command: str, arguments: object) -> bytes:
+    payload = canonical_json(
+        {
+            "version": 1,
+            "request_id": str(request_id),
+            "command": command,
+            "arguments": arguments,
+        }
+    )
+    if len(payload) > 4096 or not payload.endswith(b"\n"):
+        raise HarnessError("control fixture request exceeds its closed bound")
+    return payload
+
+
+def _validate_control_response(
+    payload: bytes, *, request_id: UUID, expect_ok: bool
+) -> dict[str, object]:
+    if not payload.endswith(b"\n") or len(payload) > 16 * 1024 or b"path" in payload.lower():
+        raise HarnessError("control fixture response framing or privacy differs")
+    value = _strict_json(payload, "control response")
+    if (
+        value.get("version") != 1
+        or value.get("request_id") != str(request_id)
+        or value.get("ok") is not expect_ok
+    ):
+        raise HarnessError("control fixture response identity differs")
+    field = "result" if expect_ok else "error"
+    result = value.get(field)
+    if not isinstance(result, dict):
+        raise HarnessError("control fixture response body differs")
+    return cast(dict[str, object], result)
+
+
+async def _raw_control_request(
+    path: Path,
+    *,
+    request_id: UUID,
+    command: str,
+    arguments: object,
+    expect_ok: bool = True,
+) -> dict[str, object]:
+    open_unix_connection = cast(
+        Any, asyncio.open_unix_connection  # type: ignore[attr-defined]
+    )
+    reader, writer = await asyncio.wait_for(
+        open_unix_connection(str(path)), timeout=CONTROL_PROTOCOL_CLIENT_TIMEOUT_S
+    )
+    try:
+        writer.write(_control_request_payload(request_id, command, arguments))
+        await asyncio.wait_for(
+            writer.drain(), timeout=CONTROL_PROTOCOL_CLIENT_TIMEOUT_S
+        )
+        payload = await asyncio.wait_for(
+            reader.readline(), timeout=CONTROL_PROTOCOL_CLIENT_TIMEOUT_S
+        )
+        return _validate_control_response(payload, request_id=request_id, expect_ok=expect_ok)
+    finally:
+        writer.close()
+        await asyncio.wait_for(
+            writer.wait_closed(), timeout=CONTROL_PROTOCOL_CLIENT_TIMEOUT_S
+        )
+
+
+async def _joined_durable_worker(
+    callback: Any, /, *arguments: object, **keywords: object
+) -> Any:
+    """Observe an inner deadline but never detach a native mutation worker."""
+
+    worker = asyncio.create_task(asyncio.to_thread(callback, *arguments, **keywords))
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        done, _ = await asyncio.wait({worker}, timeout=CONTROL_DURABLE_TIMEOUT_S)
+    except asyncio.CancelledError as error:
+        done = set()
+        cancellation = error
+    exceeded = cancellation is None and worker not in done
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    if cancellation is not None:
+        if not worker.cancelled():
+            worker.exception()
+        raise cancellation
+    result = worker.result()
+    if exceeded:
+        raise HarnessError("control durable worker exceeded its inner deadline")
+    return result
+
+
+def _validate_control_client_environment(work: Path) -> Path:
+    resolved_work = work.resolve(strict=True)
+    runtime = _control_runtime_directory(resolved_work)
+    expected_python = (
+        Path("/opt/dashcam/releases") / EXPECTED_RELEASE / "venv/bin/python"
+    ).resolve(strict=True)
+    if (
+        sys.platform != "linux"
+        or os.geteuid() != 0
+        or Path(sys.executable).resolve() != expected_python
+    ):
+        raise HarnessError("control client process identity differs")
+    _validate_crash_fixture_mount(
+        RECORDING_ROOT.resolve(strict=True),
+        resolved_work / "recording.exfat.img",
+        expected_size=EXFAT_IMAGE_BYTES,
+        filesystem="exfat",
+        label="M10LOOP",
+    )
+    _validate_crash_fixture_mount(
+        (resolved_work / "catalog").resolve(strict=True),
+        resolved_work / "catalog.ext4.img",
+        expected_size=EXT4_IMAGE_BYTES,
+        filesystem="ext4",
+        label="M10CAT",
+    )
+    socket_path = runtime / CONTROL_SOCKET_NAME
+    _validate_control_socket(socket_path, group_id=_dashcam_api_group_id())
+    return socket_path
+
+
+def _arm_parent_death_sigkill() -> None:
+    from ctypes import CDLL, c_int, get_errno
+
+    if sys.platform != "linux" or os.geteuid() != 0:
+        raise HarnessError("lease client parent-death guard requires root Linux")
+    parent_pid = os.getppid()
+    if parent_pid <= 1:
+        raise HarnessError("lease client lacks its exact worker parent")
+    library = CDLL(None, use_errno=True)
+    prctl = library.prctl
+    prctl.argtypes = (c_int, c_int, c_int, c_int, c_int)
+    prctl.restype = c_int
+    if prctl(PR_SET_PDEATHSIG, SIGKILL_NUMBER, 0, 0, 0) != 0:
+        raise HarnessError(f"lease client parent-death guard failed with errno {get_errno()}")
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), SIGKILL_NUMBER)
+        os._exit(125)
+
+
+def _lease_client(arguments: argparse.Namespace) -> int:
+    _arm_parent_death_sigkill()
+    clip_id = UUID(cast(str, arguments.lease_clip_id))
+    if clip_id != UUID(int=CONTROL_FIXTURE_BASE_ORDER + 1):
+        raise HarnessError("lease client clip identity differs")
+    bundle = Path(arguments.bundle).resolve(strict=True)
+    verify_bundle(bundle, arguments.expected_manifest_sha256, arguments.expected_commit)
+    socket_path = _validate_control_client_environment(Path(cast(str, arguments.work)))
+    request_id = UUID(int=8_001)
+    client = socket.socket(
+        cast(int, socket.AF_UNIX),  # type: ignore[attr-defined]
+        socket.SOCK_STREAM,
+    )
+    client.settimeout(CONTROL_PROTOCOL_CLIENT_TIMEOUT_S)
+    try:
+        client.connect(str(socket_path))
+        client.sendall(
+            _control_request_payload(
+                request_id,
+                "acquire_download",
+                {"clip_id": str(clip_id), "member": "video", "holder": "abandoned"},
+            )
+        )
+        response = bytearray()
+        while not response.endswith(b"\n") and len(response) <= 16 * 1024:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        result = _validate_control_response(
+            bytes(response), request_id=request_id, expect_ok=True
+        )
+        lease_id = result.get("lease_id")
+        if not isinstance(lease_id, str) or re.fullmatch(r"[0-9a-f]{32}", lease_id) is None:
+            raise HarnessError("lease client authority is not opaque and bounded")
+        _write_all(sys.stdout.fileno(), CONTROL_CLIENT_CONFIRMATION)
+        cast(Any, signal.alarm)(CONTROL_CLIENT_TIMEOUT_S + 5)  # type: ignore[attr-defined]
+        while True:
+            cast(Any, signal.pause)()  # type: ignore[attr-defined]
+    finally:
+        client.close()
+
+
+def _run_abandoned_lease_client(
+    *, bundle: Path, work: Path, expected_manifest_sha256: str, expected_commit: str
+) -> None:
+    command = (
+        sys.executable,
+        "-I",
+        str(bundle / "run.py"),
+        "--lease-client",
+        "--bundle",
+        str(bundle),
+        "--work",
+        str(work),
+        "--expected-manifest-sha256",
+        expected_manifest_sha256,
+        "--expected-commit",
+        expected_commit,
+        "--lease-clip-id",
+        str(UUID(int=CONTROL_FIXTURE_BASE_ORDER + 1)),
+    )
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1"},
+    )
+    stdout = b""
+    stderr = b""
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        ready, _, _ = select.select((process.stdout,), (), (), CONTROL_CLIENT_TIMEOUT_S)
+        if ready:
+            stdout = os.read(process.stdout.fileno(), len(CONTROL_CLIENT_CONFIRMATION) + 1)
+        if stdout != CONTROL_CLIENT_CONFIRMATION:
+            process.kill()
+            process.wait(timeout=5)
+            stderr = process.stderr.read(513)
+            raise HarnessError(
+                "lease client did not confirm acquisition: "
+                f"stdout={len(stdout)}:{_sha256(stdout)} stderr={len(stderr)}:{_sha256(stderr)}"
+            )
+        process.kill()
+        returncode = process.wait(timeout=5)
+        stderr = process.stderr.read(513)
+        if returncode != -SIGKILL_NUMBER or stderr:
+            raise HarnessError(
+                "lease client loss contract differed: "
+                f"rc={returncode} stderr={len(stderr)}:{_sha256(stderr)}"
+            )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def _matrix_control_component(
+    root: Path,
+    catalog_path: Path,
+    *,
+    bundle: Path,
+    work: Path,
+    expected_manifest_sha256: str,
+    expected_commit: str,
+) -> dict[str, object]:
+    from dashcam.catalog.database import ClipCatalog
+    from dashcam.config import default_config
+    from dashcam.control.dispatcher import (
+        MAX_ACTIVE_DOWNLOAD_LEASES,
+        RecorderControlDispatcher,
+    )
+    from dashcam.control.socket_server import (
+        MAX_CONCURRENT_CLIENTS,
+        BoundedConnectionHandler,
+        RecorderUnixServer,
+    )
+    from dashcam.recorder.finalizer import (
+        DurableRootedFinalizationFilesystem,
+        RecorderClipFinalizer,
+    )
+    from dashcam.state import ClipLifecycle
+    from dashcam.storage.intents import PairPaths
+    from dashcam.storage.naming import finalized_unsynced_clip_pair
+
+    async def scenario() -> dict[str, object]:
+        group_id = _dashcam_api_group_id()
+        runtime_dir = _control_runtime_directory(work)
+        if runtime_dir.exists() or runtime_dir.is_symlink():
+            raise HarnessError("control runtime directory is not fresh")
+        runtime_dir.mkdir(mode=0o700)
+        socket_path = runtime_dir / CONTROL_SOCKET_NAME
+        filesystem = DurableRootedFinalizationFilesystem(
+            root, expected_device_id=_device_id(root)
+        )
+        clock = [2_000_000_000]
+        config = default_config()
+        config = replace(
+            config,
+            storage=replace(
+                config.storage,
+                download_lease_timeout_s=1,
+                protect_previous_clips=2,
+                protect_next_clips=1,
+            ),
+        )
+        request_number = 9_000
+        active_clip_id: list[UUID | None] = [None]
+        server: Any | None = None
+        if (
+            MAX_ACTIVE_DOWNLOAD_LEASES != CONTROL_MAX_ACTIVE_LEASES
+            or MAX_CONCURRENT_CLIENTS != 8
+        ):
+            raise HarnessError("control production bounds differ from reviewed values")
+        if not (
+            0
+            < CONTROL_DURABLE_TIMEOUT_S
+            < CONTROL_DISPATCHER_TIMEOUT_S
+            < CONTROL_HANDLER_TIMEOUT_S
+            < CONTROL_PROTOCOL_CLIENT_TIMEOUT_S
+            < CONTROL_CLIENT_TIMEOUT_S
+        ):
+            raise HarnessError("control deadline nesting differs")
+
+        with ClipCatalog(catalog_path) as catalog:
+            finalizer = RecorderClipFinalizer(
+                catalog=catalog,
+                filesystem=filesystem,
+                monotonic_ns=lambda: clock[0],
+            )
+            clips = []
+            for order in range(
+                CONTROL_FIXTURE_BASE_ORDER,
+                CONTROL_FIXTURE_BASE_ORDER + CONTROL_FIXTURE_CLIP_COUNT,
+            ):
+                clip = _fixture_clip(order)
+                _materialize_clip(root, clip, video_bytes=32 * 1024)
+                catalog.register_clip(clip, catalog_now_ns=order)
+                clips.append(clip)
+
+            async def execute_intent(intent_id: UUID) -> None:
+                outcome = await _joined_durable_worker(finalizer.execute_intent, intent_id)
+                if not outcome.complete:
+                    raise HarnessError("control intent did not converge")
+
+            class ComponentRuntimeControlSeam:
+                async def trigger_control_event(
+                    self,
+                    source: Any,
+                    monotonic_now_ns: int,
+                    previous_count: int,
+                    next_count: int,
+                    event_id: UUID,
+                ) -> Any:
+                    return await _joined_durable_worker(
+                        finalizer.trigger_event,
+                        active_clip_id[0],
+                        source=source,
+                        monotonic_now_ns=monotonic_now_ns,
+                        previous_count=previous_count,
+                        next_count=next_count,
+                        event_id=event_id,
+                    )
+
+            runtime_seam = ComponentRuntimeControlSeam()
+
+            async def unavailable() -> None:
+                raise HarnessError("unsupported control callback was invoked")
+
+            def build_server(
+                *, max_clients: int = MAX_CONCURRENT_CLIENTS, boot_id: str = CONTROL_BOOT_ID
+            ) -> Any:
+                dispatcher = RecorderControlDispatcher(
+                    catalog=catalog,
+                    config_provider=lambda: config,
+                    config_writer=lambda _value: None,
+                    status_provider=lambda: {"state": "COMPONENT"},
+                    health_provider=lambda: {"state": "COMPONENT"},
+                    intent_executor=execute_intent,
+                    event_executor=runtime_seam.trigger_control_event,
+                    restart_callback=unavailable,
+                    prepare_removal_callback=unavailable,
+                    monotonic_ns=lambda: clock[0],
+                    boot_id=boot_id,
+                    max_active_download_leases=CONTROL_MAX_ACTIVE_LEASES,
+                    operation_timeout_s=CONTROL_DISPATCHER_TIMEOUT_S,
+                )
+                return RecorderUnixServer(
+                    BoundedConnectionHandler(
+                        dispatcher,
+                        request_timeout_s=CONTROL_HANDLER_TIMEOUT_S,
+                        max_concurrent_clients=max_clients,
+                    ),
+                    path=socket_path,
+                    socket_group_id=group_id,
+                    owner_uid=0,
+                    drain_timeout_s=0.1,
+                )
+
+            async def request(
+                command: str, arguments: object, *, expect_ok: bool = True
+            ) -> dict[str, object]:
+                nonlocal request_number
+                request_number += 1
+                return await _raw_control_request(
+                    socket_path,
+                    request_id=UUID(int=request_number),
+                    command=command,
+                    arguments=arguments,
+                    expect_ok=expect_ok,
+                )
+
+            def approval(clip: Any, holder: str) -> dict[str, object]:
+                return {
+                    "clip_id": str(clip.clip_id),
+                    "member": "video",
+                    "holder": holder,
+                }
+
+            try:
+                server = build_server()
+                await server.start()
+                _validate_control_socket(socket_path, group_id=group_id)
+                await asyncio.to_thread(
+                    _run_abandoned_lease_client,
+                    bundle=bundle,
+                    work=work,
+                    expected_manifest_sha256=expected_manifest_sha256,
+                    expected_commit=expected_commit,
+                )
+                abandoned = catalog.get_clip(clips[0].clip_id).download_lease
+                if abandoned is None or abandoned.holder == "abandoned":
+                    raise HarnessError("abandoned control lease was not durably opaque")
+                lease_results: list[tuple[Any, str]] = []
+                for index, clip in enumerate(clips[1:CONTROL_MAX_ACTIVE_LEASES], start=1):
+                    acquired = await request("acquire_download", approval(clip, f"holder-{index}"))
+                    lease_id = acquired.get("lease_id")
+                    if (
+                        not isinstance(lease_id, str)
+                        or re.fullmatch(r"[0-9a-f]{32}", lease_id) is None
+                    ):
+                        raise HarnessError("control lease authority differs")
+                    lease_results.append((clip, lease_id))
+                capped = await request(
+                    "acquire_download",
+                    approval(clips[CONTROL_MAX_ACTIVE_LEASES], "over-cap"),
+                    expect_ok=False,
+                )
+                if capped.get("code") != "CONFLICT":
+                    raise HarnessError("control lease global cap did not refuse")
+
+                await server.stop()
+                server = build_server()
+                await server.start()
+                capped_after_restart = await request(
+                    "acquire_download",
+                    approval(clips[CONTROL_MAX_ACTIVE_LEASES], "restart-over-cap"),
+                    expect_ok=False,
+                )
+                if capped_after_restart.get("code") != "CONFLICT":
+                    raise HarnessError("restarted dispatcher lost the global lease cap")
+                release_clip, release_id = lease_results[0]
+                released = await request(
+                    "release_download",
+                    {"clip_id": str(release_clip.clip_id), "lease_id": release_id},
+                )
+                if released.get("released") is not True:
+                    raise HarnessError("restarted dispatcher lost release authority")
+                replacement = await request(
+                    "acquire_download",
+                    approval(clips[CONTROL_MAX_ACTIVE_LEASES], "replacement"),
+                )
+                if not isinstance(replacement.get("lease_id"), str):
+                    raise HarnessError("global lease capacity did not reopen")
+
+                clock[0] = abandoned.expires_at_monotonic_ns - 1
+                before_expiry = catalog.retention_candidates(
+                    monotonic_now_ns=clock[0], boot_id=CONTROL_BOOT_ID, limit=64
+                )
+                abandoned_candidate = next(
+                    item for item in before_expiry if item.clip_id == clips[0].clip_id
+                )
+                if abandoned is None or abandoned_candidate.eligible_at(clock[0]):
+                    raise HarnessError("active lease entered the retention view")
+                cleared_before, _ = catalog.clear_expired_download_leases(
+                    monotonic_now_ns=clock[0], boot_id=CONTROL_BOOT_ID, limit=64
+                )
+                if cleared_before != 0:
+                    raise HarnessError("same-boot lease expired before equality")
+                clock[0] = abandoned.expires_at_monotonic_ns
+                cleared_at, more = catalog.clear_expired_download_leases(
+                    monotonic_now_ns=clock[0], boot_id=CONTROL_BOOT_ID, limit=64
+                )
+                after_expiry = catalog.retention_candidates(
+                    monotonic_now_ns=clock[0], boot_id=CONTROL_BOOT_ID, limit=64
+                )
+                expired_candidate = next(
+                    item for item in after_expiry if item.clip_id == clips[0].clip_id
+                )
+                if (
+                    cleared_at != CONTROL_MAX_ACTIVE_LEASES
+                    or more
+                    or not expired_candidate.eligible_at(clock[0])
+                ):
+                    raise HarnessError("same-boot lease equality expiry differs")
+
+                clock[0] += 1
+                previous_boot = await request(
+                    "acquire_download", approval(clips[33], "previous-boot")
+                )
+                if not isinstance(previous_boot.get("lease_id"), str):
+                    raise HarnessError("previous-boot lease was not acquired")
+                more_boot = await _joined_durable_worker(
+                    finalizer.expire_download_leases, CONTROL_NEXT_BOOT_ID
+                )
+                if more_boot or catalog.get_clip(clips[33].clip_id).download_lease is not None:
+                    raise HarnessError("previous-boot lease was not immediately cleared")
+
+                manual = clips[34]
+                manual_approval = await request(
+                    "acquire_download", approval(manual, "manual-freeze")
+                )
+                manual_lease_id = manual_approval.get("lease_id")
+                if not isinstance(manual_lease_id, str):
+                    raise HarnessError("manual freeze lease authority differs")
+                wrong_lease_id = (
+                    ("0" if manual_lease_id[0] != "0" else "1") + manual_lease_id[1:]
+                )
+                wrong_release = await request(
+                    "release_download",
+                    {"clip_id": str(manual.clip_id), "lease_id": wrong_lease_id},
+                    expect_ok=False,
+                )
+                if wrong_release.get("code") != "CLIP_BUSY":
+                    raise HarnessError("wrong lease authority was not refused")
+                leased_protect = await request(
+                    "protect_clip",
+                    {"clip_id": str(manual.clip_id)},
+                    expect_ok=False,
+                )
+                protected_video = f"protected/{PurePosixPath(manual.video_path).name}"
+                protected_sidecar = f"protected/{PurePosixPath(manual.sidecar_path).name}"
+                frozen_stored = catalog.get_clip(manual.clip_id)
+                if (
+                    leased_protect.get("code") != "CLIP_BUSY"
+                    or frozen_stored.protected
+                    or frozen_stored.video_path != manual.video_path
+                    or frozen_stored.sidecar_path != manual.sidecar_path
+                    or not (root / manual.video_path).is_file()
+                    or not (root / manual.sidecar_path).is_file()
+                    or (root / protected_video).exists()
+                    or (root / protected_sidecar).exists()
+                ):
+                    raise HarnessError("manual lease did not freeze the approved pair")
+                manual_release = await request(
+                    "release_download",
+                    {"clip_id": str(manual.clip_id), "lease_id": manual_lease_id},
+                )
+                repeated_release = await request(
+                    "release_download",
+                    {"clip_id": str(manual.clip_id), "lease_id": manual_lease_id},
+                )
+                protected = await request(
+                    "protect_clip", {"clip_id": str(manual.clip_id)}
+                )
+                protected_stored = catalog.get_clip(manual.clip_id)
+                if (
+                    manual_release.get("released") is not True
+                    or repeated_release.get("released") is not False
+                    or protected.get("protected") is not True
+                    or protected_stored.video_path != protected_video
+                    or protected_stored.sidecar_path != protected_sidecar
+                    or not (root / protected_video).is_file()
+                    or not (root / protected_sidecar).is_file()
+                    or (root / manual.video_path).exists()
+                    or (root / manual.sidecar_path).exists()
+                ):
+                    raise HarnessError("manual protect did not converge its pair")
+                unprotected = await request(
+                    "unprotect_clip", {"clip_id": str(manual.clip_id)}
+                )
+                unprotected_stored = catalog.get_clip(manual.clip_id)
+                if (
+                    unprotected.get("protected") is not False
+                    or unprotected_stored.video_path != manual.video_path
+                    or unprotected_stored.sidecar_path != manual.sidecar_path
+                    or not (root / manual.video_path).is_file()
+                    or not (root / manual.sidecar_path).is_file()
+                    or (root / protected_video).exists()
+                    or (root / protected_sidecar).exists()
+                ):
+                    raise HarnessError("manual unprotect did not converge its pair")
+
+                event_clips = [_fixture_clip(order) for order in (340, 341)]
+                for clip in event_clips:
+                    _materialize_clip(root, clip, video_bytes=32 * 1024)
+                    catalog.register_clip(clip, catalog_now_ns=clock[0])
+                event_approval = await request(
+                    "acquire_download", approval(event_clips[0], "event-freeze")
+                )
+                if not isinstance(event_approval.get("lease_id"), str):
+                    raise HarnessError("event freeze lease authority differs")
+                event_lease = catalog.get_clip(event_clips[0].clip_id).download_lease
+                if event_lease is None:
+                    raise HarnessError("event freeze lease is not durable")
+                current = _writing_fixture(342)
+                _materialize_clip(root, current, video_bytes=32 * 1024)
+                catalog.register_writing_clip(current, monotonic_now_ns=clock[0])
+                active_clip_id[0] = current.clip_id
+                event_id = UUID(int=9_999)
+                event = await request(
+                    "event", {"source": "web", "event_id": str(event_id)}
+                )
+                if (
+                    event.get("protected_clip_ids")
+                    != [str(clip.clip_id) for clip in (*event_clips, current)]
+                    or event.get("pending_next_count") != 1
+                ):
+                    raise HarnessError("control event window selection differs")
+                event_frozen = catalog.get_clip(event_clips[0].clip_id)
+                if (
+                    not event_frozen.protected
+                    or event_frozen.video_path != event_clips[0].video_path
+                    or event_frozen.sidecar_path != event_clips[0].sidecar_path
+                    or not (root / event_clips[0].video_path).is_file()
+                    or not (root / event_clips[0].sidecar_path).is_file()
+                ):
+                    raise HarnessError("event lease did not freeze the approved pair")
+                active_clip_id[0] = None
+                retried = await request(
+                    "event", {"source": "web", "event_id": str(event_id)}
+                )
+                if (
+                    retried.get("event_id") != event.get("event_id")
+                    or retried.get("protected_clip_ids") != event.get("protected_clip_ids")
+                    or retried.get("missing_previous_count")
+                    != event.get("missing_previous_count")
+                    or retried.get("pending_next_count") != event.get("pending_next_count")
+                    or retried.get("queued_intent_ids") != []
+                ):
+                    raise HarnessError("control event retry without active clip differed")
+                clock[0] = event_lease.expires_at_monotonic_ns
+                event_expiry_more = await _joined_durable_worker(
+                    finalizer.expire_download_leases, CONTROL_BOOT_ID
+                )
+                event_repaired = catalog.get_clip(event_clips[0].clip_id)
+                if (
+                    event_expiry_more
+                    or event_repaired.download_lease is not None
+                    or not event_repaired.video_path.startswith("protected/")
+                    or not event_repaired.sidecar_path.startswith("protected/")
+                    or not (root / event_repaired.video_path).is_file()
+                    or not (root / event_repaired.sidecar_path).is_file()
+                    or (root / event_clips[0].video_path).exists()
+                    or (root / event_clips[0].sidecar_path).exists()
+                ):
+                    raise HarnessError("event lease expiry repair did not converge")
+
+                async def finalize_writing(clip: Any) -> None:
+                    protection = catalog.active_closing_protection(
+                        clip.clip_id, monotonic_now_ns=clock[0]
+                    )
+                    target = finalized_unsynced_clip_pair(
+                        boot_id="m10control", sequence=clip.retention_order
+                    )
+                    closing = replace(
+                        clip,
+                        lifecycle=ClipLifecycle.FINALIZING,
+                        end_monotonic_ns=clip.start_monotonic_ns + 1_000_000_000,
+                        size_bytes=32 * 1024,
+                        protected=protection.protected,
+                        protection_reason=protection.reason,
+                    )
+                    filesystem.replace_bytes_atomic(
+                        clip.sidecar_path,
+                        _canonical_control_sidecar(
+                            closing,
+                            target_video_name=target.video_name,
+                            target_sidecar_name=target.metadata_name,
+                        ),
+                        maximum_bytes=512 * 1024,
+                    )
+                    intent_id = catalog.register_finalizing_clip(
+                        closing,
+                        promotion_paths=PairPaths(
+                            clip.video_path,
+                            clip.sidecar_path,
+                            f"clips/{target.video_name}",
+                            f"clips/{target.metadata_name}",
+                        ),
+                        monotonic_now_ns=clock[0],
+                        expected_protection_revision=protection.revision,
+                    )
+                    pending_finalize = catalog.get_pending_intent(intent_id)
+                    if (
+                        pending_finalize is None
+                        or pending_finalize.clip_id != clip.clip_id
+                        or pending_finalize.paths.video_target
+                        != f"clips/{target.video_name}"
+                        or pending_finalize.paths.sidecar_target
+                        != f"clips/{target.metadata_name}"
+                    ):
+                        raise HarnessError("control FINALIZE intent target binding differs")
+                    await execute_intent(intent_id)
+
+                await finalize_writing(current)
+                next_clip = _writing_fixture(343)
+                _materialize_clip(root, next_clip, video_bytes=32 * 1024)
+                catalog.register_writing_clip(next_clip, monotonic_now_ns=clock[0])
+                await finalize_writing(next_clip)
+                protected_ids = (*event_clips, current, next_clip)
+                if any(
+                    not catalog.get_clip(clip.clip_id).protected
+                    or not catalog.get_clip(clip.clip_id).pair_reconciled
+                    or not catalog.get_clip(clip.clip_id).video_path.startswith("protected/")
+                    or not catalog.get_clip(clip.clip_id).sidecar_path.startswith("protected/")
+                    or not (root / catalog.get_clip(clip.clip_id).video_path).is_file()
+                    or not (root / catalog.get_clip(clip.clip_id).sidecar_path).is_file()
+                    for clip in protected_ids
+                ) or any(
+                    (root / clip.video_path).exists() or (root / clip.sidecar_path).exists()
+                    for clip in protected_ids
+                ):
+                    raise HarnessError("control event pair convergence differs")
+
+                await server.stop()
+                server = build_server()
+                await server.start()
+                open_unix_connection = cast(
+                    Any, asyncio.open_unix_connection  # type: ignore[attr-defined]
+                )
+                idle_connections = [
+                    await open_unix_connection(str(socket_path))
+                    for _ in range(MAX_CONCURRENT_CLIENTS)
+                ]
+                for _ in range(100):
+                    if server.snapshot()["active_connections"] == MAX_CONCURRENT_CLIENTS:
+                        break
+                    await asyncio.sleep(0.001)
+                if server.snapshot()["active_connections"] != MAX_CONCURRENT_CLIENTS:
+                    raise HarnessError("control listener did not reach its admission cap")
+                refused_reader, refused_writer = await open_unix_connection(str(socket_path))
+                refused = await asyncio.wait_for(refused_reader.read(1), timeout=2.0)
+                refused_writer.close()
+                await refused_writer.wait_closed()
+                if refused != b"" or server.snapshot()["connections_refused"] != 1:
+                    raise HarnessError("control listener admission cap differed")
+                await server.stop()
+                server = None
+                for _reader, writer in idle_connections:
+                    writer.close()
+                    with suppress(ConnectionError, OSError):
+                        await writer.wait_closed()
+                if socket_path.exists():
+                    raise HarnessError("control listener drain retained its socket")
+            finally:
+                if server is not None:
+                    await server.stop()
+                _cleanup_control_runtime_directory(work, group_id=group_id)
+
+        return {
+            "socket_is_unix": True,
+            "socket_mode_0660": True,
+            "socket_gid_dashcam_api": True,
+            "socket_owner_root": True,
+            "hard_admission_refused": True,
+            "bounded_drain_completed": True,
+            "raw_protocol_used": True,
+            "lease_authority_opaque": True,
+            "response_paths_absent": True,
+            "abandoned_client_sigkill_observed": True,
+            "lease_survived_client_loss": True,
+            "listener_dispatcher_restart_preserved_lease": True,
+            "restart_release_authority_succeeded": True,
+            "wrong_release_authority_refused": True,
+            "idempotent_second_release": True,
+            "active_lease_cap": CONTROL_MAX_ACTIVE_LEASES,
+            "listener_admission_cap": 8,
+            "configured_lease_timeout_s": 1,
+            "global_cap_refused": True,
+            "same_boot_preexpiry_excluded": True,
+            "same_boot_exact_expiry_cleared": True,
+            "postexpiry_retention_eligible": True,
+            "previous_boot_lease_cleared": True,
+            "manual_lease_path_frozen": True,
+            "manual_post_release_protect_converged": True,
+            "manual_protect_pair_converged": True,
+            "manual_unprotect_pair_converged": True,
+            "event_lease_path_frozen": True,
+            "event_expiry_repair_converged": True,
+            "event_previous_count": 2,
+            "event_current_count": 1,
+            "event_next_count": 1,
+            "event_runtime_callback_seam_used": True,
+            "event_retry_without_active_idempotent": True,
+            "event_pair_intents_converged": True,
+            "component_scope": "commit-source-private-loop",
+            "production_listener_service_tested": False,
+            "download_data_plane_tested": False,
+            "production_runtime_tested": False,
+            "production_camera_tested": False,
+        }
+
+    return asyncio.run(scenario())
+
+
 def _matrix_g(
     root: Path, catalog_path: Path, capacity: int, device_id: str, uuid: str
 ) -> dict[str, object]:
@@ -2457,6 +3537,7 @@ def _write_result(path: Path, value: object) -> None:
 def _worker(arguments: argparse.Namespace) -> int:
     bundle = Path(arguments.bundle).resolve(strict=True)
     metadata = verify_bundle(bundle, arguments.expected_manifest_sha256, arguments.expected_commit)
+    _dashcam_api_group_id()
     current_mount_namespace = os.readlink("/proc/self/ns/mnt")
     current_network_namespace = os.readlink("/proc/self/ns/net")
     if (
@@ -2608,6 +3689,14 @@ def _worker(arguments: argparse.Namespace) -> int:
             device_id,
             exfat_facts["UUID"],
         )
+        control_component = _matrix_control_component(
+            RECORDING_ROOT,
+            catalog_mount / "matrix-control.sqlite3",
+            bundle=bundle,
+            work=work,
+            expected_manifest_sha256=arguments.expected_manifest_sha256,
+            expected_commit=arguments.expected_commit,
+        )
         fixture_files = sum(1 for path in RECORDING_ROOT.rglob("*") if path.is_file())
         if fixture_files > MAX_FIXTURE_FILES:
             raise HarnessError("fixture file count exceeded its hard bound")
@@ -2619,6 +3708,7 @@ def _worker(arguments: argparse.Namespace) -> int:
             "loop_identity_bound": True,
             "source_import_provenance_count": len(provenance),
             "fixture_file_count": fixture_files,
+            "control_component": control_component,
         }
         result: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
@@ -2636,9 +3726,6 @@ def _worker(arguments: argparse.Namespace) -> int:
             },
             "matrices": matrices,
             **RESULT_FALSE_CLAIMS,
-            "production_daemon_tested": False,
-            "production_camera_tested": False,
-            "production_gstreamer_no_space_tested": False,
             "deferred_gates": [
                 "real-production-daemon-and-camera-integration",
                 "structured-gstreamer-no-space-on-physical-recording-path",
@@ -2821,6 +3908,7 @@ def _parent(arguments: argparse.Namespace) -> int:
         if not Path(executable).is_file() or not os.access(executable, os.X_OK):
             raise HarnessError(f"required executable is unavailable: {executable}")
     root_backing_before = _observe_root_backing()
+    expected_api_group_id = _dashcam_api_group_id()
     lock_path = Path("/run/dashcam-m10-retention-loop.lock")
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
     frozen: Path | None = None
@@ -2893,6 +3981,12 @@ def _parent(arguments: argparse.Namespace) -> int:
         cleanup_errors: list[str] = []
         if work is not None and work.exists():
             try:
+                _cleanup_control_runtime_directory(
+                    work, group_id=expected_api_group_id
+                )
+            except Exception as error:
+                cleanup_errors.append(f"control-runtime:{type(error).__name__}")
+            try:
                 if _owned_loop_backing_present(work):
                     cleanup_errors.append("work-retained-owned-loop-attached")
                 else:
@@ -2949,12 +4043,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--crash-cell", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--lease-client", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--work", help=argparse.SUPPRESS)
     parser.add_argument("--result", help=argparse.SUPPRESS)
     parser.add_argument("--parent-mount-namespace", help=argparse.SUPPRESS)
     parser.add_argument("--parent-network-namespace", help=argparse.SUPPRESS)
     parser.add_argument("--cell-operation", choices=CRASH_OPERATIONS, help=argparse.SUPPRESS)
     parser.add_argument("--cell-cutpoint", choices=CRASH_CUTPOINTS, help=argparse.SUPPRESS)
+    parser.add_argument("--lease-clip-id", help=argparse.SUPPRESS)
     return parser
 
 
@@ -2967,9 +4063,28 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
         raise HarnessError("expected board serial is malformed")
     if arguments.expected_board_serial != EXPECTED_BOARD_SERIAL:
         raise HarnessError("expected board serial differs from the accepted exact Pi")
-    if arguments.worker and arguments.crash_cell:
+    modes = (arguments.worker, arguments.crash_cell, arguments.lease_client)
+    if sum(bool(value) for value in modes) > 1:
         raise HarnessError("worker modes are mutually exclusive")
-    if arguments.crash_cell:
+    if arguments.lease_client:
+        if (
+            not isinstance(arguments.work, str)
+            or not arguments.work
+            or arguments.lease_clip_id != str(UUID(int=CONTROL_FIXTURE_BASE_ORDER + 1))
+            or any(
+                value is not None
+                for value in (
+                    arguments.output,
+                    arguments.result,
+                    arguments.parent_mount_namespace,
+                    arguments.parent_network_namespace,
+                    arguments.cell_operation,
+                    arguments.cell_cutpoint,
+                )
+            )
+        ):
+            raise HarnessError("lease-client arguments are incomplete or excessive")
+    elif arguments.crash_cell:
         if (
             not isinstance(arguments.work, str)
             or not arguments.work
@@ -2982,6 +4097,7 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
                     arguments.result,
                     arguments.parent_mount_namespace,
                     arguments.parent_network_namespace,
+                    arguments.lease_clip_id,
                 )
             )
         ):
@@ -2997,6 +4113,8 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
             )
         ):
             raise HarnessError("worker arguments are incomplete")
+        if arguments.lease_clip_id is not None:
+            raise HarnessError("worker arguments are excessive")
     elif not isinstance(arguments.output, str) or not arguments.output:
         raise HarnessError("parent output path is required")
 
@@ -3015,16 +4133,18 @@ def main() -> int:
     arguments = _parser().parse_args()
     try:
         _validate_arguments(arguments)
+        if arguments.lease_client:
+            return _lease_client(arguments)
         if arguments.crash_cell:
             return _crash_cell(arguments)
         return _worker(arguments) if arguments.worker else _parent(arguments)
     except (HarnessError, OSError, ValueError, UnicodeError, zipfile.BadZipFile) as error:
-        if arguments.worker or arguments.crash_cell:
+        if arguments.worker or arguments.crash_cell or arguments.lease_client:
             return _emit_worker_refusal(error)
         print(f"REFUSED: {error}", file=sys.stderr)
         return 2
     except Exception as error:
-        if arguments.worker or arguments.crash_cell:
+        if arguments.worker or arguments.crash_cell or arguments.lease_client:
             return _emit_worker_refusal(error)
         print("REFUSED: unexpected parent exception", file=sys.stderr)
         return 2

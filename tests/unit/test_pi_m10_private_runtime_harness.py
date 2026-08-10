@@ -1968,6 +1968,7 @@ def test_source_has_owned_loop_cleanup_and_no_broad_destructive_actions() -> Non
         '"rw,nosuid,nodev,noexec,noatime,nodiscard"',
         "owned private mount remained busy after its retry bound",
         "UNMOUNT_RETRY_LIMIT: Final = 600",
+        "_drain_private_units(nonce)",
         "_require_dense_image",
         "_require_owned_loop",
     ):
@@ -1980,6 +1981,38 @@ def test_source_has_owned_loop_cleanup_and_no_broad_destructive_actions() -> Non
         "systemctl enable",
     ):
         assert forbidden not in source
+
+
+def test_fixture_cleanup_sweeps_all_nonce_units_before_unmount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = Path("/var/tmp/dashcam-m10-private.123456789abc")
+    paths = {
+        "recording": work / "recording",
+        "state": work / "state",
+        "recording_loop": Path("/dev/loop1"),
+        "state_loop": Path("/dev/loop2"),
+        "recording_image": work / "recording.exfat.img",
+        "state_image": work / "state.ext4.img",
+    }
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        run,
+        "_drain_private_units",
+        lambda nonce: observed.append(("drain", nonce)),
+    )
+    monkeypatch.setattr(run, "_require_mount", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "_unmount",
+        lambda target, loop: observed.append(("unmount", (target, loop))),
+    )
+    monkeypatch.setattr(run, "_detach", lambda *args: None)
+
+    run._cleanup_fixture(paths)
+
+    assert observed[0] == ("drain", "123456789abc")
+    assert [entry[0] for entry in observed] == ["drain", "unmount", "unmount"]
 
 
 def test_readme_states_private_scope_and_all_nonclaims() -> None:

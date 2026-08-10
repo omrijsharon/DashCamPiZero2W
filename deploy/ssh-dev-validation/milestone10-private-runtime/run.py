@@ -2553,6 +2553,8 @@ def _cleanup_fixture(paths: Mapping[str, Path]) -> None:
     state = paths["state"]
     recording_loop = paths["recording_loop"]
     state_loop = paths["state_loop"]
+    nonce = recording.parent.name.removeprefix("dashcam-m10-private.")
+    _drain_private_units(nonce)
     _require_mount(
         recording,
         recording_loop,
@@ -2818,6 +2820,23 @@ def _remove_unit(unit: str) -> None:
         "",
     }:
         raise HarnessError("transient unit/cgroup did not drain before fixture cleanup")
+
+
+def _drain_private_units(nonce: str) -> None:
+    if re.fullmatch(r"[a-z0-9]{12}", nonce) is None:
+        raise HarnessError("private unit drain nonce differs")
+    for suffix in (
+        "bind",
+        "preflight",
+        "a",
+        "rollback0",
+        "rollback1",
+        "rollback2",
+        "rollback3",
+        "b",
+        "c",
+    ):
+        _remove_unit(f"dashcam-m10-private-{nonce}-{suffix}.service")
 
 
 def _run_bind_probe(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
@@ -5431,17 +5450,7 @@ def recover_owned_work(raw_work: Path) -> dict[str, object]:
         owned_exclusion=owned_exclusion,
     )
     _require_root_identity()
-    for suffix in (
-        "bind",
-        "a",
-        "rollback0",
-        "rollback1",
-        "rollback2",
-        "rollback3",
-        "b",
-        "c",
-    ):
-        _remove_unit(f"dashcam-m10-private-{nonce}-{suffix}.service")
+    _drain_private_units(nonce)
 
     specifications = (
         ("recording", "recording.exfat.img", EXFAT_IMAGE_BYTES, "exfat", RECORDING_LABEL),

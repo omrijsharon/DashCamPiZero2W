@@ -6,7 +6,7 @@ production identity files before and after the run and requires them unchanged.
 It is intentionally exact-Pi only and must be
 built at the separately reviewed harness commit while embedding candidate
 commit `efc16c651511f7d64428c26dc874cb32d663ac42` and rollback companion
-`051f98a70039a448ce0b3475617b399429d5a023` as independent exact-source archives.
+`5268bd8e2f0dfe18d2a70ec142af45e8198b3f1a` as independent exact-source archives.
 
 The builder creates two independent deterministic source archives. Build the
 bundle outside both the repository and `/srv/dashcam`, `/var/lib/dashcam`, and
@@ -18,7 +18,7 @@ python deploy/ssh-dev-validation/milestone10-private-runtime/prepare-bundle.py \
   --output FRESH_OUTSIDE_REPOSITORY_DIRECTORY \
   --expected-harness-commit REVIEWED_HARNESS_COMMIT \
   --candidate-commit efc16c651511f7d64428c26dc874cb32d663ac42 \
-  --rollback-commit 051f98a70039a448ce0b3475617b399429d5a023
+  --rollback-commit 5268bd8e2f0dfe18d2a70ec142af45e8198b3f1a
 ```
 
 Before running, independently review the resulting `SHA256SUMS` and its own

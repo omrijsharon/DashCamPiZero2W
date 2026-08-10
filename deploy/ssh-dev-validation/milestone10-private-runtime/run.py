@@ -3322,7 +3322,10 @@ def _allocate_filler(root: Path, target_free: int) -> tuple[Path, int]:
         os.close(descriptor)
     observed = os.statvfs(root)  # type: ignore[attr-defined]
     final_free = observed.f_bavail * observed.f_frsize
-    if final_free > target_free + 2 * observed.f_frsize or final_free < target_free - amount:
+    if (
+        final_free > target_free + 2 * observed.f_frsize
+        or final_free < target_free - FILLER_CHUNK_BYTES
+    ):
         raise HarnessError("filler did not approach the bounded target")
     return path, allocated
 

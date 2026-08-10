@@ -925,6 +925,50 @@ def test_protected_emergency_fixture_is_reachable_within_filler_bound() -> None:
     assert required < run.MAX_FILLER_BYTES
 
 
+@pytest.mark.parametrize("concurrent_drop", (8 * 1024**2, 16 * 1024**2 + 4096))
+def test_filler_allows_only_one_chunk_of_concurrent_recording_decline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_drop: int,
+) -> None:
+    block = 4096
+    target = 64 * 1024**2
+    before = target + 20 * 1024**2
+    observations = iter(
+        (
+            before,
+            before,
+            target + 3 * block,
+            target + 2 * block,
+            target - concurrent_drop,
+        )
+    )
+
+    def statvfs(_path: Path) -> SimpleNamespace:
+        free = next(observations)
+        return SimpleNamespace(
+            f_bavail=free // block,
+            f_frsize=block,
+            f_blocks=(before + 64 * 1024**2) // block,
+        )
+
+    monkeypatch.setattr(run.os, "statvfs", statvfs, raising=False)
+    monkeypatch.setattr(
+        run.os,
+        "posix_fallocate",
+        lambda _descriptor, _offset, _amount: None,
+        raising=False,
+    )
+
+    if concurrent_drop <= run.FILLER_CHUNK_BYTES:
+        path, allocated = run._allocate_filler(tmp_path, target)
+        assert path.is_file()
+        assert allocated > 0
+    else:
+        with pytest.raises(run.HarnessError, match="bounded target"):
+            run._allocate_filler(tmp_path, target)
+
+
 def test_strict_idr_parser_rejects_keyframe_without_idr() -> None:
     assert run._contains_idr(b"\x00\x00\x00\x01\x65\x88")
     assert run._contains_idr((2).to_bytes(4, "big") + b"\x65\x88")

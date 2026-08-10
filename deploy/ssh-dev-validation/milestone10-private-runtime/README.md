@@ -47,7 +47,9 @@ prior unit properties before publication. It has
 a 900-second global deadline and each transient unit has `RuntimeMaxSec=`. It uses one 416 MiB exFAT
 image and one 48 MiB ext4 image at a time. Host-visible nonce mounts are bound
 over `/srv/dashcam`, `/var/lib/dashcam`, and `/run/dashcam` only inside each
-transient unit's private mount namespace. It does not use `StateDirectory=` or
+transient unit's private mount namespace. Each newly mounted loop filesystem is
+changed to and re-observed as `PROPAGATION=private` before any transient unit can
+use it, so the fixture mount cannot propagate into another namespace. It does not use `StateDirectory=` or
 `RuntimeDirectory=`. Only the parent observes the production catalog/sentinel
 read-only for exact before/after hashes; transient candidate and rollback code
 see only the private bindings.

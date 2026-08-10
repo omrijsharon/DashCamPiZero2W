@@ -2015,6 +2015,46 @@ def test_fixture_cleanup_sweeps_all_nonce_units_before_unmount(
     assert [entry[0] for entry in observed] == ["drain", "unmount", "unmount"]
 
 
+def test_fixture_mounts_are_made_private_with_exact_propagation_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "state"
+    target.mkdir()
+    loop = Path("/dev/loop2")
+    monkeypatch.setattr(
+        run,
+        "_findmnt",
+        lambda _target: {
+            "source": loop.as_posix(),
+            "target": target.resolve().as_posix(),
+        },
+    )
+    observed: list[tuple[str, ...]] = []
+
+    def command(arguments: tuple[object, ...]) -> SimpleNamespace:
+        observed.append(tuple(str(value) for value in arguments))
+        if arguments[0] == "/usr/bin/mount":
+            return SimpleNamespace(stdout=b"", stderr=b"")
+        return SimpleNamespace(stdout=b"private\n", stderr=b"")
+
+    monkeypatch.setattr(run, "_command", command)
+
+    run._make_mount_private(target, loop)
+
+    assert observed == [
+        ("/usr/bin/mount", "--make-private", str(target)),
+        (
+            "/usr/bin/findmnt",
+            "--noheadings",
+            "--output",
+            "PROPAGATION",
+            "--mountpoint",
+            str(target),
+        ),
+    ]
+
+
 def test_readme_states_private_scope_and_all_nonclaims() -> None:
     readme = (HARNESS / "README.md").read_text(encoding="utf-8")
 

@@ -2396,6 +2396,30 @@ def _detach(loop: Path, image: Path) -> None:
     _command(("/usr/sbin/losetup", "--detach", loop))
 
 
+def _make_mount_private(target: Path, loop: Path) -> None:
+    row = _findmnt(target)
+    if (
+        row.get("source") != loop.as_posix()
+        or row.get("target") != target.resolve(strict=True).as_posix()
+    ):
+        raise HarnessError("refusing to change propagation for a foreign mount")
+    changed = _command(("/usr/bin/mount", "--make-private", target))
+    if changed.stdout or changed.stderr:
+        raise HarnessError("mount propagation change produced output")
+    observed = _command(
+        (
+            "/usr/bin/findmnt",
+            "--noheadings",
+            "--output",
+            "PROPAGATION",
+            "--mountpoint",
+            target,
+        )
+    )
+    if observed.stdout != b"private\n" or observed.stderr:
+        raise HarnessError("private mount propagation proof differs")
+
+
 def _unmount(target: Path, loop: Path) -> None:
     for attempt in range(UNMOUNT_RETRY_LIMIT):
         row = _findmnt(target)
@@ -2468,6 +2492,7 @@ def _mount_fixture(
                 recording,
             )
         )
+        _make_mount_private(recording, recording_loop)
         _require_mount(
             recording,
             recording_loop,
@@ -2487,6 +2512,7 @@ def _mount_fixture(
                 state,
             )
         )
+        _make_mount_private(state, state_loop)
         _require_mount(
             state,
             state_loop,

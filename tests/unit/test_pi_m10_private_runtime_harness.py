@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import sqlite3
 import sys
 import zipfile
 from collections.abc import Callable
@@ -774,6 +775,24 @@ def test_private_findmnt_adapter_refuses_nonexact_or_ambiguous_rows(
             "TARGET,SOURCE,FSTYPE,LABEL,UUID,OPTIONS,MAJ:MIN",
         )
     ) == 2
+
+
+def test_catalog_observer_requires_canonical_state_recording_siblings(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "recording"
+    state = tmp_path / "state"
+    recording.mkdir()
+    state.mkdir()
+    catalog = state / "catalog.sqlite3"
+    sqlite3.connect(catalog).close()
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        run._query_catalog(catalog, recording)
+    with pytest.raises(run.HarnessError, match="observer path"):
+        run._query_catalog(tmp_path / "catalog.sqlite3", recording)
+    with pytest.raises(run.HarnessError, match="observer path"):
+        run._query_catalog(catalog, tmp_path / "media")
 
 
 def test_clean_storage_safety_stop_requires_zero_restart_and_success() -> None:

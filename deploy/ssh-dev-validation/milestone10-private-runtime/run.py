@@ -3105,7 +3105,15 @@ def _seed_fixture(action: str, root: Path, catalog_path: Path, boot_id: str) -> 
 
 
 def _query_catalog(catalog_path: Path, root: Path) -> dict[str, object]:
-    if catalog_path.is_symlink() or catalog_path.parent != root.parent:
+    if (
+        catalog_path.is_symlink()
+        or catalog_path.parent.is_symlink()
+        or root.is_symlink()
+        or catalog_path.name != "catalog.sqlite3"
+        or catalog_path.parent.name != "state"
+        or root.name != "recording"
+        or catalog_path.parent.parent != root.parent
+    ):
         raise HarnessError("catalog observer path differs")
     connection = sqlite3.connect(f"file:{catalog_path.as_posix()}?mode=ro", uri=True, timeout=1)
     connection.execute("PRAGMA query_only=ON")

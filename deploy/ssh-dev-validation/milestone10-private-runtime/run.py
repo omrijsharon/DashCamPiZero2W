@@ -4438,17 +4438,12 @@ def _phase_a(
             for row in completed_deletes
         ):
             raise HarnessError("startup intent completion timestamps differ")
-        pre_finalize_deletes = [
-            row
+        if any(
+            cast(int, row["completed_monotonic_ns"])
+            <= finalize["completed_monotonic_ns"]
             for row in completed_deletes
-            if cast(int, row["completed_monotonic_ns"])
-            < finalize["completed_monotonic_ns"]
-        ]
-        if not pre_finalize_deletes:
-            raise HarnessError("startup DELETE did not complete before FINALIZE")
-        post_finalize_deletes = [
-            row for row in completed_deletes if row not in pre_finalize_deletes
-        ]
+        ):
+            raise HarnessError("startup DELETE did not follow FINALIZE convergence")
         excluded_rows = {
             row["clip_id"]: row
             for row in cast(list[dict[str, object]], after_start["clips"])
@@ -4592,13 +4587,13 @@ def _phase_a(
         return {
             "passed": True,
             "startup_duration_ns": ready_ns - started_ns,
-            "startup_reclaim_before_finalize": True,
+            "startup_finalize_before_reclaim": True,
             "startup_delete_count": len(completed_deletes),
-            "startup_delete_before_finalize_count": len(pre_finalize_deletes),
-            "startup_delete_after_finalize_count": len(post_finalize_deletes),
+            "startup_delete_before_finalize_count": 0,
+            "startup_delete_after_finalize_count": len(completed_deletes),
             "protected_excluded": True,
             "leased_excluded": True,
-            "integrated_finalizing_excluded": True,
+            "integrated_pending_finalize_converged": True,
             "active_writing_interval": {
                 "clip_id": writing_before["clip_id"],
                 "preserved_until": writing_after["lifecycle"],
@@ -5460,7 +5455,8 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                 "hardware_h264_tested": True,
                 "production_listener_tested": True,
                 "active_writing_reclaim_tested": True,
-                "integrated_finalizing_startup_exclusion_tested": True,
+                "integrated_pending_finalize_startup_convergence_tested": True,
+                "integrated_finalizing_startup_exclusion_tested": False,
                 "camera_generated_finalizing_overlap_tested": False,
                 "protected_only_emergency_tested": True,
                 "startup_bound_tested": True,

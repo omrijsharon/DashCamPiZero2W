@@ -1849,6 +1849,7 @@ def test_result_claims_remain_explicit_and_false_for_unexercised_surfaces() -> N
 
     for claim in (
         '"camera_generated_finalizing_overlap_tested": False',
+        '"integrated_finalizing_startup_exclusion_tested": False',
         '"download_data_plane_tested": False',
         '"http_or_ui_tested": False',
         '"physical_gps_tested": False',
@@ -1869,7 +1870,7 @@ def test_phase_a_startup_order_refusals_remain_distinct_reviewed_lines() -> None
         "startup FINALIZE intent was not observed",
         "startup FINALIZE intent did not complete",
         "startup intent completion timestamps differ",
-        "startup DELETE did not complete before FINALIZE",
+        "startup DELETE did not follow FINALIZE convergence",
     )
     observed = [
         index + 1
@@ -1885,8 +1886,9 @@ def test_phase_a_startup_order_refusals_remain_distinct_reviewed_lines() -> None
 def test_phase_a_records_both_startup_reclaim_pass_counts() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 
-    assert '"startup_delete_before_finalize_count": len(pre_finalize_deletes)' in source
-    assert '"startup_delete_after_finalize_count": len(post_finalize_deletes)' in source
+    assert '"startup_finalize_before_reclaim": True' in source
+    assert '"startup_delete_before_finalize_count": 0' in source
+    assert '"startup_delete_after_finalize_count": len(completed_deletes)' in source
 
 
 def test_rollback_output_is_opened_inside_private_namespace() -> None:

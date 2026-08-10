@@ -70,9 +70,10 @@ successful reload.
 
 The fixed phase order is:
 
-1. Candidate startup reclaim, real camera/hardware encoder, recorder-owned
-   listener, active-WRITING and protected/leased/finalizing exclusion, event
-   NEXT convergence, three decoded ordinary clips, and clean shutdown.
+1. Candidate startup pending-FINALIZE convergence followed by reclaim, real
+   camera/hardware encoder, recorder-owned listener, active-WRITING and
+   protected/leased exclusion, event NEXT convergence, three decoded ordinary
+   clips, and clean shutdown.
 2. Exact rollback quiesce twice, its read-only guard, and a short real rollback
    recorder start on the same private fixture.
 3. Fresh protected-only emergency, which must terminate with clean
@@ -120,7 +121,8 @@ published on a refused/interrupted run.
 
 This evidence does **not** test or claim the HTTP/download data plane, UI,
 physical GPS, physical microphone, physical power loss, or deterministic
-camera-generated FINALIZING/reclaimer overlap. FINALIZING is exercised as a
-durable integrated startup exclusion; the real runtime gate covers the active
-WRITING clip. No media, coordinates, raw NMEA, or absolute managed paths are
-published.
+camera-generated FINALIZING/reclaimer overlap. The durable pending FINALIZE is
+exercised as integrated startup convergence and is required to complete before
+the first recorded DELETE completion; it is not claimed as simultaneous
+reclaimer exclusion. The real runtime gate covers the active WRITING clip.
+No media, coordinates, raw NMEA, or absolute managed paths are published.

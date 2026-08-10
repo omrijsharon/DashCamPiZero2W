@@ -166,7 +166,14 @@ PREFLIGHT_DIAGNOSTIC_STAGES: Final = frozenset(
         "IDENTITY",
         "POLICY",
         "COLLECT_ROOT",
-        "COLLECT_FINDMNT",
+        "FINDMNT_EXEC",
+        "FINDMNT_BOUND",
+        "FINDMNT_RETURN",
+        "FINDMNT_JSON",
+        "FINDMNT_ROOT",
+        "FINDMNT_ROWS",
+        "FINDMNT_ROW",
+        "FINDMNT_DIFFERING",
         "COLLECT_TARGET",
         "COLLECT_SOURCE",
         "COLLECT_FIELDS",
@@ -698,7 +705,7 @@ runpy.run_module(a.module,run_name="__main__",alter_sys=True)
 """
 
 PREFLIGHT_DIAGNOSTIC = b"""#!/usr/bin/env python3
-import json,os,sys
+import json,os,subprocess,sys
 out="/run/dashcam/preflight-diagnostic.json"
 def emit(stage):
  payload=(json.dumps({"schema_version":1,"stage":stage},sort_keys=True,separators=(",",":"))+"\\n").encode("ascii")
@@ -729,7 +736,34 @@ identity=attempt("IDENTITY",lambda:p.load_storage_identity("/var/lib/dashcam/sto
 policy=attempt("POLICY",lambda:p.policy_from_identity(config,identity))
 collector=p.PosixFactsCollector()
 root_id=attempt("COLLECT_ROOT",lambda:p._directory_device_id("/"))
-row=attempt("COLLECT_FINDMNT",lambda:collector._find_mount(policy.recording_root))
+command=("/usr/bin/findmnt","--json","--mountpoint",policy.recording_root,"--output","TARGET,SOURCE,FSTYPE,LABEL,UUID,OPTIONS,MAJ:MIN")
+result=attempt(
+ "FINDMNT_EXEC",
+ lambda:subprocess.run(command,check=False,stdin=subprocess.DEVNULL,capture_output=True,timeout=p.COMMAND_TIMEOUT_SECONDS,env={"LC_ALL":"C","PATH":"/usr/sbin:/usr/bin:/sbin:/bin"}),
+)
+if len(result.stdout)>p.MAX_FINDMNT_BYTES or len(result.stderr)>p.MAX_FINDMNT_BYTES:
+ emit("FINDMNT_BOUND");raise SystemExit(0)
+if result.returncode==1 and not result.stdout and not result.stderr:
+ row=None
+else:
+ if result.returncode!=0:
+  emit("FINDMNT_RETURN");raise SystemExit(0)
+ raw_findmnt=attempt(
+  "FINDMNT_JSON",
+  lambda:json.loads(result.stdout.decode("utf-8"),object_pairs_hook=p._unique_json_object),
+ )
+ if not isinstance(raw_findmnt,dict) or set(raw_findmnt)!={"filesystems"}:
+  emit("FINDMNT_ROOT");raise SystemExit(0)
+ rows=raw_findmnt["filesystems"]
+ if not isinstance(rows,list) or not rows or len(rows)>p.MAX_FINDMNT_ROWS:
+  emit("FINDMNT_ROWS");raise SystemExit(0)
+ parsed_rows=attempt(
+  "FINDMNT_ROW",
+  lambda:tuple(p._parse_findmnt_row(value,target=policy.recording_root) for value in rows),
+ )
+ row=parsed_rows[0]
+ if any(value!=row for value in parsed_rows[1:]):
+  emit("FINDMNT_DIFFERING");raise SystemExit(0)
 if row is None:
  raw={"mount":{"target":policy.recording_root,"mounted":False,"source":None,"filesystem":None,"label":None,"uuid":None,"mount_options":[],"device_id":None,"os_root_device_id":root_id},"space":{"capacity_bytes":None,"free_bytes":None},"sentinel":None}
 else:
@@ -3613,8 +3647,22 @@ def _run_preflight_diagnostic(nonce: str, paths: Mapping[str, Path]) -> None:
         raise HarnessError("preflight diagnostic classified policy")
     if stage == "COLLECT_ROOT":
         raise HarnessError("preflight diagnostic classified root device collection")
-    if stage == "COLLECT_FINDMNT":
-        raise HarnessError("preflight diagnostic classified findmnt collection")
+    if stage == "FINDMNT_EXEC":
+        raise HarnessError("preflight diagnostic classified findmnt execution")
+    if stage == "FINDMNT_BOUND":
+        raise HarnessError("preflight diagnostic classified findmnt output bound")
+    if stage == "FINDMNT_RETURN":
+        raise HarnessError("preflight diagnostic classified findmnt return code")
+    if stage == "FINDMNT_JSON":
+        raise HarnessError("preflight diagnostic classified findmnt JSON")
+    if stage == "FINDMNT_ROOT":
+        raise HarnessError("preflight diagnostic classified findmnt root")
+    if stage == "FINDMNT_ROWS":
+        raise HarnessError("preflight diagnostic classified findmnt rows")
+    if stage == "FINDMNT_ROW":
+        raise HarnessError("preflight diagnostic classified findmnt row")
+    if stage == "FINDMNT_DIFFERING":
+        raise HarnessError("preflight diagnostic classified differing findmnt rows")
     if stage == "COLLECT_TARGET":
         raise HarnessError("preflight diagnostic classified mount target collection")
     if stage == "COLLECT_SOURCE":

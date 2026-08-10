@@ -2018,8 +2018,10 @@ def test_canonical_media_refusals_use_the_reviewed_function_lines() -> None:
         "canonical sidecar filename binding differs",
         "canonical sidecar video profile differs",
         "canonical sidecar frame counter differs",
-        "canonical sidecar drop counter differs",
         "canonical sidecar warnings shape differs",
+        "canonical sidecar drop counter shape differs",
+        "canonical sidecar drop sentinel contradicts its warning",
+        "canonical sidecar recorded dropped frames",
         "finalized media catalog path differs",
         "finalized media member type differs",
         "finalized media device differs",
@@ -2067,6 +2069,7 @@ def test_canonical_media_accepts_production_sidecar_without_result_newline(
     assert observed["clip_id"] == row["clip_id"]
     assert observed["frames_written"] == 30
     assert observed["sidecar_drop_counter_available"] is True
+    assert observed["sidecar_dropped_frames"] == 0
 
 
 def test_media_evidence_never_turns_unavailable_sidecar_drop_count_into_zero() -> None:

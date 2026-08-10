@@ -3989,8 +3989,6 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
         or cast(int, video_summary.get("frames_written")) <= 0
     ):
         raise HarnessError("canonical sidecar frame counter differs")
-    if video_summary.get("dropped_frames") != 0:
-        raise HarnessError("canonical sidecar drop counter differs")
     if not isinstance(warnings, list):
         raise HarnessError("canonical sidecar warnings shape differs")
     counter_warning = any(
@@ -4001,6 +3999,17 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
             "frame and drop counters are unavailable",
         )
     )
+    dropped_frames = video_summary.get("dropped_frames")
+    if (
+        not isinstance(dropped_frames, int)
+        or isinstance(dropped_frames, bool)
+        or dropped_frames < 0
+    ):
+        raise HarnessError("canonical sidecar drop counter shape differs")
+    if counter_warning and dropped_frames != 0:
+        raise HarnessError("canonical sidecar drop sentinel contradicts its warning")
+    if not counter_warning and dropped_frames != 0:
+        raise HarnessError("canonical sidecar recorded dropped frames")
     directory = PurePosixPath(relative).parent
     video_relative = (directory / cast(str, value["video_file"])).as_posix()
     video = root / PurePosixPath(video_relative)
@@ -4028,6 +4037,7 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
         "sequence": value.get("sequence"),
         "frames_written": video_summary["frames_written"],
         "sidecar_drop_counter_available": not counter_warning,
+        "sidecar_dropped_frames": dropped_frames if not counter_warning else None,
     }
 
 

@@ -2389,6 +2389,9 @@ def test_preflight_execution_diagnostic_has_closed_unique_stage_lines(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    assert run.UNIT_RE.fullmatch(
+        "dashcam-m10-private-123456789abc-preflight.service"
+    ) is not None
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     paths = {

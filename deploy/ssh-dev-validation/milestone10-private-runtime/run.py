@@ -247,7 +247,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "blkid",
 )
 UNIT_RE: Final = re.compile(
-    r"dashcam-m10-private-[a-z0-9]{12}-(?:bind|a|rollback[0123]|b|c)\.service"
+    r"dashcam-m10-private-[a-z0-9]{12}-(?:bind|preflight|a|rollback[0123]|b|c)\.service"
 )
 NONCE_RE: Final = re.compile(r"dashcam-m10-private\.[a-z0-9]{12}")
 RESULT_RE: Final = re.compile(r"m10-private-runtime-[0-9a-f]{12}\.json")

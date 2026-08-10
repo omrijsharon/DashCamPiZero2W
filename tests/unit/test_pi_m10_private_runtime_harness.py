@@ -2168,6 +2168,7 @@ def test_rollback_guard_report_schema_is_closed_to_the_companion_contract() -> N
     ]
 
     for field in (
+        '"actions_attempted"',
         '"high_free_bytes"',
         '"catalog_schema"',
         '"finalized_clips_examined"',

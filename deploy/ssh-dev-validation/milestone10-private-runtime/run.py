@@ -4855,6 +4855,7 @@ def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
                     "schema_after",
                     "passes",
                     "intents_examined",
+                    "actions_attempted",
                     "expired_leases_cleared",
                     "orphaned_writing_demoted",
                     "latch_initialized",
@@ -4870,6 +4871,7 @@ def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
                     not isinstance(report.get(key), int) or cast(int, report[key]) < 0
                     for key in (
                         "intents_examined",
+                        "actions_attempted",
                         "expired_leases_cleared",
                         "orphaned_writing_demoted",
                     )

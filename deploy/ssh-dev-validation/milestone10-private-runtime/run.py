@@ -33,7 +33,7 @@ from typing import Any, Final, cast
 from uuid import UUID, uuid4
 
 SCHEMA_VERSION: Final = 1
-EXPECTED_CANDIDATE: Final = "efc16c651511f7d64428c26dc874cb32d663ac42"
+EXPECTED_CANDIDATE: Final = "3d027042c798c6dd7d92e3701689862f28ed2d9e"
 EXPECTED_ROLLBACK: Final = "5268bd8e2f0dfe18d2a70ec142af45e8198b3f1a"
 EXPECTED_API_GID: Final = 983
 EXPECTED_RELEASE: Final = "0.1.0.dev0-5f95dd806342ac9e"

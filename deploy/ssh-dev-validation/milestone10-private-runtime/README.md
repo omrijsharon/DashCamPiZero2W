@@ -5,7 +5,7 @@ code at the production catalog or recording volume. The parent reads bounded
 production identity files before and after the run and requires them unchanged.
 It is intentionally exact-Pi only and must be
 built at the separately reviewed harness commit while embedding candidate
-commit `efc16c651511f7d64428c26dc874cb32d663ac42` and rollback companion
+commit `3d027042c798c6dd7d92e3701689862f28ed2d9e` and rollback companion
 `5268bd8e2f0dfe18d2a70ec142af45e8198b3f1a` as independent exact-source archives.
 
 The builder creates two independent deterministic source archives. Build the
@@ -17,7 +17,7 @@ python deploy/ssh-dev-validation/milestone10-private-runtime/prepare-bundle.py \
   --repository REPOSITORY \
   --output FRESH_OUTSIDE_REPOSITORY_DIRECTORY \
   --expected-harness-commit REVIEWED_HARNESS_COMMIT \
-  --candidate-commit efc16c651511f7d64428c26dc874cb32d663ac42 \
+  --candidate-commit 3d027042c798c6dd7d92e3701689862f28ed2d9e \
   --rollback-commit 5268bd8e2f0dfe18d2a70ec142af45e8198b3f1a
 ```
 

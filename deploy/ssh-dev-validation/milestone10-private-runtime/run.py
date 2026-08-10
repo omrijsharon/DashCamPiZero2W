@@ -4876,13 +4876,31 @@ def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
                 )
                 or report.get("latch_initialized") is not expected_initialization[index]
                 or not isinstance(guard, dict)
-                or set(guard) != {"volume_uuid", "device_id", "capacity_bytes", "free_bytes"}
+                or set(guard)
+                != {
+                    "volume_uuid",
+                    "device_id",
+                    "capacity_bytes",
+                    "free_bytes",
+                    "high_free_bytes",
+                    "catalog_schema",
+                    "finalized_clips_examined",
+                }
                 or guard.get("volume_uuid") != _blkid(paths["recording_loop"])["UUID"]
                 or guard.get("device_id") != _device_id(paths["recording"])
                 or guard.get("capacity_bytes") != _space(paths["recording"])[0]
                 or not isinstance(guard.get("free_bytes"), int)
+                or isinstance(guard.get("free_bytes"), bool)
                 or cast(int, guard.get("free_bytes"))
                 < resolved_thresholds(_space(paths["recording"])[0])[1]
+                or guard.get("high_free_bytes")
+                != resolved_thresholds(_space(paths["recording"])[0])[1]
+                or guard.get("catalog_schema") != 5
+                or not isinstance(guard.get("finalized_clips_examined"), int)
+                or isinstance(guard.get("finalized_clips_examined"), bool)
+                or not 0
+                <= cast(int, guard.get("finalized_clips_examined"))
+                <= MAX_FIXTURE_ROWS
             ):
                 raise HarnessError("rollback quiesce/guard report contract differs")
             quiesce_results.append(report)

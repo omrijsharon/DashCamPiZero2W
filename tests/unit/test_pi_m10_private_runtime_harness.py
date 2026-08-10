@@ -2161,6 +2161,22 @@ def test_fresh_writing_selection_accepts_one_small_successor_during_overlap(
     assert run._wait_fresh_writing(tmp_path / "catalog.sqlite3", root) == new
 
 
+def test_rollback_guard_report_schema_is_closed_to_the_companion_contract() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    rollback = source[
+        source.index("def _rollback_phase(") : source.index("def _protected_emergency_phase(")
+    ]
+
+    for field in (
+        '"high_free_bytes"',
+        '"catalog_schema"',
+        '"finalized_clips_examined"',
+    ):
+        assert field in rollback
+    assert 'guard.get("catalog_schema") != 5' in rollback
+    assert "<= MAX_FIXTURE_ROWS" in rollback
+
+
 def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
     messages = (

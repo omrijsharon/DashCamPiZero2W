@@ -3047,26 +3047,33 @@ def _storage_fault_classification(runtime: object) -> tuple[str, str | None]:
     if "storage_preflight" not in runtime:
         return "PREFLIGHT_MISSING", None
     preflight = runtime["storage_preflight"]
-    if not isinstance(preflight, dict) or set(preflight) != PREFLIGHT_STATUS_KEYS:
-        return "PREFLIGHT_MALFORMED", None
+    if not isinstance(preflight, dict):
+        return "PREFLIGHT_NOT_MAPPING", None
+    if set(preflight) != PREFLIGHT_STATUS_KEYS:
+        return "PREFLIGHT_KEYS", None
     state = preflight.get("state")
     reasons = preflight.get("reasons")
     ready = preflight.get("ready")
-    if (
-        type(state) is not str
-        or state not in PREFLIGHT_STATES
-        or not isinstance(reasons, list)
-        or len(reasons) > len(PREFLIGHT_REASONS)
-        or any(type(reason) is not str for reason in reasons)
-        or len(set(reasons)) != len(reasons)
-        or any(reason not in PREFLIGHT_REASONS for reason in reasons)
-        or type(ready) is not bool
-    ):
-        return "PREFLIGHT_MALFORMED", None
+    if type(state) is not str:
+        return "PREFLIGHT_STATE_TYPE", None
+    if state not in PREFLIGHT_STATES:
+        return "PREFLIGHT_STATE_DOMAIN", None
+    if not isinstance(reasons, list):
+        return "PREFLIGHT_REASONS_TYPE", None
+    if len(reasons) > len(PREFLIGHT_REASONS):
+        return "PREFLIGHT_REASONS_LENGTH", None
+    if any(type(reason) is not str for reason in reasons):
+        return "PREFLIGHT_REASON_TYPE", None
     typed_reasons = cast(list[str], reasons)
+    if len(set(typed_reasons)) != len(typed_reasons):
+        return "PREFLIGHT_REASON_DUPLICATE", None
+    if any(reason not in PREFLIGHT_REASONS for reason in typed_reasons):
+        return "PREFLIGHT_REASON_DOMAIN", None
+    if type(ready) is not bool:
+        return "PREFLIGHT_READY_TYPE", None
     if not typed_reasons:
         if state != "READY" or ready is not True:
-            return "PREFLIGHT_MALFORMED", None
+            return "PREFLIGHT_EMPTY_RELATION", None
     else:
         non_faulted = {"READ_ONLY", "CONFLICTING_MOUNT_OPTIONS", "RESERVE_EXHAUSTED"}
         if any(reason not in non_faulted for reason in typed_reasons):
@@ -3079,7 +3086,7 @@ def _storage_fault_classification(runtime: object) -> tuple[str, str | None]:
         else:
             expected_state = "EMERGENCY"
         if state != expected_state or ready is not False:
-            return "PREFLIGHT_MALFORMED", None
+            return "PREFLIGHT_NONEMPTY_RELATION", None
         return "PREFLIGHT_REASON", typed_reasons[0]
     if "storage_retention" not in runtime:
         return "RETENTION_MISSING", None
@@ -3213,8 +3220,30 @@ def _phase_a_launch_failure_status(runtime: Path) -> None:
             raise HarnessError("phase A storage status runtime is malformed")
         if classification == "PREFLIGHT_MISSING":
             raise HarnessError("phase A storage preflight status is missing")
-        if classification == "PREFLIGHT_MALFORMED":
-            raise HarnessError("phase A storage preflight status is malformed")
+        if classification == "PREFLIGHT_NOT_MAPPING":
+            raise HarnessError("phase A storage preflight status type differs")
+        if classification == "PREFLIGHT_KEYS":
+            raise HarnessError("phase A storage preflight status fields differ")
+        if classification == "PREFLIGHT_STATE_TYPE":
+            raise HarnessError("phase A storage preflight state type differs")
+        if classification == "PREFLIGHT_STATE_DOMAIN":
+            raise HarnessError("phase A storage preflight state domain differs")
+        if classification == "PREFLIGHT_REASONS_TYPE":
+            raise HarnessError("phase A storage preflight reasons type differs")
+        if classification == "PREFLIGHT_REASONS_LENGTH":
+            raise HarnessError("phase A storage preflight reasons bound differs")
+        if classification == "PREFLIGHT_REASON_TYPE":
+            raise HarnessError("phase A storage preflight reason type differs")
+        if classification == "PREFLIGHT_REASON_DUPLICATE":
+            raise HarnessError("phase A storage preflight reasons are duplicated")
+        if classification == "PREFLIGHT_REASON_DOMAIN":
+            raise HarnessError("phase A storage preflight reason domain differs")
+        if classification == "PREFLIGHT_READY_TYPE":
+            raise HarnessError("phase A storage preflight ready type differs")
+        if classification == "PREFLIGHT_EMPTY_RELATION":
+            raise HarnessError("phase A storage preflight empty relation differs")
+        if classification == "PREFLIGHT_NONEMPTY_RELATION":
+            raise HarnessError("phase A storage preflight reason relation differs")
         if storage_reason == "MALFORMED_FACTS":
             raise HarnessError("phase A storage status matched classified branch")
         if storage_reason == "WRONG_TARGET":

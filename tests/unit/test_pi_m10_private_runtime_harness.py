@@ -2352,6 +2352,67 @@ def test_storage_fault_diagnostic_missing_and_malformed_shapes_are_fixed_and_uni
             assert private not in refusal
 
 
+def test_storage_fault_diagnostic_splits_every_preflight_malformed_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrong_keys = _storage_preflight_status()
+    wrong_keys["private_extra"] = "hunter2"
+    state_type = _storage_preflight_status()
+    state_type["state"] = 7
+    state_domain = _storage_preflight_status()
+    state_domain["state"] = "PRIVATE_STATE"
+    reasons_type = _storage_preflight_status()
+    reasons_type["reasons"] = "PRIVATE_REASONS"
+    reasons_length = _storage_preflight_status()
+    reasons_length["reasons"] = ["WRONG_TARGET"] * (len(run.PREFLIGHT_REASONS) + 1)
+    reason_type = _storage_preflight_status()
+    reason_type["reasons"] = [7]
+    reason_duplicate = _storage_preflight_status("READ_ONLY")
+    reason_duplicate["reasons"] = ["READ_ONLY", "READ_ONLY"]
+    reason_domain = _storage_preflight_status("PRIVATE_REASON")
+    ready_type = _storage_preflight_status()
+    ready_type["ready"] = "PRIVATE_READY"
+    empty_relation = _storage_preflight_status()
+    empty_relation["state"] = "CHECKING"
+    nonempty_relation = _storage_preflight_status("WRONG_TARGET")
+    nonempty_relation["state"] = "READY"
+    cases: tuple[object, ...] = (
+        ["PRIVATE_NOT_MAPPING", "/private/path", "hunter2"],
+        wrong_keys,
+        state_type,
+        state_domain,
+        reasons_type,
+        reasons_length,
+        reason_type,
+        reason_duplicate,
+        reason_domain,
+        ready_type,
+        empty_relation,
+        nonempty_relation,
+    )
+    refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(preflight=preflight),
+        )
+        for preflight in cases
+    }
+
+    assert len(refusals) == len(cases)
+    for refusal in refusals:
+        assert run._validated_refusal_location(refusal) == refusal
+        for private in (
+            b"PRIVATE",
+            b"storage_preflight",
+            b"state",
+            b"reasons",
+            b"ready",
+            b"hunter2",
+            b"/private",
+        ):
+            assert private not in refusal
+
+
 def test_storage_fault_diagnostic_refuses_unknown_closed_domain_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2376,7 +2437,7 @@ def test_storage_fault_diagnostic_refuses_unknown_closed_domain_values(
         for retention in (unknown_mode, unknown_fault, unknown_trigger)
     }
 
-    assert len(preflight_refusals) == 1
+    assert len(preflight_refusals) == 2
     assert len(retention_refusals) == 1
     assert preflight_refusals.isdisjoint(retention_refusals)
     for refusal in preflight_refusals | retention_refusals:

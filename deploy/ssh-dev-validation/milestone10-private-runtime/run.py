@@ -4794,7 +4794,7 @@ def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
                 "--control-socket",
                 CONTROL_SOCKET,
             ),
-            client_timeout_s=SYSTEMD_RUN_CLIENT_TIMEOUT_S,
+            client_timeout_s=SYSTEMD_RUN_NOTIFY_TIMEOUT_S,
         )
         terminal = _wait_unit_terminal(unit, ROLLBACK_TIMEOUT_S)
         try:

@@ -1939,16 +1939,15 @@ def test_candidate_unit_maps_only_notify_roles_to_50_second_client_timeout(
     ]
 
 
-def test_bind_and_rollback_recovery_keep_explicit_20_second_client_timeout() -> None:
+def test_bind_and_rollback_recovery_use_role_appropriate_client_timeouts() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
     bind = source[source.index("def _run_bind_probe(") : source.index("def _source_environment(")]
     rollback = source[
         source.index("def _rollback_phase(") : source.index("def _protected_emergency_phase(")
     ]
 
-    expected = "client_timeout_s=SYSTEMD_RUN_CLIENT_TIMEOUT_S"
-    assert bind.count(expected) == 1
-    assert rollback.count(expected) == 1
+    assert bind.count("client_timeout_s=SYSTEMD_RUN_CLIENT_TIMEOUT_S") == 1
+    assert rollback.count("client_timeout_s=SYSTEMD_RUN_NOTIFY_TIMEOUT_S") == 1
 
 
 def test_source_has_owned_loop_cleanup_and_no_broad_destructive_actions() -> None:

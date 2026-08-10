@@ -4425,19 +4425,25 @@ def _phase_a(
             (row for row in intents if row["intent_id"] == fixture["finalize_intent_id"]),
             None,
         )
-        if (
-            not completed_deletes
-            or any(row["clip_id"] in excluded for row in completed_deletes)
-            or finalize is None
-            or finalize["status"] != "COMPLETE"
-            or not all(
-                isinstance(row["completed_monotonic_ns"], int)
-                and isinstance(finalize["completed_monotonic_ns"], int)
-                and row["completed_monotonic_ns"] < finalize["completed_monotonic_ns"]
-                for row in completed_deletes
-            )
+        if not completed_deletes:
+            raise HarnessError("startup reclaim produced no durable DELETE completion")
+        if any(row["clip_id"] in excluded for row in completed_deletes):
+            raise HarnessError("startup reclaim deleted an excluded clip")
+        if finalize is None:
+            raise HarnessError("startup FINALIZE intent was not observed")
+        if finalize["status"] != "COMPLETE":
+            raise HarnessError("startup FINALIZE intent did not complete")
+        if not isinstance(finalize["completed_monotonic_ns"], int) or any(
+            not isinstance(row["completed_monotonic_ns"], int)
+            for row in completed_deletes
         ):
-            raise HarnessError("startup reclaim-before-FINALIZE or exclusion evidence differs")
+            raise HarnessError("startup intent completion timestamps differ")
+        if any(
+            cast(int, row["completed_monotonic_ns"])
+            >= finalize["completed_monotonic_ns"]
+            for row in completed_deletes
+        ):
+            raise HarnessError("startup DELETE completed after FINALIZE")
         excluded_rows = {
             row["clip_id"]: row
             for row in cast(list[dict[str, object]], after_start["clips"])

@@ -1861,6 +1861,27 @@ def test_result_claims_remain_explicit_and_false_for_unexercised_surfaces() -> N
     assert '"findmnt_active_row_adapter_used": True' in source
 
 
+def test_phase_a_startup_order_refusals_remain_distinct_reviewed_lines() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    messages = (
+        "startup reclaim produced no durable DELETE completion",
+        "startup reclaim deleted an excluded clip",
+        "startup FINALIZE intent was not observed",
+        "startup FINALIZE intent did not complete",
+        "startup intent completion timestamps differ",
+        "startup DELETE completed after FINALIZE",
+    )
+    observed = [
+        index + 1
+        for index, line in enumerate(source.splitlines())
+        if any(message in line for message in messages)
+    ]
+
+    assert len(observed) == len(messages)
+    assert len(set(observed)) == len(messages)
+    assert set(observed).issubset(run._reviewed_function_lines()["phase_a"])
+
+
 def test_rollback_output_is_opened_inside_private_namespace() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 

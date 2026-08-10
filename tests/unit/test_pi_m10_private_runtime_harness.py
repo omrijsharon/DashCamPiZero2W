@@ -105,6 +105,109 @@ def _bundle(tmp_path: Path, *, compression: int = zipfile.ZIP_STORED) -> Path:
     return root
 
 
+def test_virtual_reader_accepts_procfs_zero_size_and_reads_to_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = iter((b"Raspberry Pi Zero 2 W Rev 1.0\0", b""))
+    opened: list[int] = []
+    closed: list[int] = []
+    monkeypatch.setattr(
+        run.os,
+        "open",
+        lambda _path, flags: opened.append(flags) or 7,
+    )
+    monkeypatch.setattr(
+        run.os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(st_mode=0o100444, st_size=0),
+    )
+    monkeypatch.setattr(run.os, "read", lambda _descriptor, _size: next(reads))
+    monkeypatch.setattr(run.os, "close", closed.append)
+
+    assert (
+        run._bounded_virtual_read(Path("/proc/device-tree/model"), 256)
+        == b"Raspberry Pi Zero 2 W Rev 1.0\0"
+    )
+    assert closed == [7]
+    if getattr(run.os, "O_NOFOLLOW", 0):
+        assert opened[0] & run.os.O_NOFOLLOW
+    if getattr(run.os, "O_CLOEXEC", 0):
+        assert opened[0] & run.os.O_CLOEXEC
+
+
+@pytest.mark.parametrize(
+    ("mode", "chunks", "message"),
+    (
+        (0o040755, (b"data", b""), "type differs"),
+        (0o100444, (b"",), "made no progress"),
+        (0o100444, (b"12345",), "exceeded its bound"),
+    ),
+)
+def test_virtual_reader_refuses_type_no_progress_and_oversize(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+    chunks: tuple[bytes, ...],
+    message: str,
+) -> None:
+    reads = iter(chunks)
+    monkeypatch.setattr(run.os, "open", lambda _path, _flags: 7)
+    monkeypatch.setattr(
+        run.os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(st_mode=mode, st_size=0),
+    )
+    monkeypatch.setattr(run.os, "read", lambda _descriptor, _size: next(reads))
+    monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
+
+    with pytest.raises(run.HarnessError, match=message):
+        run._bounded_virtual_read(Path("/proc/example"), 4)
+
+
+def test_virtual_identity_parsers_are_canonical_and_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads = {
+        Path("/proc/sys/kernel/random/boot_id"): b"11111111-1111-1111-1111-111111111111\n",
+        Path("/proc/device-tree/model"): b"Raspberry Pi Zero 2 W Rev 1.0\0",
+        Path("/proc/cpuinfo"): b"Processor\t: ARMv7\nSerial          : 0123456789abcdef\n",
+    }
+    monkeypatch.setattr(
+        run,
+        "_bounded_virtual_read",
+        lambda path, _maximum: payloads[path],
+    )
+
+    assert run._read_boot_id() == "11111111-1111-1111-1111-111111111111"
+    assert run._read_board_model() == "Raspberry Pi Zero 2 W Rev 1.0"
+    assert run._read_cpu_serial() == "0123456789abcdef"
+
+    payloads[Path("/proc/sys/kernel/random/boot_id")] = (
+        b"11111111-1111-1111-1111-111111111111\nextra\n"
+    )
+    with pytest.raises(run.HarnessError, match="boot ID virtual-file shape"):
+        run._read_boot_id()
+    payloads[Path("/proc/device-tree/model")] = b"model-without-nul"
+    with pytest.raises(run.HarnessError, match="board model virtual-file shape"):
+        run._read_board_model()
+    payloads[Path("/proc/cpuinfo")] = b"Serial : 0123456789abcdef\nSerial : fedcba9876543210\n"
+    with pytest.raises(run.HarnessError, match="CPU serial record count"):
+        run._read_cpu_serial()
+
+
+def test_only_declared_virtual_files_use_virtual_reader() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+
+    assert '_bounded_read(Path("/proc' not in source
+    assert '_bounded_read(Path("/sys' not in source
+    for declaration in (
+        '_bounded_virtual_read(Path("/proc/sys/kernel/random/boot_id"), 37)',
+        '_bounded_virtual_read(Path("/proc/device-tree/model"), 256)',
+        '_bounded_virtual_read(Path("/proc/cpuinfo"), 256 * 1024)',
+        '_bounded_virtual_read(Path("/sys/block") / loop.name / "loop/backing_file", 4096)',
+    ):
+        assert declaration in source
+
+
 def test_bundle_verifier_closes_both_exact_sources(tmp_path: Path) -> None:
     root = _bundle(tmp_path)
     digest = hashlib.sha256((root / "SHA256SUMS").read_bytes()).hexdigest()

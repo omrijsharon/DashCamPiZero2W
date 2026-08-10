@@ -152,6 +152,83 @@ def _bounded_read(path: Path, maximum: int) -> bytes:
         os.close(descriptor)
 
 
+def _bounded_virtual_read(path: Path, maximum: int) -> bytes:
+    """Read one declared procfs/sysfs regular file whose st_size is not authoritative."""
+
+    if maximum <= 0:
+        raise HarnessError("virtual file read bound is invalid")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HarnessError(f"virtual file type differs: {path.name}")
+        chunks = bytearray()
+        while len(chunks) <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if not chunks:
+            raise HarnessError(f"virtual file made no progress: {path.name}")
+        if len(chunks) > maximum:
+            raise HarnessError(f"virtual file exceeded its bound: {path.name}")
+        return bytes(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _read_boot_id() -> str:
+    payload = _bounded_virtual_read(Path("/proc/sys/kernel/random/boot_id"), 37)
+    try:
+        value = payload.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise HarnessError("boot ID is not ASCII") from error
+    if not value.endswith("\n") or value.count("\n") != 1:
+        raise HarnessError("boot ID virtual-file shape differs")
+    value = value.removesuffix("\n")
+    try:
+        canonical = str(UUID(value))
+    except ValueError as error:
+        raise HarnessError("boot ID is not canonical UUID text") from error
+    if canonical != value:
+        raise HarnessError("boot ID is not canonical UUID text")
+    return value
+
+
+def _read_board_model() -> str:
+    payload = _bounded_virtual_read(Path("/proc/device-tree/model"), 256)
+    if not payload.endswith(b"\0") or b"\0" in payload[:-1]:
+        raise HarnessError("board model virtual-file shape differs")
+    try:
+        return payload[:-1].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise HarnessError("board model is not ASCII") from error
+
+
+def _read_cpu_serial() -> str:
+    payload = _bounded_virtual_read(Path("/proc/cpuinfo"), 256 * 1024)
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise HarnessError("CPU information is not ASCII") from error
+    if "\0" in text or not text.endswith("\n"):
+        raise HarnessError("CPU information virtual-file shape differs")
+    serials: list[str] = []
+    for line in text.splitlines():
+        match = re.fullmatch(r"Serial[ \t]*:[ \t]*([0-9a-f]{16})", line)
+        if match is not None:
+            serials.append(match.group(1))
+    if len(serials) != 1:
+        raise HarnessError("CPU serial record count differs")
+    return serials[0]
+
+
 def _strict_json(payload: bytes, label: str) -> dict[str, object]:
     def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -1396,12 +1473,18 @@ def _require_dense_image(path: Path, expected_size: int) -> None:
 def _loop_backing(loop: Path) -> Path:
     if LOOP_RE.fullmatch(loop.as_posix()) is None:
         raise HarnessError("loop device name differs")
-    raw = _bounded_read(Path("/sys/block") / loop.name / "loop/backing_file", 4096)
+    raw = _bounded_virtual_read(Path("/sys/block") / loop.name / "loop/backing_file", 4096)
     try:
-        value = raw.decode("utf-8").strip()
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise HarnessError("loop backing path is not UTF-8") from error
-    return Path("/") / value
+    if "\0" in text or text.count("\n") > 1 or not text.endswith("\n"):
+        raise HarnessError("loop backing virtual-file shape differs")
+    value = text.removesuffix("\n")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise HarnessError("loop backing path is not absolute and normalized")
+    return path
 
 
 def _attach(image: Path) -> Path:
@@ -2917,7 +3000,7 @@ def _phase_a(
     root, state, runtime = paths["recording"], paths["state"], paths["runtime"]
     _source_environment(state / "candidate-source.zip")
     catalog = state / "catalog.sqlite3"
-    boot_id = _bounded_read(Path("/proc/sys/kernel/random/boot_id"), 64).decode("ascii").strip()
+    boot_id = _read_boot_id()
     fixture = _fixture_subprocess("A", root, catalog, boot_id, state / "candidate-source.zip")
     low, high, _emergency = resolved_thresholds(cast(int, identity["capacity_bytes"]))
     reserve = math.ceil(MINIMUM_FREE_GIB * 1024**3)
@@ -3139,7 +3222,7 @@ def _phase_a(
 
 def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
     runtime = paths["runtime"]
-    boot_id = _bounded_read(Path("/proc/sys/kernel/random/boot_id"), 64).decode("ascii").strip()
+    boot_id = _read_boot_id()
     absent_catalog = paths["state"] / "rollback-absent.sqlite3"
     absent_fixture = _fixture_subprocess(
         "D",
@@ -3296,7 +3379,7 @@ def _protected_emergency_phase(
 ) -> dict[str, object]:
     root, state, runtime = paths["recording"], paths["state"], paths["runtime"]
     catalog = state / "catalog.sqlite3"
-    boot_id = _bounded_read(Path("/proc/sys/kernel/random/boot_id"), 64).decode("ascii").strip()
+    boot_id = _read_boot_id()
     fixture = _fixture_subprocess("B", root, catalog, boot_id, state / "candidate-source.zip")
     before_catalog = _query_catalog(catalog, root)
     before_manifest = _managed_manifest(root)
@@ -3360,7 +3443,7 @@ def _protected_emergency_phase(
 def _startup_bound_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
     root, state, runtime = paths["recording"], paths["state"], paths["runtime"]
     catalog = state / "catalog.sqlite3"
-    boot_id = _bounded_read(Path("/proc/sys/kernel/random/boot_id"), 64).decode("ascii").strip()
+    boot_id = _read_boot_id()
     fixture = _fixture_subprocess("C", root, catalog, boot_id, state / "candidate-source.zip")
     observer = _CameraAbsenceObserver(catalog, root, runtime)
     unit = _candidate_unit(
@@ -3421,13 +3504,10 @@ def _validate_pi(expected_board_serial: str) -> tuple[int, int, int]:
         raise HarnessError("exact-Pi qualification requires Linux root")
     if Path(sys.executable).resolve(strict=True) != EXPECTED_INTERPRETER.resolve(strict=True):
         raise HarnessError("qualification interpreter differs from accepted release")
-    model = _bounded_read(Path("/proc/device-tree/model"), 256).rstrip(b"\0").decode("ascii")
+    model = _read_board_model()
     if model != EXPECTED_BOARD_MODEL:
         raise HarnessError("board model differs")
-    serial = None
-    for line in _bounded_read(Path("/proc/cpuinfo"), 256 * 1024).decode("ascii").splitlines():
-        if line.startswith("Serial") and line.count(":") == 1:
-            serial = line.split(":", 1)[1].strip()
+    serial = _read_cpu_serial()
     if (
         serial != expected_board_serial
         or re.fullmatch(r"[0-9a-f]{16}", expected_board_serial) is None

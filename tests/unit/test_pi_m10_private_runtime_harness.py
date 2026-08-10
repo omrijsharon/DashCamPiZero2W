@@ -1945,7 +1945,12 @@ def test_refusal_line_skips_command_and_systemd_wrappers_for_bind_probe_caller(
         assert private not in payload
 
 
-def _launch_status_payload(state: str, reason: str | None) -> bytes:
+def _launch_status_payload(
+    state: str,
+    reason: str | None,
+    *,
+    runtime: object | None = None,
+) -> bytes:
     return run.canonical_json(
         {
             "schema_version": 3,
@@ -1957,10 +1962,14 @@ def _launch_status_payload(state: str, reason: str | None) -> bytes:
                 "config_schema_version": 1,
                 "notification_failures": 0,
             },
-            "runtime": {
-                "secret": "coordinates 32.1,34.8",
-                "path": "/srv/dashcam/private.mp4",
-            },
+            "runtime": (
+                {
+                    "secret": "coordinates 32.1,34.8",
+                    "path": "/srv/dashcam/private.mp4",
+                }
+                if runtime is None
+                else runtime
+            ),
         }
     )
 
@@ -2079,6 +2088,357 @@ def test_phase_a_launch_failure_malformed_and_unknown_values_have_closed_lines(
     for refusal in refusals:
         for private in (b"PRIVATE", b"hunter2", b"/private", b"abcdef"):
             assert private not in refusal
+
+
+def _storage_preflight_status(*reasons: str) -> dict[str, object]:
+    if not reasons:
+        state = "READY"
+        ready = True
+    elif any(
+        reason not in {"READ_ONLY", "CONFLICTING_MOUNT_OPTIONS", "RESERVE_EXHAUSTED"}
+        for reason in reasons
+    ):
+        state = "FAULTED"
+        ready = False
+    elif any(reason in {"READ_ONLY", "CONFLICTING_MOUNT_OPTIONS"} for reason in reasons):
+        state = "READ_ONLY"
+        ready = False
+    else:
+        state = "EMERGENCY"
+        ready = False
+    return {
+        "state": state,
+        "reasons": list(reasons),
+        "ready": ready,
+        "mount": {
+            "target": "/srv/dashcam/private-secret",
+            "uuid_suffix": "secret-uuid",
+            "device_id": "secret-device",
+            "token": "abcdef",
+        },
+        "free_bytes": 32_134_800,
+        "capacity_bytes": 987_654_321,
+    }
+
+
+def _storage_retention_status(
+    *,
+    mode: str | None = "NORMAL",
+    fault: str | None = None,
+    trigger: object = None,
+    stop_required: bool = False,
+) -> dict[str, object]:
+    return {
+        "sequence": 7,
+        "mode": mode,
+        "fault": fault,
+        "trigger": trigger,
+        "stale": False,
+        "stop_required": stop_required,
+        "reclaimer_enabled": True,
+        "consecutive_observation_failures": 0,
+        "sample_age_ns": 1,
+        "volume_uuid_suffix": "secret-uuid",
+        "device_id": "secret-device",
+        "capacity_bytes": 987_654_321,
+        "free_bytes": 32_134_800,
+        "free_percent": 3.25,
+        "thresholds": {"path": "/private/threshold", "token": "abcdef"},
+        "directive": {"coordinates": "32.1,34.8", "psk": "hunter2"},
+    }
+
+
+def _storage_fault_status_payload(
+    *,
+    preflight: object = None,
+    retention: object = None,
+    include_preflight: bool = True,
+    include_retention: bool = True,
+) -> bytes:
+    runtime: dict[str, object] = {
+        "private_path": "/private/runtime",
+        "ssid": "MyHome",
+        "psk": "hunter2",
+        "token": "abcdef",
+        "coordinates": "32.1,34.8",
+    }
+    if include_preflight:
+        runtime["storage_preflight"] = (
+            _storage_preflight_status() if preflight is None else preflight
+        )
+    if include_retention:
+        runtime["storage_retention"] = (
+            _storage_retention_status() if retention is None else retention
+        )
+    return run.canonical_json(
+        {
+            "schema_version": 3,
+            "lifecycle": {
+                "state": "FAULTED",
+                "reason": "STORAGE_FAULT",
+                "detail": "SSID MyHome PSK hunter2 /private/path token abcdef",
+                "sequence": 7,
+                "config_schema_version": 1,
+                "notification_failures": 0,
+            },
+            "runtime": runtime,
+        }
+    )
+
+
+def test_storage_fault_diagnostic_has_unique_safe_line_for_every_preflight_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert run.PREFLIGHT_REASONS == (
+        "MALFORMED_FACTS",
+        "WRONG_TARGET",
+        "UNMOUNTED",
+        "MISSING_MOUNT_IDENTITY",
+        "ROOTFS_ALIAS",
+        "WRONG_FILESYSTEM",
+        "WRONG_LABEL",
+        "WRONG_UUID",
+        "WRONG_UUID_SUFFIX",
+        "READ_ONLY",
+        "CONFLICTING_MOUNT_OPTIONS",
+        "MISSING_SENTINEL",
+        "WRONG_SENTINEL_VERSION",
+        "WRONG_SENTINEL_IDENTITY",
+        "WRONG_SENTINEL_UUID",
+        "INVALID_SENTINEL_GEOMETRY",
+        "INVALID_SPACE",
+        "INSUFFICIENT_CAPACITY",
+        "RESERVE_EXHAUSTED",
+        "WRITE_PROBE_FAILED",
+    )
+    refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(preflight=_storage_preflight_status(reason)),
+        )
+        for reason in run.PREFLIGHT_REASONS
+    }
+    assert len(refusals) == len(run.PREFLIGHT_REASONS)
+
+
+def test_storage_fault_diagnostic_has_unique_safe_line_for_every_retention_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert run.SPACE_OBSERVATION_FAULTS == (
+        "OBSERVATION_FAILED",
+        "INVALID_OBSERVATION",
+        "OBSERVATION_STALE",
+        "IDENTITY_DRIFT",
+        "CAPACITY_DRIFT",
+        "LATCH_LOAD_FAILED",
+        "LATCH_BINDING_MISMATCH",
+        "LATCH_STORE_FAILED",
+        "NO_SPACE_WRITE",
+    )
+    refusals: set[bytes] = set()
+    for fault in run.SPACE_OBSERVATION_FAULTS:
+        no_space = fault == "NO_SPACE_WRITE"
+        stop_required = fault not in {"OBSERVATION_FAILED", "INVALID_OBSERVATION"}
+        refusals.add(
+            _launch_status_refusal(
+                monkeypatch,
+                _storage_fault_status_payload(
+                    retention=_storage_retention_status(
+                        mode="EMERGENCY" if no_space else None,
+                        fault=fault,
+                        trigger="NO_SPACE_WRITE" if no_space else None,
+                        stop_required=stop_required,
+                    )
+                ),
+            )
+        )
+    assert len(refusals) == len(run.SPACE_OBSERVATION_FAULTS)
+
+
+def test_storage_fault_diagnostic_accepts_normal_mode_with_production_fault_polarity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transient = ("OBSERVATION_FAILED", "INVALID_OBSERVATION")
+    latched = (
+        "IDENTITY_DRIFT",
+        "CAPACITY_DRIFT",
+        "LATCH_LOAD_FAILED",
+        "LATCH_BINDING_MISMATCH",
+        "LATCH_STORE_FAILED",
+    )
+    transient_refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(
+                retention=_storage_retention_status(
+                    mode="NORMAL",
+                    fault=fault,
+                    stop_required=False,
+                )
+            ),
+        )
+        for fault in transient
+    }
+    latched_refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(
+                retention=_storage_retention_status(
+                    mode="NORMAL",
+                    fault=fault,
+                    stop_required=True,
+                )
+            ),
+        )
+        for fault in latched
+    }
+
+    assert len(transient_refusals) == len(transient)
+    assert len(latched_refusals) == len(latched)
+    assert transient_refusals.isdisjoint(latched_refusals)
+
+
+def test_storage_fault_diagnostic_has_closed_no_fault_stop_and_mode_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert run.RETENTION_MODES == ("NORMAL", "RECLAIMING", "EMERGENCY")
+    shapes = [
+        _storage_retention_status(mode=None),
+        *(_storage_retention_status(mode=mode) for mode in run.RETENTION_MODES),
+        _storage_retention_status(mode="EMERGENCY", stop_required=True),
+    ]
+    refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(retention=retention),
+        )
+        for retention in shapes
+    }
+    assert len(refusals) == len(shapes)
+
+
+def test_storage_fault_diagnostic_missing_and_malformed_shapes_are_fixed_and_unique(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed_preflight = _storage_preflight_status()
+    malformed_preflight["private_extra"] = "hunter2"
+    malformed_retention = _storage_retention_status(trigger={"secret": "hunter2"})
+    cases = (
+        _launch_status_payload(
+            "FAULTED",
+            "STORAGE_FAULT",
+            runtime=["hunter2", "/private/runtime", "32.1,34.8"],
+        ),
+        _storage_fault_status_payload(include_preflight=False),
+        _storage_fault_status_payload(preflight=malformed_preflight),
+        _storage_fault_status_payload(include_retention=False),
+        _storage_fault_status_payload(retention=malformed_retention),
+    )
+    refusals = {_launch_status_refusal(monkeypatch, payload) for payload in cases}
+    assert len(refusals) == len(cases)
+    for refusal in refusals:
+        for private in (
+            b"MyHome",
+            b"hunter2",
+            b"/private",
+            b"abcdef",
+            b"32.1",
+            b"34.8",
+            b"secret-device",
+            b"secret-uuid",
+            b"32134800",
+            b"987654321",
+        ):
+            assert private not in refusal
+
+
+def test_storage_fault_diagnostic_refuses_unknown_closed_domain_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unknown_state = _storage_preflight_status()
+    unknown_state["state"] = "PRIVATE_STATE"
+    unknown_reason = _storage_preflight_status("PRIVATE_REASON")
+    preflight_refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(preflight=preflight),
+        )
+        for preflight in (unknown_state, unknown_reason)
+    }
+    unknown_mode = _storage_retention_status(mode="PRIVATE_MODE")
+    unknown_fault = _storage_retention_status(fault="PRIVATE_FAULT")
+    unknown_trigger = _storage_retention_status(trigger="PRIVATE_TRIGGER")
+    retention_refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(retention=retention),
+        )
+        for retention in (unknown_mode, unknown_fault, unknown_trigger)
+    }
+
+    assert len(preflight_refusals) == 1
+    assert len(retention_refusals) == 1
+    assert preflight_refusals.isdisjoint(retention_refusals)
+    for refusal in preflight_refusals | retention_refusals:
+        assert b"PRIVATE" not in refusal
+
+
+def test_storage_fault_diagnostic_refuses_impossible_production_relations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impossible = [
+        _storage_retention_status(mode="NORMAL", trigger="NO_SPACE_WRITE"),
+        _storage_retention_status(mode="NORMAL", stop_required=True),
+        *(
+            _storage_retention_status(mode=mode, stop_required=True)
+            for mode in (None, "NORMAL", "RECLAIMING")
+        ),
+        *(
+            _storage_retention_status(mode=None, fault=fault, stop_required=True)
+            for fault in ("OBSERVATION_FAILED", "INVALID_OBSERVATION")
+        ),
+        *(
+            _storage_retention_status(mode=None, fault=fault, stop_required=False)
+            for fault in (
+                "OBSERVATION_STALE",
+                "IDENTITY_DRIFT",
+                "CAPACITY_DRIFT",
+                "LATCH_LOAD_FAILED",
+                "LATCH_BINDING_MISMATCH",
+                "LATCH_STORE_FAILED",
+            )
+        ),
+        _storage_retention_status(
+            mode="RECLAIMING",
+            fault="NO_SPACE_WRITE",
+            trigger="NO_SPACE_WRITE",
+            stop_required=True,
+        ),
+        _storage_retention_status(
+            mode="EMERGENCY",
+            fault="NO_SPACE_WRITE",
+            trigger=None,
+            stop_required=True,
+        ),
+        _storage_retention_status(
+            mode="EMERGENCY",
+            fault="NO_SPACE_WRITE",
+            trigger="NO_SPACE_WRITE",
+            stop_required=False,
+        ),
+        _storage_retention_status(mode=None, trigger="NO_SPACE_WRITE"),
+    ]
+    refusals = {
+        _launch_status_refusal(
+            monkeypatch,
+            _storage_fault_status_payload(retention=retention),
+        )
+        for retention in impossible
+    }
+
+    assert len(refusals) == 1
+    refusal = next(iter(refusals))
+    assert run._validated_refusal_location(refusal) == refusal
 
 
 def test_wait_recording_timeout_uses_closed_status_classifier(

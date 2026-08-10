@@ -83,6 +83,72 @@ RECORDER_REASONS: Final = (
     "SHUTDOWN_FAILED",
     "SHUTDOWN_TIMEOUT",
 )
+PREFLIGHT_STATES: Final = (
+    "UNKNOWN",
+    "CHECKING",
+    "READY",
+    "LOW_SPACE",
+    "EMERGENCY",
+    "READ_ONLY",
+    "FAULTED",
+)
+PREFLIGHT_REASONS: Final = (
+    "MALFORMED_FACTS",
+    "WRONG_TARGET",
+    "UNMOUNTED",
+    "MISSING_MOUNT_IDENTITY",
+    "ROOTFS_ALIAS",
+    "WRONG_FILESYSTEM",
+    "WRONG_LABEL",
+    "WRONG_UUID",
+    "WRONG_UUID_SUFFIX",
+    "READ_ONLY",
+    "CONFLICTING_MOUNT_OPTIONS",
+    "MISSING_SENTINEL",
+    "WRONG_SENTINEL_VERSION",
+    "WRONG_SENTINEL_IDENTITY",
+    "WRONG_SENTINEL_UUID",
+    "INVALID_SENTINEL_GEOMETRY",
+    "INVALID_SPACE",
+    "INSUFFICIENT_CAPACITY",
+    "RESERVE_EXHAUSTED",
+    "WRITE_PROBE_FAILED",
+)
+SPACE_OBSERVATION_FAULTS: Final = (
+    "OBSERVATION_FAILED",
+    "INVALID_OBSERVATION",
+    "OBSERVATION_STALE",
+    "IDENTITY_DRIFT",
+    "CAPACITY_DRIFT",
+    "LATCH_LOAD_FAILED",
+    "LATCH_BINDING_MISMATCH",
+    "LATCH_STORE_FAILED",
+    "NO_SPACE_WRITE",
+)
+RETENTION_MODES: Final = ("NORMAL", "RECLAIMING", "EMERGENCY")
+PREFLIGHT_STATUS_KEYS: Final = frozenset(
+    {"state", "reasons", "ready", "mount", "free_bytes", "capacity_bytes"}
+)
+RETENTION_STATUS_KEYS: Final = frozenset(
+    {
+        "sequence",
+        "mode",
+        "fault",
+        "trigger",
+        "stale",
+        "stop_required",
+        "reclaimer_enabled",
+        "consecutive_observation_failures",
+        "sample_age_ns",
+        "volume_uuid_suffix",
+        "device_id",
+        "capacity_bytes",
+        "free_bytes",
+        "free_percent",
+        "thresholds",
+        "directive",
+    }
+)
 FIXTURE_FINALIZING_SIDECAR: Final = PurePosixPath(
     "pending/boot-m10private-000022.partial.json"
 )
@@ -2975,6 +3041,91 @@ def _listener_identity(runtime: Path, dashcam_uid: int) -> dict[str, object]:
     return {"uid": metadata.st_uid, "gid": metadata.st_gid, "mode": "0660"}
 
 
+def _storage_fault_classification(runtime: object) -> tuple[str, str | None]:
+    if not isinstance(runtime, dict):
+        return "RUNTIME_MALFORMED", None
+    if "storage_preflight" not in runtime:
+        return "PREFLIGHT_MISSING", None
+    preflight = runtime["storage_preflight"]
+    if not isinstance(preflight, dict) or set(preflight) != PREFLIGHT_STATUS_KEYS:
+        return "PREFLIGHT_MALFORMED", None
+    state = preflight.get("state")
+    reasons = preflight.get("reasons")
+    ready = preflight.get("ready")
+    if (
+        type(state) is not str
+        or state not in PREFLIGHT_STATES
+        or not isinstance(reasons, list)
+        or len(reasons) > len(PREFLIGHT_REASONS)
+        or any(type(reason) is not str for reason in reasons)
+        or len(set(reasons)) != len(reasons)
+        or any(reason not in PREFLIGHT_REASONS for reason in reasons)
+        or type(ready) is not bool
+    ):
+        return "PREFLIGHT_MALFORMED", None
+    typed_reasons = cast(list[str], reasons)
+    if not typed_reasons:
+        if state != "READY" or ready is not True:
+            return "PREFLIGHT_MALFORMED", None
+    else:
+        non_faulted = {"READ_ONLY", "CONFLICTING_MOUNT_OPTIONS", "RESERVE_EXHAUSTED"}
+        if any(reason not in non_faulted for reason in typed_reasons):
+            expected_state = "FAULTED"
+        elif any(
+            reason in {"READ_ONLY", "CONFLICTING_MOUNT_OPTIONS"}
+            for reason in typed_reasons
+        ):
+            expected_state = "READ_ONLY"
+        else:
+            expected_state = "EMERGENCY"
+        if state != expected_state or ready is not False:
+            return "PREFLIGHT_MALFORMED", None
+        return "PREFLIGHT_REASON", typed_reasons[0]
+    if "storage_retention" not in runtime:
+        return "RETENTION_MISSING", None
+    retention = runtime["storage_retention"]
+    if not isinstance(retention, dict) or set(retention) != RETENTION_STATUS_KEYS:
+        return "RETENTION_MALFORMED", None
+    mode = retention.get("mode")
+    fault = retention.get("fault")
+    trigger = retention.get("trigger")
+    stop_required = retention.get("stop_required")
+    non_stop_faults = {"OBSERVATION_FAILED", "INVALID_OBSERVATION"}
+    stop_faults = set(SPACE_OBSERVATION_FAULTS) - non_stop_faults
+    if (
+        (mode is not None and (type(mode) is not str or mode not in RETENTION_MODES))
+        or (
+            fault is not None
+            and (type(fault) is not str or fault not in SPACE_OBSERVATION_FAULTS)
+        )
+        or (
+            trigger is not None
+            and (type(trigger) is not str or trigger != "NO_SPACE_WRITE")
+        )
+        or type(stop_required) is not bool
+        or (mode == "NORMAL" and trigger is not None)
+        or (mode == "NORMAL" and fault is None and stop_required is not False)
+        or (mode is None and trigger is not None)
+        or (
+            trigger == "NO_SPACE_WRITE"
+            and mode not in {"RECLAIMING", "EMERGENCY"}
+        )
+        or (fault is None and stop_required and mode != "EMERGENCY")
+        or (fault in non_stop_faults and stop_required is not False)
+        or (fault in stop_faults and stop_required is not True)
+        or (
+            fault == "NO_SPACE_WRITE"
+            and (mode != "EMERGENCY" or trigger != "NO_SPACE_WRITE" or not stop_required)
+        )
+    ):
+        return "RETENTION_MALFORMED", None
+    if fault is not None:
+        return "RETENTION_FAULT", fault
+    if stop_required:
+        return "RETENTION_STOP", None
+    return "RETENTION_MODE", mode
+
+
 def _phase_a_launch_failure_status(runtime: Path) -> None:
     if runtime.parent != Path("/run") or NONCE_RE.fullmatch(runtime.name) is None:
         raise HarnessError("phase A launch status runtime identity differs")
@@ -3057,7 +3208,86 @@ def _phase_a_launch_failure_status(runtime: Path) -> None:
     if reason == "FINALIZATION_FAILED":
         raise HarnessError("phase A launch status matched classified branch")
     if reason == "STORAGE_FAULT":
-        raise HarnessError("phase A launch status matched classified branch")
+        classification, storage_reason = _storage_fault_classification(document["runtime"])
+        if classification == "RUNTIME_MALFORMED":
+            raise HarnessError("phase A storage status runtime is malformed")
+        if classification == "PREFLIGHT_MISSING":
+            raise HarnessError("phase A storage preflight status is missing")
+        if classification == "PREFLIGHT_MALFORMED":
+            raise HarnessError("phase A storage preflight status is malformed")
+        if storage_reason == "MALFORMED_FACTS":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_TARGET":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "UNMOUNTED":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "MISSING_MOUNT_IDENTITY":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "ROOTFS_ALIAS":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_FILESYSTEM":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_LABEL":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_UUID":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_UUID_SUFFIX":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "READ_ONLY":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "CONFLICTING_MOUNT_OPTIONS":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "MISSING_SENTINEL":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_SENTINEL_VERSION":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_SENTINEL_IDENTITY":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRONG_SENTINEL_UUID":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "INVALID_SENTINEL_GEOMETRY":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "INVALID_SPACE":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "INSUFFICIENT_CAPACITY":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "RESERVE_EXHAUSTED":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "WRITE_PROBE_FAILED":
+            raise HarnessError("phase A storage status matched classified branch")
+        if classification == "RETENTION_MISSING":
+            raise HarnessError("phase A storage retention status is missing")
+        if classification == "RETENTION_MALFORMED":
+            raise HarnessError("phase A storage retention status is malformed")
+        if storage_reason == "OBSERVATION_FAILED":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "INVALID_OBSERVATION":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "OBSERVATION_STALE":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "IDENTITY_DRIFT":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "CAPACITY_DRIFT":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "LATCH_LOAD_FAILED":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "LATCH_BINDING_MISMATCH":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "LATCH_STORE_FAILED":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "NO_SPACE_WRITE":
+            raise HarnessError("phase A storage status matched classified branch")
+        if classification == "RETENTION_STOP":
+            raise HarnessError("phase A storage status requires a stop without a fault")
+        if classification == "RETENTION_MODE" and storage_reason is None:
+            raise HarnessError("phase A storage status has no mode or fault")
+        if storage_reason == "NORMAL":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "RECLAIMING":
+            raise HarnessError("phase A storage status matched classified branch")
+        if storage_reason == "EMERGENCY":
+            raise HarnessError("phase A storage status matched classified branch")
+        raise HarnessError("phase A storage status classification is unreachable")
     if reason == "OPTIONAL_SUBSYSTEM":
         raise HarnessError("phase A launch status matched classified branch")
     if reason == "SHUTDOWN_FAILED":

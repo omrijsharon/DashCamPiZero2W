@@ -419,22 +419,130 @@ def test_control_component_evidence_requires_exact_scope_and_semantics() -> None
 
 
 def test_control_response_validator_is_opaque_bounded_and_path_free() -> None:
+    from dashcam.control.api import ErrorCode
+    from dashcam.control.socket_server import encode_error, encode_success
+
     request_id = UUID(int=71)
-    accepted = harness.canonical_json(
-        {
-            "version": 1,
-            "request_id": str(request_id),
-            "ok": True,
-            "result": {"lease_id": "a" * 32, "member": "video"},
-        }
+    accepted = encode_success(
+        request_id,
+        {"lease_id": "a" * 32, "member": "video"},
     )
     assert harness._validate_control_response(
         accepted, request_id=request_id, expect_ok=True
     )["lease_id"] == "a" * 32
 
+    refused = encode_error(
+        request_id,
+        ErrorCode.CLIP_BUSY,
+        "clip is leased",
+        retryable=True,
+    )
+    assert harness._validate_control_response(
+        refused, request_id=request_id, expect_ok=False
+    ) == {
+        "code": "CLIP_BUSY",
+        "message": "clip is leased",
+        "retryable": True,
+    }
+
     leaked = accepted.replace(b'"member":"video"', b'"path":"/srv/dashcam"')
     with pytest.raises(harness.HarnessError, match="privacy"):
         harness._validate_control_response(leaked, request_id=request_id, expect_ok=True)
+
+
+def test_control_response_refuses_sorted_duplicate_whitespace_non_ascii_and_extra_keys() -> None:
+    from dashcam.control.socket_server import encode_success
+
+    request_id = UUID(int=72)
+    value = {
+        "version": 1,
+        "request_id": str(request_id),
+        "ok": True,
+        "result": {"lease_id": "b" * 32, "member": "video"},
+    }
+    accepted = encode_success(request_id, cast(dict[str, object], value["result"]))
+    sorted_payload = (
+        json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    duplicate = accepted.replace(b'{"version":1,', b'{"version":1,"version":1,', 1)
+    nested_duplicate = accepted.replace(
+        b'"member":"video"',
+        b'"member":"video","member":"video"',
+        1,
+    )
+    whitespace = accepted.replace(b'"version":1', b'"version": 1', 1)
+    non_ascii = accepted.replace(b'"member":"video"', b'"member":"vid\xc3\xa9o"', 1)
+    extra = accepted.replace(b'"result":{', b'"extra":null,"result":{', 1)
+
+    assert tuple(json.loads(accepted)) == ("version", "request_id", "ok", "result")
+    assert sorted_payload != accepted
+    for payload in (
+        sorted_payload,
+        duplicate,
+        nested_duplicate,
+        whitespace,
+        non_ascii,
+        extra,
+    ):
+        with pytest.raises(harness.HarnessError):
+            harness._validate_control_response(
+                payload,
+                request_id=request_id,
+                expect_ok=True,
+            )
+
+
+def test_control_response_value_domain_matches_production_key_and_depth_bounds() -> None:
+    from dashcam.control import socket_server
+
+    request_id = UUID(int=73)
+
+    def nested_lists(count: int) -> object:
+        value: object = 0
+        for _ in range(count):
+            value = [value]
+        return value
+
+    def wire(result: dict[str, object]) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "version": 1,
+                    "request_id": str(request_id),
+                    "ok": True,
+                    "result": result,
+                },
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+
+    assert harness.CONTROL_MAX_PROTOCOL_DEPTH == socket_server.MAX_PROTOCOL_DEPTH == 12
+    boundary = {"k" * 128: nested_lists(10)}
+    accepted = socket_server.encode_success(request_id, boundary)
+    assert accepted == wire(boundary)
+    assert harness._validate_control_response(
+        accepted,
+        request_id=request_id,
+        expect_ok=True,
+    ) == boundary
+
+    invalid_cases: tuple[dict[str, object], ...] = (
+        {"": 1},
+        {"k" * 129: 1},
+        {"nested": nested_lists(11)},
+    )
+    for invalid in invalid_cases:
+        with pytest.raises(socket_server.ControlProtocolError):
+            socket_server.encode_success(request_id, invalid)
+        with pytest.raises(harness.HarnessError):
+            harness._validate_control_response(
+                wire(invalid),
+                request_id=request_id,
+                expect_ok=True,
+            )
 
 
 def test_control_deadlines_are_strictly_nested_and_cancellation_joins_worker() -> None:

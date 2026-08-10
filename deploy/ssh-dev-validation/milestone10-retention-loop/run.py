@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -173,6 +174,7 @@ CONTROL_HANDLER_TIMEOUT_S: Final = 7.0
 CONTROL_PROTOCOL_CLIENT_TIMEOUT_S: Final = 9.0
 CONTROL_CLIENT_TIMEOUT_S: Final = 12
 CONTROL_CLIENT_CONFIRMATION: Final = b"LEASE_ACQUIRED\n"
+CONTROL_MAX_PROTOCOL_DEPTH: Final = 12
 CONTROL_FIXTURE_BASE_ORDER: Final = 300
 CONTROL_FIXTURE_CLIP_COUNT: Final = 38
 CONTROL_MAX_ACTIVE_LEASES: Final = 32
@@ -378,6 +380,58 @@ def _strict_json(payload: bytes, label: str) -> dict[str, object]:
     if not isinstance(value, dict) or canonical_json(value) != payload:
         raise HarnessError(f"{label} differs from canonical JSON")
     return cast(dict[str, object], value)
+
+
+def _control_response_json(payload: bytes) -> dict[str, object]:
+    duplicate_key = False
+
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        nonlocal duplicate_key
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                duplicate_key = True
+            result[key] = item
+        return result
+
+    try:
+        decoded = payload.decode("ascii")
+        value = json.loads(decoded, object_pairs_hook=pairs_hook)
+        validated = _control_json_value(value)
+        encoded = json.dumps(
+            validated,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise HarnessError("control response is not compact production ASCII JSON") from error
+    if duplicate_key or not isinstance(value, dict) or encoded != payload:
+        raise HarnessError("control response differs from compact production JSON")
+    return cast(dict[str, object], value)
+
+
+def _control_json_value(value: object, *, depth: int = 0) -> object:
+    if depth > CONTROL_MAX_PROTOCOL_DEPTH:
+        raise HarnessError("control response exceeds the production nesting bound")
+    if value is None or isinstance(value, str | bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise HarnessError("control response contains a non-finite number")
+        return value
+    if isinstance(value, list):
+        return [_control_json_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 128:
+                raise HarnessError("control response key differs from production bounds")
+            result[key] = _control_json_value(item, depth=depth + 1)
+        return result
+    raise HarnessError("control response contains a non-production JSON value")
 
 
 def parse_manifest(payload: bytes) -> dict[str, str]:
@@ -2852,9 +2906,15 @@ def _validate_control_response(
 ) -> dict[str, object]:
     if not payload.endswith(b"\n") or len(payload) > 16 * 1024 or b"path" in payload.lower():
         raise HarnessError("control fixture response framing or privacy differs")
-    value = _strict_json(payload, "control response")
+    value = _control_response_json(payload)
+    expected_fields = (
+        ("version", "request_id", "ok", "result")
+        if expect_ok
+        else ("version", "request_id", "ok", "error")
+    )
     if (
-        value.get("version") != 1
+        tuple(value) != expected_fields
+        or value.get("version") != 1
         or value.get("request_id") != str(request_id)
         or value.get("ok") is not expect_ok
     ):

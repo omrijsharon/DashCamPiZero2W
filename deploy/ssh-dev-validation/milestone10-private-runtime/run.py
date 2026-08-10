@@ -720,6 +720,66 @@ def _write_exclusive(path: Path, payload: bytes, mode: int, *, uid: int = 0, gid
         os.close(descriptor)
 
 
+def _write_exfat_sentinel_exclusive(
+    path: Path,
+    payload: bytes,
+    *,
+    dashcam_uid: int,
+    storage_gid: int,
+) -> None:
+    """Durably create the fixed-ownership exFAT sentinel without chown/chmod."""
+
+    if path.name != ".dashcam-volume":
+        raise HarnessError("exFAT sentinel path differs")
+    parent_descriptor = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != dashcam_uid
+            or parent_metadata.st_gid != storage_gid
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o750
+        ):
+            raise HarnessError("exFAT sentinel parent identity differs")
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o640,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise HarnessError("exFAT sentinel write made no progress")
+                view = view[written:]
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != dashcam_uid
+                or metadata.st_gid != storage_gid
+                or stat.S_IMODE(metadata.st_mode) != 0o640
+                or metadata.st_nlink != 1
+                or metadata.st_dev != parent_metadata.st_dev
+                or metadata.st_size != len(payload)
+            ):
+                raise HarnessError("exFAT sentinel effective identity differs")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
 def _validate_result_destination(path: Path) -> Path:
     parent = path.parent
     parent_metadata = os.lstat(parent)
@@ -1992,7 +2052,9 @@ def _install_private_state(
     frozen: Path,
     paths: Mapping[str, Path],
     *,
+    dashcam_uid: int,
     dashcam_gid: int,
+    storage_gid: int,
 ) -> dict[str, object]:
     recording = paths["recording"]
     state = paths["state"]
@@ -2024,7 +2086,12 @@ def _install_private_state(
         "DASHCAM_STORAGE_DATA_END_SECTOR=999999\n"
         "DASHCAM_STORAGE_MINIMUM_CAPACITY_BYTES=1\n"
     ).encode("ascii")
-    _write_exclusive(recording / ".dashcam-volume", sentinel, 0o640)
+    _write_exfat_sentinel_exclusive(
+        recording / ".dashcam-volume",
+        sentinel,
+        dashcam_uid=dashcam_uid,
+        storage_gid=storage_gid,
+    )
     for directory in (recording / "clips", recording / "protected", recording / "pending"):
         directory.mkdir(mode=0o750)
     _write_exclusive(state / "config.toml", _config(rollback=False), 0o640, gid=dashcam_gid)
@@ -3794,7 +3861,13 @@ def _fresh_phase(
     if after_images < ROOT_PRESERVED_FREE_BYTES + ROOT_BOUNDED_OVERHEAD_BYTES:
         raise HarnessError("root reserve fell below the post-image safety gate")
     try:
-        identity = _install_private_state(frozen, paths, dashcam_gid=dashcam_gid)
+        identity = _install_private_state(
+            frozen,
+            paths,
+            dashcam_uid=dashcam_uid,
+            dashcam_gid=dashcam_gid,
+            storage_gid=storage_gid,
+        )
         _run_bind_probe(work.name.removeprefix("dashcam-m10-private."), paths)
         return paths, identity
     except BaseException:

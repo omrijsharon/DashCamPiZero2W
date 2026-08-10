@@ -208,6 +208,112 @@ def test_only_declared_virtual_files_use_virtual_reader() -> None:
         assert declaration in source
 
 
+def test_exfat_sentinel_writer_inherits_mount_identity_without_fchown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'{"sentinel":true}\n'
+    opened: list[tuple[object, int | None]] = []
+    fsynced: list[int] = []
+    parent = _metadata(
+        mode=0o40750,
+        uid=42,
+        gid=84,
+        nlink=2,
+        device=7,
+        inode=10,
+    )
+    member = _metadata(
+        mode=0o100640,
+        uid=42,
+        gid=84,
+        nlink=1,
+        device=7,
+        inode=11,
+        size=len(payload),
+    )
+
+    def open_file(path: object, _flags: int, *args: object, **kwargs: object) -> int:
+        opened.append((path, kwargs.get("dir_fd")))
+        return 10 if len(opened) == 1 else 11
+
+    monkeypatch.setattr(run.os, "open", open_file)
+    monkeypatch.setattr(run.os, "fstat", lambda descriptor: parent if descriptor == 10 else member)
+    monkeypatch.setattr(run.os, "write", lambda _descriptor, view: len(view))
+    monkeypatch.setattr(run.os, "fsync", fsynced.append)
+    monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
+    monkeypatch.setattr(
+        run.os,
+        "fchown",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("fchown must not run on exFAT")),
+        raising=False,
+    )
+
+    run._write_exfat_sentinel_exclusive(
+        Path("/fixture/.dashcam-volume"),
+        payload,
+        dashcam_uid=42,
+        storage_gid=84,
+    )
+
+    assert opened == [(Path("/fixture"), None), (".dashcam-volume", 10)]
+    assert fsynced == [11, 10]
+
+
+@pytest.mark.parametrize(
+    ("uid", "gid", "mode"),
+    (
+        (43, 84, 0o100640),
+        (42, 85, 0o100640),
+        (42, 84, 0o100660),
+    ),
+)
+def test_exfat_sentinel_writer_refuses_wrong_effective_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    payload = b"sentinel\n"
+    parent = _metadata(mode=0o40750, uid=42, gid=84, nlink=2, device=7)
+    member = _metadata(
+        mode=mode,
+        uid=uid,
+        gid=gid,
+        nlink=1,
+        device=7,
+        size=len(payload),
+    )
+    opened = 0
+
+    def open_file(_path: object, _flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal opened
+        opened += 1
+        return 10 if opened == 1 else 11
+
+    monkeypatch.setattr(run.os, "open", open_file)
+    monkeypatch.setattr(run.os, "fstat", lambda descriptor: parent if descriptor == 10 else member)
+    monkeypatch.setattr(run.os, "write", lambda _descriptor, view: len(view))
+    monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
+
+    with pytest.raises(run.HarnessError, match="effective identity differs"):
+        run._write_exfat_sentinel_exclusive(
+            Path("/fixture/.dashcam-volume"),
+            payload,
+            dashcam_uid=42,
+            storage_gid=84,
+        )
+
+
+def test_private_state_routes_only_exfat_sentinel_to_fixed_ownership_writer() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    install = source[source.index("def _install_private_state(") : source.index("BIND_PROBE =")]
+
+    assert "_write_exfat_sentinel_exclusive(" in install
+    assert '_write_exclusive(recording / ".dashcam-volume"' not in install
+    assert "dashcam_uid=dashcam_uid" in install
+    assert "storage_gid=storage_gid" in install
+
+
 def test_bundle_verifier_closes_both_exact_sources(tmp_path: Path) -> None:
     root = _bundle(tmp_path)
     digest = hashlib.sha256((root / "SHA256SUMS").read_bytes()).hexdigest()

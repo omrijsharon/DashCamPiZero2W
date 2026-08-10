@@ -825,16 +825,27 @@ def test_catalog_observer_requires_canonical_state_recording_siblings(
 
 def test_clean_storage_safety_stop_requires_zero_restart_and_success() -> None:
     clean = {
+        "LoadState": "loaded",
         "ActiveState": "inactive",
         "SubState": "dead",
         "Result": "success",
         "ExecMainCode": "1",
         "ExecMainStatus": "0",
         "NRestarts": "0",
+        "MainPID": "0",
+        "ControlGroup": "",
     }
     run.validate_clean_safety_stop(clean)
+    run.validate_clean_safety_stop({**clean, "LoadState": "not-found", "ExecMainCode": "0"})
 
-    for key, value in (("Result", "exit-code"), ("ExecMainStatus", "1"), ("NRestarts", "1")):
+    for key, value in (
+        ("LoadState", "not-found"),
+        ("Result", "exit-code"),
+        ("ExecMainStatus", "1"),
+        ("NRestarts", "1"),
+        ("MainPID", "123"),
+        ("ControlGroup", "/system.slice/foreign.service"),
+    ):
         changed = {**clean, key: value}
         with pytest.raises(run.HarnessError, match="safety-stop"):
             run.validate_clean_safety_stop(changed)

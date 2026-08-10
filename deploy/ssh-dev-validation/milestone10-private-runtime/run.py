@@ -910,11 +910,21 @@ def validate_clean_safety_stop(properties: Mapping[str, str]) -> None:
         "ActiveState": "inactive",
         "SubState": "dead",
         "Result": "success",
-        "ExecMainCode": "1",
         "ExecMainStatus": "0",
         "NRestarts": "0",
+        "MainPID": "0",
+        "ControlGroup": "",
     }
-    if any(properties.get(key) != value for key, value in expected.items()):
+    loaded_exit = properties.get("LoadState") == "loaded" and properties.get(
+        "ExecMainCode"
+    ) == "1"
+    collected_exit = properties.get("LoadState") == "not-found" and properties.get(
+        "ExecMainCode"
+    ) == "0"
+    if (
+        any(properties.get(key) != value for key, value in expected.items())
+        or loaded_exit is collected_exit
+    ):
         raise HarnessError("clean pre-camera storage safety-stop unit outcome differs")
 
 

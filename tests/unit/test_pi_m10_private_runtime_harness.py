@@ -2206,6 +2206,16 @@ def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:
     assert set(observed).issubset(run._reviewed_function_lines()["runtime_health"])
 
 
+def test_runtime_health_wait_only_retries_unavailable_drop_shape() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    wait = source[source.index("def _wait_runtime_health(") : source.index("def _phase_a(")]
+
+    assert "timeout: float = 10" in wait
+    assert "isinstance(dropped, int) and not isinstance(dropped, bool)" in wait
+    assert "return status, _runtime_health(status)" in wait
+    assert "return last_status, _runtime_health(last_status)" in wait
+
+
 def test_control_wrapper_is_not_a_reviewed_diagnostic_location() -> None:
     assert "raw_control" not in run.DIAGNOSTIC_FUNCTIONS
     assert "raw_control" not in run._reviewed_function_lines()

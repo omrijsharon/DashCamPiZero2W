@@ -266,6 +266,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "wait_event_media",
     "media_evidence",
     "runtime_health",
+    "wait_runtime_health",
     "phase_a",
     "rollback_phase",
     "protected_emergency_phase",
@@ -4526,6 +4527,30 @@ def _runtime_health(status: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _wait_runtime_health(
+    runtime: Path,
+    *,
+    timeout: float = 10,
+) -> tuple[dict[str, object], dict[str, object]]:
+    deadline = time.monotonic() + timeout
+    last_status: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        status = _strict_json(
+            _bounded_read(runtime / "status.json", 128 * 1024),
+            "runtime status",
+        )
+        last_status = status
+        runtime_value = status.get("runtime")
+        frames = runtime_value.get("frames") if isinstance(runtime_value, dict) else None
+        dropped = frames.get("dropped") if isinstance(frames, dict) else None
+        if isinstance(dropped, int) and not isinstance(dropped, bool):
+            return status, _runtime_health(status)
+        time.sleep(0.1)
+    if last_status is None:
+        raise HarnessError("runtime health observation was not attempted")
+    return last_status, _runtime_health(last_status)
+
+
 def _phase_a(
     nonce: str,
     paths: Mapping[str, Path],
@@ -4735,10 +4760,7 @@ def _phase_a(
             clip_id=leased["clip_id"],
             lease_id=lease_id,
         )
-        final_status = _strict_json(
-            _bounded_read(runtime / "status.json", 128 * 1024), "runtime status"
-        )
-        health = _runtime_health(final_status)
+        _final_status, health = _wait_runtime_health(runtime)
         terminal = _stop_clean(unit)
         stopped = True
         if (runtime / "control.sock").exists() or (runtime / "control.sock").is_symlink():
@@ -4933,10 +4955,7 @@ def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
         if (runtime / "control.sock").exists() or (runtime / "control.sock").is_symlink():
             raise HarnessError("rollback companion unexpectedly exposed a control listener")
         time.sleep(3)
-        rollback_status = _strict_json(
-            _bounded_read(runtime / "status.json", 128 * 1024), "rollback recorder status"
-        )
-        rollback_health = _runtime_health(rollback_status)
+        _rollback_status, rollback_health = _wait_runtime_health(runtime)
         terminal = _stop_clean(unit)
         stopped = True
         return {

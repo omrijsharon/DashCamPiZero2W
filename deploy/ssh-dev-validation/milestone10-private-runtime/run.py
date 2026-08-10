@@ -64,6 +64,9 @@ ROLLBACK_TIMEOUT_S: Final = 60
 OBSERVATION_INTERVAL_S: Final = 0.1
 CONTROL_RESPONSE_BYTES: Final = 16 * 1024
 CONTROL_TIMEOUT_S: Final = 9.0
+FIXTURE_FINALIZING_SIDECAR: Final = PurePosixPath(
+    "pending/boot-m10private-000022.partial.json"
+)
 
 LOW_PERCENT: Final = 30
 HIGH_PERCENT: Final = 35
@@ -860,6 +863,122 @@ def _write_exfat_sentinel_exclusive(
         os.fsync(parent_descriptor)
     finally:
         os.close(parent_descriptor)
+
+
+def _fixture_storage_identity() -> tuple[int, int]:
+    """Resolve the fixed exFAT mount identity independently in the fixture child."""
+
+    import grp
+    import pwd
+
+    if sys.platform != "linux" or os.geteuid() != 0:
+        raise HarnessError("fixture storage identity requires Linux root")
+    dashcam = pwd.getpwnam("dashcam")
+    storage = grp.getgrnam("dashcam-storage")
+    if (
+        dashcam.pw_name != "dashcam"
+        or storage.gr_name != "dashcam-storage"
+        or isinstance(dashcam.pw_uid, bool)
+        or isinstance(storage.gr_gid, bool)
+        or dashcam.pw_uid <= 0
+        or storage.gr_gid <= 0
+    ):
+        raise HarnessError("fixture storage account identity differs")
+    return dashcam.pw_uid, storage.gr_gid
+
+
+def _write_exfat_pending_finalizing_sidecar(
+    root: Path,
+    relative: str,
+    payload: bytes,
+    *,
+    dashcam_uid: int,
+    storage_gid: int,
+) -> None:
+    """Durably create the one generated pending sidecar without chown/chmod."""
+
+    requested = PurePosixPath(relative)
+    root_path = root.as_posix()
+    if (
+        relative != FIXTURE_FINALIZING_SIDECAR.as_posix()
+        or requested != FIXTURE_FINALIZING_SIDECAR
+        or re.fullmatch(
+            r"/var/tmp/dashcam-m10-private\.[a-z0-9]{12}/recording",
+            root_path,
+        )
+        is None
+    ):
+        raise HarnessError("fixture FINALIZING sidecar path differs")
+    root_descriptor = os.open(
+        root,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != dashcam_uid
+            or root_metadata.st_gid != storage_gid
+            or stat.S_IMODE(root_metadata.st_mode) != 0o750
+        ):
+            raise HarnessError("fixture recording root identity differs")
+        pending_descriptor = os.open(
+            "pending",
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
+        try:
+            pending_metadata = os.fstat(pending_descriptor)
+            if (
+                not stat.S_ISDIR(pending_metadata.st_mode)
+                or pending_metadata.st_uid != dashcam_uid
+                or pending_metadata.st_gid != storage_gid
+                or stat.S_IMODE(pending_metadata.st_mode) != 0o750
+                or pending_metadata.st_dev != root_metadata.st_dev
+            ):
+                raise HarnessError("fixture pending directory identity differs")
+            descriptor = os.open(
+                requested.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o640,
+                dir_fd=pending_descriptor,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise HarnessError("fixture FINALIZING sidecar write made no progress")
+                    view = view[written:]
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != dashcam_uid
+                    or metadata.st_gid != storage_gid
+                    or stat.S_IMODE(metadata.st_mode) != 0o640
+                    or metadata.st_nlink != 1
+                    or metadata.st_dev != root_metadata.st_dev
+                    or metadata.st_size != len(payload)
+                ):
+                    raise HarnessError("fixture FINALIZING sidecar identity differs")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(pending_descriptor)
+        finally:
+            os.close(pending_descriptor)
+    finally:
+        os.close(root_descriptor)
 
 
 def _validate_result_destination(path: Path) -> Path:
@@ -2481,7 +2600,14 @@ def _seed_fixture(action: str, root: Path, catalog_path: Path, boot_id: str) -> 
             )
             finalizing, paths, sidecar = _finalizing_fixture(22, file_size)
             _member(root, finalizing.video_path, file_size)
-            _write_exclusive(root / finalizing.sidecar_path, sidecar, 0o640)
+            dashcam_uid, storage_gid = _fixture_storage_identity()
+            _write_exfat_pending_finalizing_sidecar(
+                root,
+                cast(str, finalizing.sidecar_path),
+                sidecar,
+                dashcam_uid=dashcam_uid,
+                storage_gid=storage_gid,
+            )
             intent_id = catalog.register_finalizing_clip(
                 finalizing,
                 promotion_paths=paths,

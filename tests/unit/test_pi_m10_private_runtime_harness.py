@@ -6,7 +6,7 @@ import io
 import sys
 import zipfile
 from datetime import UTC
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -314,6 +314,186 @@ def test_private_state_routes_only_exfat_sentinel_to_fixed_ownership_writer() ->
     assert "storage_gid=storage_gid" in install
 
 
+def test_pending_finalizing_sidecar_writer_inherits_exfat_identity_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'{"fixture":"canonical"}\n'
+    root = Path("/var/tmp/dashcam-m10-private.123456789abc/recording")
+    opened: list[tuple[object, int | None]] = []
+    fsynced: list[int] = []
+    metadata = {
+        10: _metadata(mode=0o40750, uid=42, gid=84, nlink=1, device=7, inode=10),
+        11: _metadata(mode=0o40750, uid=42, gid=84, nlink=1, device=7, inode=11),
+        12: _metadata(
+            mode=0o100640,
+            uid=42,
+            gid=84,
+            nlink=1,
+            device=7,
+            inode=12,
+            size=len(payload),
+        ),
+    }
+
+    def open_file(path: object, _flags: int, *args: object, **kwargs: object) -> int:
+        opened.append((path, kwargs.get("dir_fd")))
+        return 9 + len(opened)
+
+    monkeypatch.setattr(run.os, "open", open_file)
+    monkeypatch.setattr(run.os, "fstat", metadata.__getitem__)
+    monkeypatch.setattr(run.os, "write", lambda _descriptor, view: len(view))
+    monkeypatch.setattr(run.os, "fsync", fsynced.append)
+    monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
+    monkeypatch.setattr(
+        run.os,
+        "fchown",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("fchown must not run on exFAT")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        run.os,
+        "fchmod",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("fchmod must not run on exFAT")),
+        raising=False,
+    )
+
+    run._write_exfat_pending_finalizing_sidecar(
+        root,
+        run.FIXTURE_FINALIZING_SIDECAR.as_posix(),
+        payload,
+        dashcam_uid=42,
+        storage_gid=84,
+    )
+
+    assert opened == [
+        (root, None),
+        ("pending", 10),
+        ("boot-m10private-000022.partial.json", 11),
+    ]
+    assert fsynced == [12, 11]
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "clips/boot-m10private-000022.partial.json",
+        "pending/boot-m10private-000023.partial.json",
+        "pending/../boot-m10private-000022.partial.json",
+        "/pending/boot-m10private-000022.partial.json",
+    ),
+)
+def test_pending_finalizing_sidecar_writer_refuses_any_other_path(
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setattr(
+        run.os,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must refuse first")),
+    )
+
+    with pytest.raises(run.HarnessError, match="sidecar path differs"):
+        run._write_exfat_pending_finalizing_sidecar(
+            Path("/var/tmp/dashcam-m10-private.123456789abc/recording"),
+            relative,
+            b"payload\n",
+            dashcam_uid=42,
+            storage_gid=84,
+        )
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "changed", "message"),
+    (
+        (10, {"uid": 43}, "recording root identity differs"),
+        (10, {"mode": 0o40770}, "recording root identity differs"),
+        (11, {"gid": 85}, "pending directory identity differs"),
+        (11, {"device": 8}, "pending directory identity differs"),
+        (12, {"mode": 0o100660}, "sidecar identity differs"),
+        (12, {"nlink": 2}, "sidecar identity differs"),
+        (12, {"device": 8}, "sidecar identity differs"),
+        (12, {"size": 7}, "sidecar identity differs"),
+    ),
+)
+def test_pending_finalizing_sidecar_writer_refuses_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor: int,
+    changed: dict[str, int],
+    message: str,
+) -> None:
+    payload = b"canonical\n"
+    values = {
+        10: {"mode": 0o40750, "uid": 42, "gid": 84, "nlink": 1, "device": 7},
+        11: {"mode": 0o40750, "uid": 42, "gid": 84, "nlink": 1, "device": 7},
+        12: {
+            "mode": 0o100640,
+            "uid": 42,
+            "gid": 84,
+            "nlink": 1,
+            "device": 7,
+            "size": len(payload),
+        },
+    }
+    values[descriptor].update(changed)
+    opened = 9
+
+    def open_file(_path: object, _flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal opened
+        opened += 1
+        return opened
+
+    monkeypatch.setattr(run.os, "open", open_file)
+    monkeypatch.setattr(
+        run.os,
+        "fstat",
+        lambda fd: _metadata(**values[fd]),
+    )
+    monkeypatch.setattr(run.os, "write", lambda _descriptor, view: len(view))
+    monkeypatch.setattr(run.os, "fsync", lambda _descriptor: None)
+    monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
+
+    with pytest.raises(run.HarnessError, match=message):
+        run._write_exfat_pending_finalizing_sidecar(
+            Path("/var/tmp/dashcam-m10-private.123456789abc/recording"),
+            run.FIXTURE_FINALIZING_SIDECAR.as_posix(),
+            payload,
+            dashcam_uid=42,
+            storage_gid=84,
+        )
+
+
+def test_fixture_storage_identity_is_resolved_inside_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run.sys, "platform", "linux")
+    monkeypatch.setattr(run.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "pwd",
+        SimpleNamespace(
+            getpwnam=lambda name: SimpleNamespace(pw_name=name, pw_uid=42),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "grp",
+        SimpleNamespace(
+            getgrnam=lambda name: SimpleNamespace(gr_name=name, gr_gid=84),
+        ),
+    )
+
+    assert run._fixture_storage_identity() == (42, 84)
+
+
+def test_seed_fixture_routes_only_generated_finalizing_sidecar_to_exfat_writer() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    seed = source[source.index("def _seed_fixture(") : source.index("def _catalog_counts(")]
+
+    assert seed.count("_write_exfat_pending_finalizing_sidecar(") == 1
+    assert "_write_exclusive(root / finalizing.sidecar_path" not in seed
+    assert "dashcam_uid, storage_gid = _fixture_storage_identity()" in seed
+
+
 def test_bundle_verifier_closes_both_exact_sources(tmp_path: Path) -> None:
     root = _bundle(tmp_path)
     digest = hashlib.sha256((root / "SHA256SUMS").read_bytes()).hexdigest()
@@ -514,6 +694,14 @@ def test_exact_candidate_fixture_apis_create_a_b_and_65_delete_states(
         target.write_bytes(b"fixture\n" + bytes(min(size, 4096) - 8))
 
     monkeypatch.setattr(run, "_member", bounded_member)
+    monkeypatch.setattr(run, "_fixture_storage_identity", lambda: (42, 84))
+    monkeypatch.setattr(
+        run,
+        "_write_exfat_pending_finalizing_sidecar",
+        lambda root, relative, payload, **_kwargs: (
+            root / PurePosixPath(relative)
+        ).write_bytes(payload),
+    )
     monkeypatch.setattr(schema, "ZoneInfo", lambda _name: UTC)
     for phase in ("A", "B", "C"):
         phase_root = tmp_path / phase

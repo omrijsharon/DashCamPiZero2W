@@ -587,12 +587,14 @@ def test_source_orders_a_rollback_b_c_and_fail_safe_single_start() -> None:
     assert "validate_clean_safety_stop(terminal)" in source
 
 
-def test_source_runtime_masks_and_restores_ordinary_recorder() -> None:
+def test_source_runtime_excludes_and_restores_ordinary_recorder() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 
-    assert '"mask", "--runtime", "dashcamd.service"' in source
-    assert "_unlink_owned_runtime_mask(mask, owned_mask)" in source
-    assert "_require_masked()" in source
+    assert '"mask", "--runtime", "dashcamd.service"' not in source
+    assert "RefuseManualStart=yes" in source
+    assert "ConditionPathExists=" in source
+    assert "_remove_owned_runtime_exclusion(nonce, owned_exclusion)" in source
+    assert "_require_excluded(" in source
     assert "NRestarts" in source
     assert "production host snapshot changed" in source
     assert "systemctl start dashcamd" not in source
@@ -601,12 +603,13 @@ def test_source_runtime_masks_and_restores_ordinary_recorder() -> None:
     assert "QUALIFICATION_TIMEOUT_S: Final = 900" in source
 
 
-def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
+def test_runtime_exclusion_is_owned_before_reload_and_matches_measured_properties(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, ...]] = []
     sequence: list[str] = []
-    masked = False
+    nonce = "123456789abc"
+    drop_in = "/run/systemd/system/dashcamd.service.d/99-m10-exclusion.conf"
     states = iter(
         (
             {
@@ -615,51 +618,47 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
                 "SubState": "dead",
                 "UnitFileState": "enabled",
                 "NRestarts": "0",
+                "FragmentPath": "/etc/systemd/system/dashcamd.service",
+                "DropInPaths": "",
+                "RefuseManualStart": "no",
+                "Conditions": "",
             },
             {
-                "LoadState": "masked",
+                "LoadState": "loaded",
                 "ActiveState": "inactive",
                 "SubState": "dead",
-                "UnitFileState": "masked-runtime",
+                "UnitFileState": "enabled",
                 "NRestarts": "0",
+                "FragmentPath": "/etc/systemd/system/dashcamd.service",
+                "DropInPaths": drop_in,
+                "RefuseManualStart": "yes",
+                "Conditions": "[unprintable]",
             },
         )
     )
 
     def service_properties(_unit: str) -> dict[str, str]:
         state = next(states)
-        sequence.append(f"observe:{state['LoadState']}:{state['UnitFileState']}")
+        sequence.append(
+            f"observe:{state['LoadState']}:{state['UnitFileState']}:{state['RefuseManualStart']}"
+        )
         return state
 
     monkeypatch.setattr(run, "_service_properties", service_properties)
 
     def command(arguments: tuple[object, ...], **_kwargs: object) -> None:
-        nonlocal masked
         call = tuple(str(value) for value in arguments)
         calls.append(call)
         sequence.append(f"command:{Path(call[0]).name}:{call[1]}")
-        if "mask" in call:
-            masked = True
 
     monkeypatch.setattr(run, "_command", command)
     monkeypatch.setattr(Path, "exists", lambda _self: False)
-    monkeypatch.setattr(Path, "is_symlink", lambda _self: masked)
-    monkeypatch.setattr(run.os, "readlink", lambda _path: "/dev/null")
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    owned = {"content": "owned"}
     monkeypatch.setattr(
         run,
-        "_owned_mask_facts",
-        lambda _path: (
-            sequence.append("capture:owned-mask")
-            or {
-                "device": 1,
-                "inode": 2,
-                "uid": 0,
-                "gid": 0,
-                "mode": 0o777,
-                "nlink": 1,
-                "target": "/dev/null",
-            }
-        ),
+        "_create_runtime_exclusion",
+        lambda _nonce: sequence.append("create:owned-exclusion") or owned,
     )
     prior = {
         "LoadState": "loaded",
@@ -667,6 +666,10 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
         "SubState": "dead",
         "UnitFileState": "enabled",
         "NRestarts": "0",
+        "FragmentPath": "/etc/systemd/system/dashcamd.service",
+        "DropInPaths": "",
+        "RefuseManualStart": "no",
+        "Conditions": "",
     }
     monkeypatch.setattr(
         run,
@@ -674,7 +677,7 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
         lambda _work: {
             "phase": "PREPARED",
             "prior_unit": prior,
-            "prior_mask_present": False,
+            "prior_exclusion_present": False,
         },
     )
     monkeypatch.setattr(
@@ -686,65 +689,227 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
     )
     with (
         pytest.raises(RuntimeError, match="injected"),
-        run._runtime_mask(Path("/var/tmp/dashcam-m10-private.123456789abc")),
+        run._runtime_exclusion(Path(f"/var/tmp/dashcam-m10-private.{nonce}")),
     ):
         raise RuntimeError("injected")
-    assert not any("unmask" in call for call in calls)
+    assert not any("mask" in call for call in calls)
     assert sequence == [
-        "observe:loaded:enabled",
-        "transition:PREPARED>MASK_INTENT",
-        "command:systemctl:mask",
-        "capture:owned-mask",
-        "transition:MASK_INTENT>MASK_OWNED",
+        "observe:loaded:enabled:no",
+        "transition:PREPARED>EXCLUSION_INTENT",
+        "create:owned-exclusion",
+        "transition:EXCLUSION_INTENT>EXCLUSION_OWNED",
         "command:systemctl:daemon-reload",
-        "observe:masked:masked-runtime",
+        "observe:loaded:enabled:yes",
     ]
 
 
-@pytest.mark.parametrize(
-    ("phase", "mask_present", "exact_owned", "authorized"),
-    (
-        ("PREPARED", False, False, False),
-        ("MASK_INTENT", False, False, False),
-        ("MASK_OWNED", True, True, True),
-        ("CLEANED_MASKED", True, True, True),
-        ("CLEANED_MASKED", False, False, False),
-        ("RESTORED", False, False, False),
-    ),
-)
-def test_recovery_unmasks_only_an_exact_owned_mask(
-    phase: str, mask_present: bool, exact_owned: bool, authorized: bool
+def test_runtime_exclusion_refuses_preexisting_operator_drop_in(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert (
-        run.validate_recovery_mask_authority(
-            phase,
-            mask_present=mask_present,
-            exact_owned_mask=exact_owned,
+    prior = {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "UnitFileState": "enabled",
+        "NRestarts": "0",
+        "FragmentPath": "/etc/systemd/system/dashcamd.service",
+        "DropInPaths": "/run/systemd/system/dashcamd.service.d/operator.conf",
+        "RefuseManualStart": "no",
+        "Conditions": "",
+    }
+    transitions: list[tuple[str, str]] = []
+    monkeypatch.setattr(run, "_service_properties", lambda _unit: dict(prior))
+    monkeypatch.setattr(
+        run,
+        "_read_recovery_journal",
+        lambda _work: {
+            "phase": "PREPARED",
+            "prior_unit": run._unit_restore_facts(prior),
+            "prior_exclusion_present": False,
+        },
+    )
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda self: self == run.EXCLUSION_DIRECTORY,
+    )
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    monkeypatch.setattr(
+        run,
+        "_transition_recovery_journal",
+        lambda _work, expected, target, **_kwargs: transitions.append((expected, target)),
+    )
+
+    with (
+        pytest.raises(run.HarnessError, match="runtime exclusion override"),
+        run._runtime_exclusion(Path("/var/tmp/dashcam-m10-private.123456789abc")),
+    ):
+        raise AssertionError("operator drop-in must refuse before entry")
+
+    assert transitions == []
+
+
+def test_runtime_exclusion_accepts_only_systemd257_unprintable_condition_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nonce = "123456789abc"
+    before = {
+        "LoadState": "loaded",
+        "UnitFileState": "enabled",
+    }
+    values = {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "UnitFileState": "enabled",
+        "DropInPaths": "/run/systemd/system/dashcamd.service.d/99-m10-exclusion.conf",
+        "RefuseManualStart": "yes",
+        "Conditions": "[unprintable]",
+    }
+    monkeypatch.setattr(Path, "exists", lambda _self: False)
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+
+    assert run._exclusion_loaded(values, nonce, before) is True
+    for wrong in (
+        "",
+        "[unprintable] ",
+        "unprintable",
+        f"[type=ConditionPathExists parameter=/run/dashcam-m10-exclusion-{nonce}-absent]",
+    ):
+        assert (
+            run._exclusion_loaded(
+                {**values, "Conditions": wrong},
+                nonce,
+                before,
+            )
+            is False
         )
-        is authorized
+    assert (
+        run._exclusion_loaded(
+            {**values, "DropInPaths": "/run/systemd/system/dashcamd.service.d/wrong.conf"},
+            nonce,
+            before,
+        )
+        is False
     )
 
 
-@pytest.mark.parametrize(
-    ("phase", "mask_present", "exact_owned"),
-    (
-        ("PREPARED", True, False),
-        ("MASK_INTENT", True, False),
-        ("MASK_INTENT", True, True),
-        ("MASK_OWNED", False, False),
-        ("MASK_OWNED", True, False),
-        ("CLEANED_MASKED", True, False),
-        ("RESTORED", True, False),
-    ),
-)
-def test_recovery_refuses_operator_or_drifted_masks(
-    phase: str, mask_present: bool, exact_owned: bool
+def test_service_property_parser_preserves_actual_unprintable_conditions(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(run.HarnessError):
-        run.validate_recovery_mask_authority(
+    payload = (
+        b"LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+        b"UnitFileState=enabled\nDropInPaths=/run/systemd/system/"
+        b"dashcamd.service.d/99-m10-exclusion.conf\nRefuseManualStart=yes\n"
+        b"Conditions=[unprintable]\n"
+    )
+    monkeypatch.setattr(
+        run,
+        "_command",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=payload),
+    )
+
+    values = run._service_properties("dashcamd.service")
+
+    assert values["Conditions"] == "[unprintable]"
+    assert values["DropInPaths"].endswith("/99-m10-exclusion.conf")
+
+
+def _exact_exclusion_facts(nonce: str = "123456789abc") -> dict[str, object]:
+    content = run._exclusion_content(nonce)
+    return {
+        "directory_device": 7,
+        "directory_inode": 11,
+        "directory_uid": 0,
+        "directory_gid": 0,
+        "directory_mode": 0o755,
+        "directory_nlink": 2,
+        "file_device": 7,
+        "file_inode": 12,
+        "file_uid": 0,
+        "file_gid": 0,
+        "file_mode": 0o644,
+        "file_nlink": 1,
+        "file_size": len(content),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "content": content.decode("ascii"),
+        "condition_path": f"/run/dashcam-m10-exclusion-{nonce}-absent",
+    }
+
+
+def test_recovery_journal_binds_exact_nonce_content_and_file_facts() -> None:
+    exact = _exact_exclusion_facts()
+    assert run._owned_exclusion_document_valid(exact, "123456789abc") is True
+    assert run._owned_exclusion_document_valid({**exact, "file_inode": 13}, "123456789abc") is True
+    assert (
+        run._owned_exclusion_document_valid(
+            {**exact, "content": "[Unit]\nRefuseManualStart=no\n"},
+            "123456789abc",
+        )
+        is False
+    )
+    assert run._owned_exclusion_document_valid(exact, "fedcba987654") is False
+
+
+@pytest.mark.parametrize("phase", ("PREPARED", "EXCLUSION_INTENT", "RESTORED"))
+def test_recovery_without_exclusion_needs_no_removal(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    monkeypatch.setattr(Path, "exists", lambda _self: False)
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    assert (
+        run.validate_recovery_exclusion_authority(
             phase,
-            mask_present=mask_present,
-            exact_owned_mask=exact_owned,
+            nonce="123456789abc",
+            exclusion_present=False,
+            owned_exclusion=None,
+        )
+        is False
+    )
+
+
+def test_recovery_owned_exclusion_requires_exact_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {"content": "exact"}
+    monkeypatch.setattr(Path, "exists", lambda _self: False)
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    monkeypatch.setattr(run, "_owned_exclusion_facts", lambda _nonce: expected)
+    assert (
+        run.validate_recovery_exclusion_authority(
+            "EXCLUSION_OWNED",
+            nonce="123456789abc",
+            exclusion_present=True,
+            owned_exclusion=expected,
+        )
+        is True
+    )
+
+
+def test_recovery_refuses_ambiguous_operator_drop_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "exists", lambda _self: False)
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    with pytest.raises(run.HarnessError, match="does not prove ownership"):
+        run.validate_recovery_exclusion_authority(
+            "EXCLUSION_INTENT",
+            nonce="123456789abc",
+            exclusion_present=True,
+            owned_exclusion=None,
+        )
+
+
+def test_recovery_refuses_condition_marker_that_would_enable_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "exists", lambda self: "exclusion-" in self.name)
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    with pytest.raises(run.HarnessError, match="impossible condition path exists"):
+        run.validate_recovery_exclusion_authority(
+            "EXCLUSION_OWNED",
+            nonce="123456789abc",
+            exclusion_present=True,
+            owned_exclusion={"content": "exact"},
         )
 
 
@@ -802,20 +967,24 @@ def test_recovery_refuses_work_identity_drift(
 
 def _recovery_document(work: Path) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "nonce": "123456789abc",
         "work": work.as_posix(),
         "ordinary_unit": "dashcamd.service",
         "phase": "PREPARED",
-        "mask_owner": "11111111-1111-1111-1111-111111111111",
-        "prior_mask_present": False,
-        "owned_mask": None,
+        "exclusion_owner": "11111111-1111-1111-1111-111111111111",
+        "prior_exclusion_present": False,
+        "owned_exclusion": None,
         "prior_unit": {
             "LoadState": "loaded",
             "ActiveState": "inactive",
             "SubState": "dead",
             "UnitFileState": "enabled",
             "NRestarts": "0",
+            "FragmentPath": "/etc/systemd/system/dashcamd.service",
+            "DropInPaths": "",
+            "RefuseManualStart": "no",
+            "Conditions": "",
         },
     }
 
@@ -897,7 +1066,6 @@ def test_intent_only_recovery_transitions_directly_to_restored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = Path("/var/tmp/dashcam-m10-private.123456789abc")
-    mask = Path("/run/systemd/system/dashcamd.service")
     transitions: list[tuple[str, str]] = []
     commands: list[tuple[str, ...]] = []
     prior = {
@@ -906,6 +1074,10 @@ def test_intent_only_recovery_transitions_directly_to_restored(
         "SubState": "dead",
         "UnitFileState": "enabled",
         "NRestarts": "0",
+        "FragmentPath": "/etc/systemd/system/dashcamd.service",
+        "DropInPaths": "",
+        "RefuseManualStart": "no",
+        "Conditions": "",
     }
     monkeypatch.setattr(Path, "exists", lambda _self: False)
     monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
@@ -921,35 +1093,51 @@ def test_intent_only_recovery_transitions_directly_to_restored(
         lambda _work, expected, target, **_kwargs: transitions.append((expected, target)),
     )
 
-    run._restore_recovery_mask(
+    run._restore_recovery_exclusion(
         work,
-        {"prior_unit": prior, "owned_mask": None},
-        "MASK_INTENT",
-        mask,
+        {"prior_unit": prior, "owned_exclusion": None},
+        "EXCLUSION_INTENT",
+        "123456789abc",
         False,
     )
 
-    assert transitions == [("MASK_INTENT", "RESTORED")]
+    assert transitions == [("EXCLUSION_INTENT", "RESTORED")]
     assert commands == [("/usr/bin/systemctl", "daemon-reload")]
 
 
-def test_owned_mask_swap_at_final_unlink_seam_is_refused(
+def test_owned_exclusion_swap_at_final_unlink_seam_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mask = Path("/run/systemd/system/dashcamd.service")
     expected = {
-        "device": 7,
-        "inode": 11,
-        "uid": 0,
-        "gid": 0,
-        "mode": 0o777,
-        "nlink": 1,
-        "target": "/dev/null",
+        "directory_device": 7,
+        "directory_inode": 11,
+        "directory_uid": 0,
+        "directory_gid": 0,
+        "directory_mode": 0o755,
+        "directory_nlink": 2,
+        "file_inode": 12,
     }
-    drifted = {**expected, "inode": 12}
+    drifted = {**expected, "file_inode": 13}
     unlinked: list[str] = []
-    monkeypatch.setattr(run, "_open_mask_parent", lambda _mask: 9)
-    monkeypatch.setattr(run, "_mask_facts_at", lambda _descriptor, _name: drifted)
+    descriptors = iter((9, 10))
+    monkeypatch.setattr(run, "_open_exclusion_parent", lambda: next(descriptors))
+    monkeypatch.setattr(run.os, "open", lambda *_args, **_kwargs: 11)
+    monkeypatch.setattr(
+        run.os,
+        "fstat",
+        lambda descriptor: (
+            _metadata(
+                mode=0o40755,
+                nlink=2,
+                device=7,
+                inode=11,
+            )
+            if descriptor == 11
+            else _metadata(mode=0o40755, nlink=2, device=7, inode=1)
+        ),
+    )
+    monkeypatch.setattr(run.os, "listdir", lambda _descriptor: [run.EXCLUSION_FILE_NAME])
+    monkeypatch.setattr(run, "_exclusion_facts_at", lambda _descriptor, _nonce: drifted)
     monkeypatch.setattr(
         run.os,
         "unlink",
@@ -957,8 +1145,8 @@ def test_owned_mask_swap_at_final_unlink_seam_is_refused(
     )
     monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
 
-    with pytest.raises(run.HarnessError, match="changed before identity-bound unlink"):
-        run._unlink_owned_runtime_mask(mask, expected)
+    with pytest.raises(run.HarnessError, match="changed before removal"):
+        run._remove_owned_runtime_exclusion("123456789abc", expected)
 
     assert unlinked == []
 
@@ -1070,7 +1258,7 @@ def test_readme_states_private_scope_and_all_nonclaims() -> None:
     for text in (
         "production catalog or recording volume",
         "2,701,131,776",
-        "runtime-masks",
+        "runtime drop-in",
         "65-DELETE backlog",
         "exactly 64",
         "HTTP/download data plane",
@@ -1097,6 +1285,8 @@ def test_result_claims_remain_explicit_and_false_for_unexercised_surfaces() -> N
         '"physical_power_loss_tested": False',
     ):
         assert claim in source
+    assert '"conditions_property": "[unprintable]"' in source
+    assert '"conditions_property_parsed": False' in source
 
 
 def test_rollback_output_is_opened_inside_private_namespace() -> None:
@@ -1169,20 +1359,24 @@ def test_recovery_journal_phase_transition_is_durable_and_exact(
     work = tmp_path / "dashcam-m10-private.123456789abc"
     work.mkdir()
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "nonce": "123456789abc",
         "work": work.as_posix(),
         "ordinary_unit": "dashcamd.service",
         "phase": "PREPARED",
-        "mask_owner": "11111111-1111-1111-1111-111111111111",
-        "prior_mask_present": False,
-        "owned_mask": None,
+        "exclusion_owner": "11111111-1111-1111-1111-111111111111",
+        "prior_exclusion_present": False,
+        "owned_exclusion": None,
         "prior_unit": {
             "LoadState": "loaded",
             "ActiveState": "inactive",
             "SubState": "dead",
             "UnitFileState": "enabled",
             "NRestarts": "0",
+            "FragmentPath": "/etc/systemd/system/dashcamd.service",
+            "DropInPaths": "",
+            "RefuseManualStart": "no",
+            "Conditions": "",
         },
     }
     (work / "RECOVERY.json").write_bytes(run.canonical_json(document))
@@ -1194,18 +1388,21 @@ def test_recovery_journal_phase_transition_is_durable_and_exact(
     monkeypatch.setattr(run.os, "fsync", lambda _descriptor: None)
     monkeypatch.setattr(run.os, "close", lambda _descriptor: None)
 
-    run._transition_recovery_journal(work, "PREPARED", "MASK_INTENT")
+    run._transition_recovery_journal(work, "PREPARED", "EXCLUSION_INTENT")
 
-    assert run._strict_json((work / "RECOVERY.json").read_bytes(), "test")["phase"] == "MASK_INTENT"
+    assert (
+        run._strict_json((work / "RECOVERY.json").read_bytes(), "test")["phase"]
+        == "EXCLUSION_INTENT"
+    )
 
 
-def test_failure_cleanup_stays_inside_mask_scope() -> None:
+def test_failure_cleanup_stays_inside_exclusion_scope() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
     qualify = source[source.index("def qualify(") : source.index("def _parser(")]
 
-    assert qualify.index("with _runtime_mask(work) as mask_state") < qualify.index(
+    assert qualify.index("with _runtime_exclusion(work) as exclusion_state") < qualify.index(
         "_cleanup_fixture(paths)"
     )
     assert qualify.index("_cleanup_fixture(paths)") < qualify.index(
-        'mask_state["restore_authorized"] = True'
+        'exclusion_state["restore_authorized"] = True'
     )

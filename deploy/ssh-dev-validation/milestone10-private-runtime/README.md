@@ -36,10 +36,14 @@ sudo /opt/dashcam/releases/0.1.0.dev0-5f95dd806342ac9e/venv/bin/python -I \
   --output /var/tmp/m10-private-runtime-FRESH12HEX.json
 ```
 
-The harness takes both live-qualification locks and runtime-masks the ordinary
-`dashcamd.service` before any private camera work. On a successful run it keeps
-that mask through unit/cgroup drain, loop and owned-work cleanup, then restores
-the exact enabled, inactive and restart-count state before publication. It has
+The harness takes both live-qualification locks and installs a fresh, owned
+runtime drop-in for ordinary `dashcamd.service` before any private camera work.
+The nonce-bound drop-in combines `RefuseManualStart=yes` with a deliberately
+absent `ConditionPathExists=` target. After `daemon-reload`, the harness requires
+the exact `DropInPaths`, `RefuseManualStart=yes`, inactive state, and absent
+condition target before proceeding. On a successful run it keeps that exclusion
+through unit/cgroup drain, loop and owned-work cleanup, then restores the exact
+prior unit properties before publication. It has
 a 900-second global deadline and each transient unit has `RuntimeMaxSec=`. It uses one 416 MiB exFAT
 image and one 48 MiB ext4 image at a time. Host-visible nonce mounts are bound
 over `/srv/dashcam`, `/var/lib/dashcam`, and `/run/dashcam` only inside each
@@ -47,6 +51,14 @@ transient unit's private mount namespace. It does not use `StateDirectory=` or
 `RuntimeDirectory=`. Only the parent observes the production catalog/sentinel
 read-only for exact before/after hashes; transient candidate and rollback code
 see only the private bindings.
+
+On this exact systemd 257 stack, `systemctl show` serializes the structured
+`Conditions` property only as the exact sentinel `[unprintable]`. The harness
+requires that sentinel and records `conditions_property_parsed=false`; it does
+not claim a separately parsed D-Bus condition. Admission instead rests on the
+descriptor-bound canonical drop-in content and hash, exact loaded drop-in path,
+observed `RefuseManualStart=yes`, absent nonce marker, inactive unit, and
+successful reload.
 
 The fixed phase order is:
 
@@ -63,34 +75,36 @@ The fixed phase order is:
 
 The result is atomically no-replace published only at the exact direct-child
 `/var/tmp/m10-private-runtime-<12 lowercase hex>.json` grammar, after unit/cgroup drain, socket cleanup, loop
-unmount/detach, runtime-mask restoration, production-state comparison, root
+unmount/detach, runtime-exclusion restoration, production-state comparison, root
 reserve validation, and `throttled=0x0` validation. On an ownership ambiguity,
 the harness refuses rather than deleting an unknown mount, loop, path or unit.
 The owned temporary file, final file, and `/var/tmp` directory receive the
 required durability barriers, so no partially written final result is exposed.
 
-An interrupted or refused run deliberately keeps the ordinary recorder masked
+An interrupted or refused run deliberately keeps the ordinary recorder excluded
 unless all owned cleanup and exact prior-state restoration have completed. The
 fresh work directory contains a durably transitioned recovery journal binding
-the exact prior unit facts, absent prior mask, random mask-ownership token, and
-`PREPARED`, `MASK_INTENT`, `MASK_OWNED`, `CLEANED_MASKED`, or `RESTORED` phase.
-The journal and work directory remain until unmask, daemon reload, and exact
+the exact prior unit facts, absent prior drop-in, random exclusion-ownership
+token, and `PREPARED`, `EXCLUSION_INTENT`, `EXCLUSION_OWNED`,
+`CLEANED_EXCLUSION`, or `RESTORED` phase. `EXCLUSION_OWNED` records the exact
+directory and file device, inode, owner, mode, link count, canonical content,
+content hash, and impossible condition path. The journal and work directory
+remain until identity-bound drop-in removal, daemon reload, and exact
 prior-state verification all succeed. After reviewing its exact nonce, recover with
 the same hash-closed harness; recovery stops and drains only deterministic
 nonce units, verifies and removes only matching loop backings/mounts/work, and
-unmasks the ordinary recorder last:
+removes the owned exclusion last:
 
 ```text
 sudo /opt/dashcam/releases/0.1.0.dev0-5f95dd806342ac9e/venv/bin/python -I \
   BUNDLE/run.py --recover-work /var/tmp/dashcam-m10-private.EXACT12HEX
 ```
 
-Recovery is idempotent before mask creation, after durable mask ownership, after
-owned cleanup, and after unmask but before journal removal. `MASK_OWNED` binds
-the exact `/dev/null` symlink device, inode, owner, mode, link count, and target;
-those facts must match before recovery may unmask. `MASK_INTENT` with a present
-mask is deliberately ambiguous and never authorizes unmasking, even when its
-target is `/dev/null`; recovery refuses and preserves the journal for review.
+Recovery is idempotent before exclusion creation, after durable exclusion
+ownership, after owned cleanup, and after removal but before journal deletion.
+The exact directory/file facts must match before recovery may remove either.
+`EXCLUSION_INTENT` with a present drop-in is deliberately ambiguous and never
+authorizes removal; recovery refuses and preserves the journal for review.
 The work directory, journal, and private runtime directory are likewise checked
 without following links and against their exact owner, mode, link, and device
 contract before destructive recovery. No qualification claim or result is

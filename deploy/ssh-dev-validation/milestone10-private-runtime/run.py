@@ -4,7 +4,7 @@
 The root parent owns disposable host-visible loop mounts. Every recorder or
 rollback process runs in a transient systemd mount namespace in which those
 mounts cover /srv/dashcam, /var/lib/dashcam and /run/dashcam.  The ordinary
-recorder is runtime-masked for the complete qualification and its production
+recorder is excluded by an owned runtime drop-in for the complete qualification and its production
 catalog/media paths are observed read-only only for before/after identity.
 """
 
@@ -75,6 +75,8 @@ RECORDING_LABEL: Final = "DASHCAM"
 CATALOG_LABEL: Final = "M10STATE"
 CONTROL_SOCKET: Final = Path("/run/dashcam/control.sock")
 STATUS_PATH: Final = Path("/run/dashcam/status.json")
+EXCLUSION_DIRECTORY: Final = Path("/run/systemd/system/dashcamd.service.d")
+EXCLUSION_FILE_NAME: Final = "99-m10-exclusion.conf"
 CATALOG_PATH: Final = Path("/var/lib/dashcam/catalog.sqlite3")
 CONFIG_PATH: Final = Path("/var/lib/dashcam/config.toml")
 IDENTITY_PATH: Final = Path("/var/lib/dashcam/storage-volume.env")
@@ -926,7 +928,8 @@ def _service_properties(unit: str) -> dict[str, str]:
             "show",
             unit,
             "--property=LoadState,ActiveState,SubState,Result,ExecMainCode,"
-            "ExecMainStatus,NRestarts,MainPID,UnitFileState,ControlGroup",
+            "ExecMainStatus,NRestarts,MainPID,UnitFileState,ControlGroup,"
+            "FragmentPath,DropInPaths,RefuseManualStart,Conditions",
         )
     )
     values: dict[str, str] = {}
@@ -998,77 +1001,82 @@ def _qualification_locks() -> Iterator[None]:
             os.close(descriptor)
 
 
+def _exclusion_loaded(values: Mapping[str, str], nonce: str, before: Mapping[str, str]) -> bool:
+    drop_in = (EXCLUSION_DIRECTORY / EXCLUSION_FILE_NAME).as_posix()
+    conditions = values.get("Conditions", "")
+    return (
+        values.get("LoadState") == before.get("LoadState") == "loaded"
+        and values.get("ActiveState") == "inactive"
+        and values.get("UnitFileState") == before.get("UnitFileState") == "enabled"
+        and values.get("DropInPaths") == drop_in
+        and values.get("RefuseManualStart") == "yes"
+        and conditions == "[unprintable]"
+        and not (_exclusion_condition_path(nonce).exists())
+        and not (_exclusion_condition_path(nonce).is_symlink())
+    )
+
+
 @contextlib.contextmanager
-def _runtime_mask(work: Path) -> Iterator[dict[str, object]]:
+def _runtime_exclusion(work: Path) -> Iterator[dict[str, object]]:
     before = _service_properties("dashcamd.service")
     journal = _read_recovery_journal(work)
+    nonce = work.name.removeprefix("dashcam-m10-private.")
     if (
         before.get("ActiveState") != "inactive"
         or before.get("UnitFileState") != "enabled"
         or journal.get("phase") != "PREPARED"
         or journal.get("prior_unit") != _unit_restore_facts(before)
-        or journal.get("prior_mask_present") is not False
+        or journal.get("prior_exclusion_present") is not False
     ):
         raise HarnessError("ordinary dashcamd must be enabled and inactive")
-    mask = Path("/run/systemd/system/dashcamd.service")
-    if mask.exists() or mask.is_symlink():
-        raise HarnessError("ordinary dashcamd already has a runtime override")
-    _transition_recovery_journal(work, "PREPARED", "MASK_INTENT")
-    try:
-        _command(("/usr/bin/systemctl", "mask", "--runtime", "dashcamd.service"))
-    except BaseException:
-        # MASK_INTENT is intentionally retained because PID 1 may have accepted
-        # the operation before its reply was lost.
-        raise
-    owned_mask = _owned_mask_facts(mask)
+    condition = _exclusion_condition_path(nonce)
+    if (
+        EXCLUSION_DIRECTORY.exists()
+        or EXCLUSION_DIRECTORY.is_symlink()
+        or condition.exists()
+        or condition.is_symlink()
+    ):
+        raise HarnessError("ordinary dashcamd already has a runtime exclusion override")
+    _transition_recovery_journal(work, "PREPARED", "EXCLUSION_INTENT")
+    owned_exclusion = _create_runtime_exclusion(nonce)
     _transition_recovery_journal(
         work,
-        "MASK_INTENT",
-        "MASK_OWNED",
-        owned_mask=owned_mask,
+        "EXCLUSION_INTENT",
+        "EXCLUSION_OWNED",
+        owned_exclusion=owned_exclusion,
     )
     state: dict[str, object] = {"before": before, "restore_authorized": False}
     try:
         _command(("/usr/bin/systemctl", "daemon-reload"))
-        masked = _service_properties("dashcamd.service")
-        if (
-            masked.get("LoadState") != "masked"
-            or masked.get("ActiveState") != "inactive"
-            or masked.get("UnitFileState") != "masked-runtime"
-            or not mask.is_symlink()
-            or os.readlink(mask) != "/dev/null"
-        ):
-            raise HarnessError("ordinary dashcamd runtime mask did not close camera admission")
+        excluded = _service_properties("dashcamd.service")
+        if not _exclusion_loaded(excluded, nonce, before):
+            raise HarnessError("ordinary dashcamd runtime exclusion did not close admission")
         yield state
     finally:
         if state["restore_authorized"] is True:
             if set(entry.name for entry in work.iterdir()) != {"RECOVERY.json"}:
-                raise HarnessError("owned work was not cleaned before mask restoration")
-            if _owned_mask_facts(mask) != owned_mask:
-                raise HarnessError("owned runtime mask changed before restoration")
-            _transition_recovery_journal(work, "MASK_OWNED", "CLEANED_MASKED")
-            if _owned_mask_facts(mask) != owned_mask:
-                raise HarnessError("owned runtime mask changed after cleanup commit")
-            _unlink_owned_runtime_mask(mask, owned_mask)
+                raise HarnessError("owned work was not cleaned before exclusion restoration")
+            if _owned_exclusion_facts(nonce) != owned_exclusion:
+                raise HarnessError("owned runtime exclusion changed before restoration")
+            _transition_recovery_journal(work, "EXCLUSION_OWNED", "CLEANED_EXCLUSION")
+            if _owned_exclusion_facts(nonce) != owned_exclusion:
+                raise HarnessError("owned runtime exclusion changed after cleanup commit")
+            _remove_owned_runtime_exclusion(nonce, owned_exclusion)
             _command(("/usr/bin/systemctl", "daemon-reload"))
             after = _service_properties("dashcamd.service")
             if (
-                mask.exists()
-                or mask.is_symlink()
+                EXCLUSION_DIRECTORY.exists()
+                or EXCLUSION_DIRECTORY.is_symlink()
                 or _unit_restore_facts(after) != cast(dict[str, str], journal["prior_unit"])
             ):
                 raise HarnessError("ordinary dashcamd state was not restored exactly")
-            _transition_recovery_journal(work, "CLEANED_MASKED", "RESTORED")
+            _transition_recovery_journal(work, "CLEANED_EXCLUSION", "RESTORED")
             _remove_recovery_authority(work)
 
 
-def _require_masked() -> None:
+def _require_excluded(nonce: str, before: Mapping[str, str]) -> None:
     state = _service_properties("dashcamd.service")
-    if (
-        state.get("LoadState") != "masked"
-        or state.get("ActiveState") != "inactive"
-        or state.get("UnitFileState") != "masked-runtime"
-    ):
+    if not _exclusion_loaded(state, nonce, before):
         raise HarnessError("ordinary dashcamd exclusion changed during qualification")
 
 
@@ -1086,7 +1094,17 @@ def _freeze_bundle(bundle: Path, work: Path) -> Path:
 def _unit_restore_facts(values: Mapping[str, str]) -> dict[str, str]:
     return {
         key: values.get(key, "")
-        for key in ("LoadState", "ActiveState", "SubState", "UnitFileState", "NRestarts")
+        for key in (
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "UnitFileState",
+            "NRestarts",
+            "FragmentPath",
+            "DropInPaths",
+            "RefuseManualStart",
+            "Conditions",
+        )
     }
 
 
@@ -1111,57 +1129,203 @@ def _validate_work_identity(work: Path) -> os.stat_result:
     return metadata
 
 
-def _mask_facts_at(parent_descriptor: int, name: str) -> dict[str, object]:
-    metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    parent_metadata = os.fstat(parent_descriptor)
-    if (
-        name != "dashcamd.service"
-        or not stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
-        or stat.S_IMODE(metadata.st_mode) != 0o777
-        or metadata.st_nlink != 1
-        or metadata.st_dev != parent_metadata.st_dev
-        or not stat.S_ISDIR(parent_metadata.st_mode)
-        or parent_metadata.st_uid != 0
-        or parent_metadata.st_gid != 0
-        or os.readlink(name, dir_fd=parent_descriptor) != "/dev/null"
-    ):
-        raise HarnessError("owned runtime mask identity differs")
-    return {
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "uid": metadata.st_uid,
-        "gid": metadata.st_gid,
-        "mode": stat.S_IMODE(metadata.st_mode),
-        "nlink": metadata.st_nlink,
-        "target": "/dev/null",
-    }
+def _exclusion_condition_path(nonce: str) -> Path:
+    if re.fullmatch(r"[0-9a-f]{12}", nonce) is None:
+        raise HarnessError("runtime exclusion nonce differs")
+    return Path("/run") / f"dashcam-m10-exclusion-{nonce}-absent"
 
 
-def _open_mask_parent(mask: Path) -> int:
-    if mask != Path("/run/systemd/system/dashcamd.service"):
-        raise HarnessError("owned runtime mask path differs")
+def _exclusion_content(nonce: str) -> bytes:
+    condition = _exclusion_condition_path(nonce)
+    return (f"[Unit]\nRefuseManualStart=yes\nConditionPathExists={condition.as_posix()}\n").encode(
+        "ascii"
+    )
+
+
+def _open_exclusion_parent() -> int:
     return os.open(
-        mask.parent,
+        EXCLUSION_DIRECTORY.parent,
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
 
 
-def _owned_mask_facts(mask: Path) -> dict[str, object]:
-    parent_descriptor = _open_mask_parent(mask)
+def _exclusion_facts_at(
+    parent_descriptor: int,
+    nonce: str,
+) -> dict[str, object]:
+    parent_metadata = os.fstat(parent_descriptor)
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_gid != 0
+    ):
+        raise HarnessError("runtime exclusion parent identity differs")
+    directory_descriptor = os.open(
+        EXCLUSION_DIRECTORY.name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_descriptor,
+    )
     try:
-        return _mask_facts_at(parent_descriptor, mask.name)
+        directory_metadata = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != 0
+            or directory_metadata.st_gid != 0
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o755
+            or directory_metadata.st_nlink < 2
+            or directory_metadata.st_dev != parent_metadata.st_dev
+        ):
+            raise HarnessError("owned runtime exclusion directory identity differs")
+        names = os.listdir(directory_descriptor)
+        if names != [EXCLUSION_FILE_NAME]:
+            raise HarnessError("owned runtime exclusion directory members differ")
+        file_descriptor = os.open(
+            EXCLUSION_FILE_NAME,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            file_metadata = os.fstat(file_descriptor)
+            expected_content = _exclusion_content(nonce)
+            if (
+                not stat.S_ISREG(file_metadata.st_mode)
+                or file_metadata.st_uid != 0
+                or file_metadata.st_gid != 0
+                or stat.S_IMODE(file_metadata.st_mode) != 0o644
+                or file_metadata.st_nlink != 1
+                or file_metadata.st_dev != directory_metadata.st_dev
+                or file_metadata.st_size != len(expected_content)
+            ):
+                raise HarnessError("owned runtime exclusion file identity differs")
+            chunks = bytearray()
+            while len(chunks) <= len(expected_content):
+                chunk = os.read(file_descriptor, len(expected_content) + 1 - len(chunks))
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            if bytes(chunks) != expected_content:
+                raise HarnessError("owned runtime exclusion content differs")
+        finally:
+            os.close(file_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    return {
+        "directory_device": directory_metadata.st_dev,
+        "directory_inode": directory_metadata.st_ino,
+        "directory_uid": directory_metadata.st_uid,
+        "directory_gid": directory_metadata.st_gid,
+        "directory_mode": stat.S_IMODE(directory_metadata.st_mode),
+        "directory_nlink": directory_metadata.st_nlink,
+        "file_device": file_metadata.st_dev,
+        "file_inode": file_metadata.st_ino,
+        "file_uid": file_metadata.st_uid,
+        "file_gid": file_metadata.st_gid,
+        "file_mode": stat.S_IMODE(file_metadata.st_mode),
+        "file_nlink": file_metadata.st_nlink,
+        "file_size": file_metadata.st_size,
+        "content_sha256": _sha256(expected_content),
+        "content": expected_content.decode("ascii"),
+        "condition_path": _exclusion_condition_path(nonce).as_posix(),
+    }
+
+
+def _owned_exclusion_facts(nonce: str) -> dict[str, object]:
+    parent_descriptor = _open_exclusion_parent()
+    try:
+        return _exclusion_facts_at(parent_descriptor, nonce)
     finally:
         os.close(parent_descriptor)
 
 
-def _unlink_owned_runtime_mask(mask: Path, expected: Mapping[str, object]) -> None:
-    parent_descriptor = _open_mask_parent(mask)
+def _create_runtime_exclusion(nonce: str) -> dict[str, object]:
+    condition = _exclusion_condition_path(nonce)
+    if condition.exists() or condition.is_symlink():
+        raise HarnessError("runtime exclusion impossible condition path exists")
+    parent_descriptor = _open_exclusion_parent()
     try:
-        if _mask_facts_at(parent_descriptor, mask.name) != expected:
-            raise HarnessError("owned runtime mask changed before identity-bound unlink")
-        os.unlink(mask.name, dir_fd=parent_descriptor)
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != 0
+            or parent_metadata.st_gid != 0
+        ):
+            raise HarnessError("runtime exclusion parent identity differs")
+        os.mkdir(EXCLUSION_DIRECTORY.name, 0o755, dir_fd=parent_descriptor)
+        directory_descriptor = os.open(
+            EXCLUSION_DIRECTORY.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            payload = _exclusion_content(nonce)
+            file_descriptor = os.open(
+                EXCLUSION_FILE_NAME,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o644,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(file_descriptor, view)
+                    if written <= 0:
+                        raise HarnessError("runtime exclusion write made no progress")
+                    view = view[written:]
+                fchown = getattr(os, "fchown", None)
+                if not callable(fchown):
+                    raise HarnessError("runtime exclusion ownership control is unavailable")
+                fchown(file_descriptor, 0, 0)
+                os.fsync(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        os.fsync(parent_descriptor)
+        return _exclusion_facts_at(parent_descriptor, nonce)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _remove_owned_runtime_exclusion(nonce: str, expected: Mapping[str, object]) -> None:
+    parent_descriptor = _open_exclusion_parent()
+    try:
+        try:
+            directory_descriptor = os.open(
+                EXCLUSION_DIRECTORY.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            directory_facts = {
+                "directory_device": directory_metadata.st_dev,
+                "directory_inode": directory_metadata.st_ino,
+                "directory_uid": directory_metadata.st_uid,
+                "directory_gid": directory_metadata.st_gid,
+                "directory_mode": stat.S_IMODE(directory_metadata.st_mode),
+                "directory_nlink": directory_metadata.st_nlink,
+            }
+            if any(expected.get(key) != value for key, value in directory_facts.items()):
+                raise HarnessError("owned runtime exclusion directory changed before removal")
+            names = os.listdir(directory_descriptor)
+            if names == [EXCLUSION_FILE_NAME]:
+                if _exclusion_facts_at(parent_descriptor, nonce) != expected:
+                    raise HarnessError("owned runtime exclusion changed before removal")
+                os.unlink(EXCLUSION_FILE_NAME, dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
+                names = os.listdir(directory_descriptor)
+            if names:
+                raise HarnessError("owned runtime exclusion directory is not empty")
+        finally:
+            os.close(directory_descriptor)
+        os.rmdir(EXCLUSION_DIRECTORY.name, dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
     finally:
         os.close(parent_descriptor)
@@ -1175,15 +1339,15 @@ def _write_recovery_journal(work: Path, nonce: str, prior: Mapping[str, str]) ->
         work / "RECOVERY.json",
         canonical_json(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "nonce": nonce,
                 "work": work.as_posix(),
                 "ordinary_unit": "dashcamd.service",
                 "phase": "PREPARED",
-                "mask_owner": str(uuid4()),
-                "prior_mask_present": False,
+                "exclusion_owner": str(uuid4()),
+                "prior_exclusion_present": False,
                 "prior_unit": _unit_restore_facts(prior),
-                "owned_mask": None,
+                "owned_exclusion": None,
             }
         ),
         0o600,
@@ -1193,6 +1357,54 @@ def _write_recovery_journal(work: Path, nonce: str, prior: Mapping[str, str]) ->
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _owned_exclusion_document_valid(value: object, nonce: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    expected_keys = {
+        "directory_device",
+        "directory_inode",
+        "directory_uid",
+        "directory_gid",
+        "directory_mode",
+        "directory_nlink",
+        "file_device",
+        "file_inode",
+        "file_uid",
+        "file_gid",
+        "file_mode",
+        "file_nlink",
+        "file_size",
+        "content_sha256",
+        "content",
+        "condition_path",
+    }
+    content = _exclusion_content(nonce)
+    integer_keys = expected_keys - {"content_sha256", "content", "condition_path"}
+    return (
+        set(value) == expected_keys
+        and all(
+            isinstance(value.get(key), int) and not isinstance(value.get(key), bool)
+            for key in integer_keys
+        )
+        and value.get("directory_device") == value.get("file_device")
+        and cast(int, value.get("directory_device")) > 0
+        and cast(int, value.get("directory_inode")) > 0
+        and cast(int, value.get("file_inode")) > 0
+        and value.get("directory_uid") == 0
+        and value.get("directory_gid") == 0
+        and value.get("directory_mode") == 0o755
+        and cast(int, value.get("directory_nlink")) >= 2
+        and value.get("file_uid") == 0
+        and value.get("file_gid") == 0
+        and value.get("file_mode") == 0o644
+        and value.get("file_nlink") == 1
+        and value.get("file_size") == len(content)
+        and value.get("content_sha256") == _sha256(content)
+        and value.get("content") == content.decode("ascii")
+        and value.get("condition_path") == _exclusion_condition_path(nonce).as_posix()
+    )
 
 
 def _read_recovery_journal(work: Path) -> dict[str, object]:
@@ -1251,38 +1463,52 @@ def _read_recovery_journal(work: Path) -> dict[str, object]:
             "work",
             "ordinary_unit",
             "phase",
-            "mask_owner",
-            "prior_mask_present",
+            "exclusion_owner",
+            "prior_exclusion_present",
             "prior_unit",
-            "owned_mask",
+            "owned_exclusion",
         }
-        or document.get("schema_version") != 1
+        or document.get("schema_version") != 2
         or document.get("nonce") != work.name.removeprefix("dashcam-m10-private.")
         or document.get("work") != work.as_posix()
         or document.get("ordinary_unit") != "dashcamd.service"
         or document.get("phase")
-        not in {"PREPARED", "MASK_INTENT", "MASK_OWNED", "CLEANED_MASKED", "RESTORED"}
-        or not isinstance(document.get("mask_owner"), str)
-        or str(UUID(cast(str, document["mask_owner"]))) != document["mask_owner"]
-        or document.get("prior_mask_present") is not False
+        not in {
+            "PREPARED",
+            "EXCLUSION_INTENT",
+            "EXCLUSION_OWNED",
+            "CLEANED_EXCLUSION",
+            "RESTORED",
+        }
+        or not isinstance(document.get("exclusion_owner"), str)
+        or str(UUID(cast(str, document["exclusion_owner"]))) != document["exclusion_owner"]
+        or document.get("prior_exclusion_present") is not False
         or not isinstance(document.get("prior_unit"), dict)
         or set(cast(dict[str, object], document["prior_unit"]))
-        != {"LoadState", "ActiveState", "SubState", "UnitFileState", "NRestarts"}
+        != {
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "UnitFileState",
+            "NRestarts",
+            "FragmentPath",
+            "DropInPaths",
+            "RefuseManualStart",
+            "Conditions",
+        }
         or (
-            document.get("owned_mask") is not None
-            and (
-                not isinstance(document.get("owned_mask"), dict)
-                or set(cast(dict[str, object], document["owned_mask"]))
-                != {"device", "inode", "uid", "gid", "mode", "nlink", "target"}
+            document.get("owned_exclusion") is not None
+            and not _owned_exclusion_document_valid(
+                document.get("owned_exclusion"), cast(str, document.get("nonce"))
             )
         )
         or (
-            document.get("phase") in {"PREPARED", "MASK_INTENT"}
-            and document.get("owned_mask") is not None
+            document.get("phase") in {"PREPARED", "EXCLUSION_INTENT"}
+            and document.get("owned_exclusion") is not None
         )
         or (
-            document.get("phase") in {"MASK_OWNED", "CLEANED_MASKED"}
-            and not isinstance(document.get("owned_mask"), dict)
+            document.get("phase") in {"EXCLUSION_OWNED", "CLEANED_EXCLUSION"}
+            and not isinstance(document.get("owned_exclusion"), dict)
         )
     ):
         raise HarnessError("recovery journal content differs")
@@ -1386,15 +1612,15 @@ def _transition_recovery_journal(
     expected: str,
     target: str,
     *,
-    owned_mask: Mapping[str, object] | None = None,
+    owned_exclusion: Mapping[str, object] | None = None,
 ) -> None:
     allowed = {
-        ("PREPARED", "MASK_INTENT"),
-        ("MASK_INTENT", "MASK_OWNED"),
-        ("MASK_OWNED", "CLEANED_MASKED"),
-        ("MASK_INTENT", "RESTORED"),
+        ("PREPARED", "EXCLUSION_INTENT"),
+        ("EXCLUSION_INTENT", "EXCLUSION_OWNED"),
+        ("EXCLUSION_OWNED", "CLEANED_EXCLUSION"),
+        ("EXCLUSION_INTENT", "RESTORED"),
         ("PREPARED", "RESTORED"),
-        ("CLEANED_MASKED", "RESTORED"),
+        ("CLEANED_EXCLUSION", "RESTORED"),
     }
     if (expected, target) not in allowed:
         raise HarnessError("recovery journal transition differs")
@@ -1402,10 +1628,10 @@ def _transition_recovery_journal(
     if document["phase"] != expected:
         raise HarnessError("recovery journal phase changed")
     document["phase"] = target
-    if owned_mask is not None:
-        if expected != "MASK_INTENT" or target != "MASK_OWNED":
-            raise HarnessError("mask ownership may only be bound at acquisition")
-        document["owned_mask"] = dict(owned_mask)
+    if owned_exclusion is not None:
+        if expected != "EXCLUSION_INTENT" or target != "EXCLUSION_OWNED":
+            raise HarnessError("exclusion ownership may only be bound at acquisition")
+        document["owned_exclusion"] = dict(owned_exclusion)
     temporary = work / f".RECOVERY.{uuid4().hex}.tmp"
     _write_exclusive(temporary, canonical_json(document), 0o600)
     try:
@@ -3596,7 +3822,7 @@ def _remove_frozen(work: Path, frozen: Path) -> None:
     _require_root_identity()
     frozen.rmdir()
     if set(entry.name for entry in work.iterdir()) != {"RECOVERY.json"}:
-        raise HarnessError("owned work remains before mask restoration")
+        raise HarnessError("owned work remains before exclusion restoration")
 
 
 def _same_production(before: Mapping[str, object], after: Mapping[str, object]) -> None:
@@ -3606,7 +3832,7 @@ def _same_production(before: Mapping[str, object], after: Mapping[str, object]) 
     before_unit, after_unit = before.get("dashcamd"), after.get("dashcamd")
     if not isinstance(before_unit, dict) or not isinstance(after_unit, dict):
         raise HarnessError("ordinary dashcamd snapshot shape differs")
-    for key in ("LoadState", "ActiveState", "SubState", "UnitFileState", "NRestarts"):
+    for key in _unit_restore_facts({}):
         if before_unit.get(key) != after_unit.get(key):
             raise HarnessError(f"ordinary dashcamd changed: {key}")
     if before.get("throttled") != "throttled=0x0" or after.get("throttled") != "throttled=0x0":
@@ -3634,31 +3860,75 @@ def _mountpoint_or_none(path: Path) -> dict[str, object] | None:
     return cast(dict[str, object], rows[0])
 
 
-def validate_recovery_mask_authority(
+def _cleaned_exclusion_layout(nonce: str, expected: Mapping[str, object]) -> bool:
+    parent_descriptor = _open_exclusion_parent()
+    try:
+        try:
+            directory_descriptor = os.open(
+                EXCLUSION_DIRECTORY.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            metadata = os.fstat(directory_descriptor)
+            directory_values = {
+                "directory_device": metadata.st_dev,
+                "directory_inode": metadata.st_ino,
+                "directory_uid": metadata.st_uid,
+                "directory_gid": metadata.st_gid,
+                "directory_mode": stat.S_IMODE(metadata.st_mode),
+                "directory_nlink": metadata.st_nlink,
+            }
+            if any(expected.get(key) != value for key, value in directory_values.items()):
+                raise HarnessError("cleaned exclusion directory identity differs")
+            names = os.listdir(directory_descriptor)
+            if names == [EXCLUSION_FILE_NAME]:
+                if _exclusion_facts_at(parent_descriptor, nonce) != expected:
+                    raise HarnessError("cleaned exclusion file identity differs")
+            elif names:
+                raise HarnessError("cleaned exclusion directory members differ")
+            return True
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def validate_recovery_exclusion_authority(
     phase: str,
     *,
-    mask_present: bool,
-    exact_owned_mask: bool,
+    nonce: str,
+    exclusion_present: bool,
+    owned_exclusion: Mapping[str, object] | None,
 ) -> bool:
-    """Return whether recovery may unmask; refuse every ambiguous combination."""
+    """Return whether exact owned exclusion cleanup remains; refuse ambiguity."""
 
+    condition = _exclusion_condition_path(nonce)
+    if condition.exists() or condition.is_symlink():
+        raise HarnessError("runtime exclusion impossible condition path exists")
     if phase in {"PREPARED", "RESTORED"}:
-        if mask_present:
-            raise HarnessError("pre-mask/restored journal cannot own a runtime mask")
+        if exclusion_present:
+            raise HarnessError("pre-exclusion/restored journal cannot own a drop-in")
         return False
-    if phase == "MASK_INTENT":
-        if mask_present:
-            raise HarnessError("mask intent does not prove ownership of a present mask")
+    if phase == "EXCLUSION_INTENT":
+        if exclusion_present:
+            raise HarnessError("exclusion intent does not prove ownership of a present drop-in")
         return False
-    if phase == "MASK_OWNED":
-        if not mask_present or not exact_owned_mask:
-            raise HarnessError("owned-mask journal identity differs")
+    if phase == "EXCLUSION_OWNED":
+        if (
+            not exclusion_present
+            or owned_exclusion is None
+            or _owned_exclusion_facts(nonce) != owned_exclusion
+        ):
+            raise HarnessError("owned exclusion journal identity differs")
         return True
-    if phase == "CLEANED_MASKED":
-        if mask_present and not exact_owned_mask:
-            raise HarnessError("cleaned-mask journal identity differs")
-        return mask_present
-    raise HarnessError("unknown recovery mask phase")
+    if phase == "CLEANED_EXCLUSION":
+        if owned_exclusion is None:
+            raise HarnessError("cleaned exclusion evidence is absent")
+        return _cleaned_exclusion_layout(nonce, owned_exclusion)
+    raise HarnessError("unknown recovery exclusion phase")
 
 
 def _associated_loop(image: Path) -> Path | None:
@@ -3671,58 +3941,58 @@ def _associated_loop(image: Path) -> Path | None:
     return None if not names else Path(names[0])
 
 
-def _restore_recovery_mask(
+def _restore_recovery_exclusion(
     work: Path,
     journal: Mapping[str, object],
     phase: str,
-    mask: Path,
-    may_unmask: bool,
+    nonce: str,
+    may_remove: bool,
 ) -> None:
     if phase == "PREPARED":
         ordinary = _service_properties("dashcamd.service")
         if _unit_restore_facts(ordinary) != journal["prior_unit"]:
-            raise HarnessError("pre-mask recovery prior state differs")
+            raise HarnessError("pre-exclusion recovery prior state differs")
         _transition_recovery_journal(work, "PREPARED", "RESTORED")
         return
-    if phase == "MASK_INTENT":
-        if may_unmask:
-            raise HarnessError("mask intent unexpectedly authorized unmask")
+    if phase == "EXCLUSION_INTENT":
+        if may_remove:
+            raise HarnessError("exclusion intent unexpectedly authorized removal")
         _command(("/usr/bin/systemctl", "daemon-reload"))
         ordinary = _service_properties("dashcamd.service")
         if (
-            mask.exists()
-            or mask.is_symlink()
+            EXCLUSION_DIRECTORY.exists()
+            or EXCLUSION_DIRECTORY.is_symlink()
             or _unit_restore_facts(ordinary) != journal["prior_unit"]
         ):
             raise HarnessError("ordinary recorder state differs after intent-only recovery")
-        _transition_recovery_journal(work, "MASK_INTENT", "RESTORED")
+        _transition_recovery_journal(work, "EXCLUSION_INTENT", "RESTORED")
         return
-    if phase in {"MASK_OWNED", "CLEANED_MASKED"}:
-        owned_mask = journal.get("owned_mask")
-        if not isinstance(owned_mask, dict):
-            raise HarnessError("owned recovery mask evidence is absent")
-        if phase == "MASK_OWNED":
-            if _owned_mask_facts(mask) != owned_mask:
-                raise HarnessError("owned runtime mask changed before recovery cleanup commit")
-            _transition_recovery_journal(work, "MASK_OWNED", "CLEANED_MASKED")
-        if may_unmask:
-            _unlink_owned_runtime_mask(mask, owned_mask)
+    if phase in {"EXCLUSION_OWNED", "CLEANED_EXCLUSION"}:
+        owned_exclusion = journal.get("owned_exclusion")
+        if not isinstance(owned_exclusion, dict):
+            raise HarnessError("owned recovery exclusion evidence is absent")
+        if phase == "EXCLUSION_OWNED":
+            if _owned_exclusion_facts(nonce) != owned_exclusion:
+                raise HarnessError("owned exclusion changed before recovery cleanup commit")
+            _transition_recovery_journal(work, "EXCLUSION_OWNED", "CLEANED_EXCLUSION")
+        if may_remove:
+            _remove_owned_runtime_exclusion(nonce, owned_exclusion)
         _command(("/usr/bin/systemctl", "daemon-reload"))
         ordinary = _service_properties("dashcamd.service")
         if (
-            mask.exists()
-            or mask.is_symlink()
+            EXCLUSION_DIRECTORY.exists()
+            or EXCLUSION_DIRECTORY.is_symlink()
             or _unit_restore_facts(ordinary) != journal["prior_unit"]
         ):
             raise HarnessError("ordinary recorder state differs after recovery")
-        _transition_recovery_journal(work, "CLEANED_MASKED", "RESTORED")
+        _transition_recovery_journal(work, "CLEANED_EXCLUSION", "RESTORED")
         return
     if phase == "RESTORED":
         ordinary = _service_properties("dashcamd.service")
         if _unit_restore_facts(ordinary) != journal["prior_unit"]:
             raise HarnessError("restored recovery prior state differs")
         return
-    raise HarnessError("unknown recovery mask phase")
+    raise HarnessError("unknown recovery exclusion phase")
 
 
 def recover_owned_work(raw_work: Path) -> dict[str, object]:
@@ -3737,20 +4007,18 @@ def recover_owned_work(raw_work: Path) -> dict[str, object]:
     journal = _read_recovery_journal(work)
     nonce = work.name.removeprefix("dashcam-m10-private.")
     phase = cast(str, journal["phase"])
-    mask = Path("/run/systemd/system/dashcamd.service")
-    mask_present = mask.exists() or mask.is_symlink()
-    exact_mask = mask.is_symlink() and os.readlink(mask) == "/dev/null"
-    owned_mask = journal.get("owned_mask")
-    exact_owned_mask = bool(
-        mask_present
-        and exact_mask
-        and isinstance(owned_mask, dict)
-        and _owned_mask_facts(mask) == owned_mask
+    exclusion_present = EXCLUSION_DIRECTORY.exists() or EXCLUSION_DIRECTORY.is_symlink()
+    owned_exclusion_raw = journal.get("owned_exclusion")
+    owned_exclusion = (
+        cast(dict[str, object], owned_exclusion_raw)
+        if isinstance(owned_exclusion_raw, dict)
+        else None
     )
-    may_unmask = validate_recovery_mask_authority(
+    may_remove = validate_recovery_exclusion_authority(
         phase,
-        mask_present=mask_present,
-        exact_owned_mask=exact_owned_mask,
+        nonce=nonce,
+        exclusion_present=exclusion_present,
+        owned_exclusion=owned_exclusion,
     )
     _require_root_identity()
     for suffix in (
@@ -3836,9 +4104,14 @@ def recover_owned_work(raw_work: Path) -> dict[str, object]:
     if set(entry.name for entry in work.iterdir()) != {"RECOVERY.json"}:
         raise HarnessError("recovery work contains an unexpected member")
 
-    _restore_recovery_mask(work, journal, phase, mask, may_unmask)
+    _restore_recovery_exclusion(work, journal, phase, nonce, may_remove)
     _remove_recovery_authority(work)
-    return {"schema_version": 1, "recovered": True, "work_removed": True, "mask_restored": True}
+    return {
+        "schema_version": 2,
+        "recovered": True,
+        "work_removed": True,
+        "exclusion_restored": True,
+    }
 
 
 def qualify(arguments: argparse.Namespace) -> dict[str, object]:
@@ -3855,9 +4128,8 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
     with _qualification_locks():
         _require_root_identity(minimum_free=ROOT_REQUIRED_FREE_BYTES)
         before = _host_snapshot()
-        initial_mask = Path("/run/systemd/system/dashcamd.service")
-        if initial_mask.exists() or initial_mask.is_symlink():
-            raise HarnessError("ordinary recorder has a preexisting runtime mask")
+        if EXCLUSION_DIRECTORY.exists() or EXCLUSION_DIRECTORY.is_symlink():
+            raise HarnessError("ordinary recorder has a preexisting runtime drop-in")
         root_free_before = _space(Path("/"))[1]
         if not root_budget_satisfied(root_free_before):
             raise HarnessError("root lacks the reviewed image/overhead/reserve budget")
@@ -3885,9 +4157,9 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
         phase_results: dict[str, object] = {}
         minimum_root_free = _space(Path("/"))[1]
         try:
-            with _runtime_mask(work) as mask_state:
+            with _runtime_exclusion(work) as exclusion_state:
                 try:
-                    _require_masked()
+                    _require_excluded(nonce, cast(dict[str, str], prior_unit))
                     paths, identity = _fresh_phase(
                         work,
                         frozen,
@@ -3902,9 +4174,9 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                         identity,
                         dashcam_uid=dashcam_uid,
                     )
-                    _require_masked()
+                    _require_excluded(nonce, cast(dict[str, str], prior_unit))
                     phase_results["D"] = _rollback_phase(nonce, paths)
-                    _require_masked()
+                    _require_excluded(nonce, cast(dict[str, str], prior_unit))
                     _cleanup_fixture(paths)
                     _discard_fixture(paths)
                     paths = None
@@ -3922,7 +4194,7 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                         paths,
                         identity,
                     )
-                    _require_masked()
+                    _require_excluded(nonce, cast(dict[str, str], prior_unit))
                     _cleanup_fixture(paths)
                     _discard_fixture(paths)
                     paths = None
@@ -3936,7 +4208,7 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                     )
                     minimum_root_free = min(minimum_root_free, _space(Path("/"))[1])
                     phase_results["C"] = _startup_bound_phase(nonce, paths)
-                    _require_masked()
+                    _require_excluded(nonce, cast(dict[str, str], prior_unit))
                     _cleanup_fixture(paths)
                     _discard_fixture(paths)
                     paths = None
@@ -3947,7 +4219,7 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                         with contextlib.suppress(Exception):
                             _discard_fixture(paths)
                 _remove_frozen(work, frozen)
-                mask_state["restore_authorized"] = True
+                exclusion_state["restore_authorized"] = True
         finally:
             minimum_root_free = min(minimum_root_free, root_sampler.stop())
         root_free_after = _space(Path("/"))[1]
@@ -3990,6 +4262,14 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                 "production_paths_read_only_and_unchanged": True,
             },
             "phases": phase_results,
+            "ordinary_recorder_exclusion": {
+                "mechanism": "owned_runtime_drop_in",
+                "drop_in_path_and_content_verified": True,
+                "refuse_manual_start_observed": True,
+                "condition_marker_absent": True,
+                "conditions_property": "[unprintable]",
+                "conditions_property_parsed": False,
+            },
             "claims": {
                 "production_candidate_runtime_tested": True,
                 "production_camera_tested": True,

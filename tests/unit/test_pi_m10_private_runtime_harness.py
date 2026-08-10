@@ -605,19 +605,39 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, ...]] = []
+    sequence: list[str] = []
     masked = False
     states = iter(
         (
-            {"ActiveState": "inactive", "UnitFileState": "enabled", "NRestarts": "0"},
-            {"LoadState": "masked", "ActiveState": "inactive"},
+            {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "enabled",
+                "NRestarts": "0",
+            },
+            {
+                "LoadState": "masked",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "masked-runtime",
+                "NRestarts": "0",
+            },
         )
     )
-    monkeypatch.setattr(run, "_service_properties", lambda _unit: next(states))
+
+    def service_properties(_unit: str) -> dict[str, str]:
+        state = next(states)
+        sequence.append(f"observe:{state['LoadState']}:{state['UnitFileState']}")
+        return state
+
+    monkeypatch.setattr(run, "_service_properties", service_properties)
 
     def command(arguments: tuple[object, ...], **_kwargs: object) -> None:
         nonlocal masked
         call = tuple(str(value) for value in arguments)
         calls.append(call)
+        sequence.append(f"command:{Path(call[0]).name}:{call[1]}")
         if "mask" in call:
             masked = True
 
@@ -628,20 +648,23 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
     monkeypatch.setattr(
         run,
         "_owned_mask_facts",
-        lambda _path: {
-            "device": 1,
-            "inode": 2,
-            "uid": 0,
-            "gid": 0,
-            "mode": 0o777,
-            "nlink": 1,
-            "target": "/dev/null",
-        },
+        lambda _path: (
+            sequence.append("capture:owned-mask")
+            or {
+                "device": 1,
+                "inode": 2,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o777,
+                "nlink": 1,
+                "target": "/dev/null",
+            }
+        ),
     )
     prior = {
-        "LoadState": "",
+        "LoadState": "loaded",
         "ActiveState": "inactive",
-        "SubState": "",
+        "SubState": "dead",
         "UnitFileState": "enabled",
         "NRestarts": "0",
     }
@@ -654,13 +677,28 @@ def test_runtime_mask_restores_only_after_explicit_cleanup_authority(
             "prior_mask_present": False,
         },
     )
-    monkeypatch.setattr(run, "_transition_recovery_journal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "_transition_recovery_journal",
+        lambda _work, expected, target, **_kwargs: sequence.append(
+            f"transition:{expected}>{target}"
+        ),
+    )
     with (
         pytest.raises(RuntimeError, match="injected"),
         run._runtime_mask(Path("/var/tmp/dashcam-m10-private.123456789abc")),
     ):
         raise RuntimeError("injected")
     assert not any("unmask" in call for call in calls)
+    assert sequence == [
+        "observe:loaded:enabled",
+        "transition:PREPARED>MASK_INTENT",
+        "command:systemctl:mask",
+        "capture:owned-mask",
+        "transition:MASK_INTENT>MASK_OWNED",
+        "command:systemctl:daemon-reload",
+        "observe:masked:masked-runtime",
+    ]
 
 
 @pytest.mark.parametrize(

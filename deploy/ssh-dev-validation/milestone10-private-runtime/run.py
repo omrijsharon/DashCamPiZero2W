@@ -1020,23 +1020,25 @@ def _runtime_mask(work: Path) -> Iterator[dict[str, object]]:
         # MASK_INTENT is intentionally retained because PID 1 may have accepted
         # the operation before its reply was lost.
         raise
+    owned_mask = _owned_mask_facts(mask)
+    _transition_recovery_journal(
+        work,
+        "MASK_INTENT",
+        "MASK_OWNED",
+        owned_mask=owned_mask,
+    )
     state: dict[str, object] = {"before": before, "restore_authorized": False}
     try:
+        _command(("/usr/bin/systemctl", "daemon-reload"))
         masked = _service_properties("dashcamd.service")
         if (
             masked.get("LoadState") != "masked"
             or masked.get("ActiveState") != "inactive"
+            or masked.get("UnitFileState") != "masked-runtime"
             or not mask.is_symlink()
             or os.readlink(mask) != "/dev/null"
         ):
             raise HarnessError("ordinary dashcamd runtime mask did not close camera admission")
-        owned_mask = _owned_mask_facts(mask)
-        _transition_recovery_journal(
-            work,
-            "MASK_INTENT",
-            "MASK_OWNED",
-            owned_mask=owned_mask,
-        )
         yield state
     finally:
         if state["restore_authorized"] is True:
@@ -1062,7 +1064,11 @@ def _runtime_mask(work: Path) -> Iterator[dict[str, object]]:
 
 def _require_masked() -> None:
     state = _service_properties("dashcamd.service")
-    if state.get("LoadState") != "masked" or state.get("ActiveState") != "inactive":
+    if (
+        state.get("LoadState") != "masked"
+        or state.get("ActiveState") != "inactive"
+        or state.get("UnitFileState") != "masked-runtime"
+    ):
         raise HarnessError("ordinary dashcamd exclusion changed during qualification")
 
 

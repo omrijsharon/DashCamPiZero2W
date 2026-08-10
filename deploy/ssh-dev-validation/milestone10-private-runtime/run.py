@@ -258,6 +258,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "stop_clean",
     "wait_writing",
     "wait_delete_progress",
+    "canonical_media_row",
     "wait_event_media",
     "media_evidence",
     "runtime_health",
@@ -3948,49 +3949,66 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
         raise HarnessError("clip sidecar is not canonical JSON")
     video_summary = value.get("video")
     warnings = value.get("warnings", [])
+    if not isinstance(video_summary, dict):
+        raise HarnessError("canonical sidecar video summary differs")
+    if value.get("clip_id") != row.get("clip_id"):
+        raise HarnessError("canonical sidecar clip identity differs")
+    if value.get("start_monotonic_ns") != row.get("start_monotonic_ns"):
+        raise HarnessError("canonical sidecar start binding differs")
+    if value.get("end_monotonic_ns") != row.get("end_monotonic_ns"):
+        raise HarnessError("canonical sidecar end binding differs")
+    if value.get("protected") is not row.get("protected"):
+        raise HarnessError("canonical sidecar protection binding differs")
     if (
-        not isinstance(video_summary, dict)
-        or value.get("clip_id") != row.get("clip_id")
-        or value.get("start_monotonic_ns") != row.get("start_monotonic_ns")
-        or value.get("end_monotonic_ns") != row.get("end_monotonic_ns")
-        or value.get("protected") is not row.get("protected")
-        or not isinstance(value.get("video_file"), str)
+        not isinstance(value.get("video_file"), str)
         or not isinstance(value.get("metadata_file"), str)
         or PurePosixPath(relative).name != value.get("metadata_file")
-        or video_summary.get("codec") != "h264"
+    ):
+        raise HarnessError("canonical sidecar filename binding differs")
+    if (
+        video_summary.get("codec") != "h264"
         or video_summary.get("width") != 1920
         or video_summary.get("height") != 1080
         or video_summary.get("fps_nominal") != 30
-        or not isinstance(video_summary.get("frames_written"), int)
+    ):
+        raise HarnessError("canonical sidecar video profile differs")
+    if (
+        not isinstance(video_summary.get("frames_written"), int)
         or isinstance(video_summary.get("frames_written"), bool)
         or cast(int, video_summary.get("frames_written")) <= 0
-        or video_summary.get("dropped_frames") != 0
-        or not isinstance(warnings, list)
-        or any(
-            text in str(item).casefold()
-            for item in warnings
-            for text in (
-                "dropped-frame observation was unavailable",
-                "frame and drop counters are unavailable",
-            )
+    ):
+        raise HarnessError("canonical sidecar frame counter differs")
+    if video_summary.get("dropped_frames") != 0:
+        raise HarnessError("canonical sidecar drop counter differs")
+    if not isinstance(warnings, list):
+        raise HarnessError("canonical sidecar warnings shape differs")
+    if any(
+        text in str(item).casefold()
+        for item in warnings
+        for text in (
+            "dropped-frame observation was unavailable",
+            "frame and drop counters are unavailable",
         )
     ):
-        raise HarnessError("canonical sidecar media/catalog binding differs")
+        raise HarnessError("canonical sidecar counter warning differs")
     directory = PurePosixPath(relative).parent
     video_relative = (directory / cast(str, value["video_file"])).as_posix()
     video = root / PurePosixPath(video_relative)
     metadata = video.stat()
-    if (
-        row.get("video_path") != video_relative
-        or not stat.S_ISREG(metadata.st_mode)
-        or video.is_symlink()
-        or metadata.st_dev != root.stat().st_dev
-        or row.get("size_bytes") != metadata.st_size
-        or row.get("lifecycle") != "FINALIZED"
-        or row.get("managed") is not True
-        or row.get("pair_reconciled") is not True
-    ):
-        raise HarnessError("finalized media pair/catalog identity differs")
+    if row.get("video_path") != video_relative:
+        raise HarnessError("finalized media catalog path differs")
+    if not stat.S_ISREG(metadata.st_mode) or video.is_symlink():
+        raise HarnessError("finalized media member type differs")
+    if metadata.st_dev != root.stat().st_dev:
+        raise HarnessError("finalized media device differs")
+    if row.get("size_bytes") != metadata.st_size:
+        raise HarnessError("finalized media size differs")
+    if row.get("lifecycle") != "FINALIZED":
+        raise HarnessError("finalized media lifecycle differs")
+    if row.get("managed") is not True:
+        raise HarnessError("finalized media ownership differs")
+    if row.get("pair_reconciled") is not True:
+        raise HarnessError("finalized media reconciliation differs")
     return {
         **row,
         "sidecar": sidecar_path,

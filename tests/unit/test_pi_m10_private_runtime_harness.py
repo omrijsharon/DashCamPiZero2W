@@ -1891,6 +1891,39 @@ def test_phase_a_records_both_startup_reclaim_pass_counts() -> None:
     assert '"startup_delete_after_finalize_count": len(completed_deletes)' in source
 
 
+def test_canonical_media_refusals_use_the_reviewed_function_lines() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    messages = (
+        "canonical sidecar video summary differs",
+        "canonical sidecar clip identity differs",
+        "canonical sidecar start binding differs",
+        "canonical sidecar end binding differs",
+        "canonical sidecar protection binding differs",
+        "canonical sidecar filename binding differs",
+        "canonical sidecar video profile differs",
+        "canonical sidecar frame counter differs",
+        "canonical sidecar drop counter differs",
+        "canonical sidecar warnings shape differs",
+        "canonical sidecar counter warning differs",
+        "finalized media catalog path differs",
+        "finalized media member type differs",
+        "finalized media device differs",
+        "finalized media size differs",
+        "finalized media lifecycle differs",
+        "finalized media ownership differs",
+        "finalized media reconciliation differs",
+    )
+    observed = [
+        index + 1
+        for index, line in enumerate(source.splitlines())
+        if any(message in line for message in messages)
+    ]
+
+    assert len(observed) == len(messages)
+    assert len(set(observed)) == len(messages)
+    assert set(observed).issubset(run._reviewed_function_lines()["canonical_media_row"])
+
+
 def test_rollback_output_is_opened_inside_private_namespace() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 

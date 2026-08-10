@@ -3940,24 +3940,24 @@ def _wait_fresh_writing(
     catalog: Path,
     root: Path,
     *,
-    timeout: float = 65,
-    maximum_age_ns: int = 3_000_000_000,
+    timeout: float = 70,
 ) -> dict[str, object]:
+    initial = _wait_writing(catalog, root)
+    initial_id = initial.get("clip_id")
+    if not isinstance(initial_id, str):
+        raise HarnessError("initial durable WRITING identity differs")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         row = _writing_clip(_query_catalog(catalog, root))
-        started = None if row is None else row.get("start_monotonic_ns")
-        now = time.monotonic_ns()
         if (
             row is not None
             and row.get("video_present") is True
-            and isinstance(started, int)
-            and not isinstance(started, bool)
-            and 0 <= now - started <= maximum_age_ns
+            and isinstance(row.get("clip_id"), str)
+            and row["clip_id"] != initial_id
         ):
             return row
         time.sleep(0.05)
-    raise HarnessError("fresh durable WRITING identity was not observed")
+    raise HarnessError("successor durable WRITING identity was not observed")
 
 
 def _wait_delete_progress(

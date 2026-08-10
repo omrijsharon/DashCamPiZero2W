@@ -3391,6 +3391,22 @@ def _raw_control(runtime: Path, command: str, arguments: Mapping[str, object]) -
     return cast(dict[str, object], result)
 
 
+def _release_download_converged(
+    runtime: Path,
+    *,
+    clip_id: object,
+    lease_id: object,
+) -> dict[str, object]:
+    arguments = {"clip_id": clip_id, "lease_id": lease_id}
+    try:
+        result = _raw_control(runtime, "release_download", arguments)
+    except HarnessError:
+        result = _raw_control(runtime, "release_download", arguments)
+    if result.get("clip_id") != clip_id or not isinstance(result.get("released"), bool):
+        raise HarnessError("download release convergence response differs")
+    return result
+
+
 def _listener_identity(runtime: Path, dashcam_uid: int) -> dict[str, object]:
     endpoint = runtime / "control.sock"
     metadata = os.lstat(endpoint)
@@ -4534,10 +4550,10 @@ def _phase_a(
         _remove_filler(startup_filler, root)
 
         control_status = _raw_control(runtime, "status", {})
-        _raw_control(
+        _release_download_converged(
             runtime,
-            "release_download",
-            {"clip_id": fixture["leased_id"], "lease_id": fixture["lease_id"]},
+            clip_id=fixture["leased_id"],
+            lease_id=fixture["lease_id"],
         )
         writing_before = _wait_writing(catalog, root)
         before_live_count = _catalog_counts(catalog)["delete_complete"]
@@ -4647,16 +4663,16 @@ def _phase_a(
         if event_window["next_clip_id"] in all_completed_deletes:
             raise HarnessError("exact event NEXT successor was reclaimed")
         _remove_filler(next_filler, root)
-        _raw_control(
+        _release_download_converged(
             runtime,
-            "release_download",
-            {"clip_id": full_rows[2]["clip_id"], "lease_id": following_lease_id},
+            clip_id=full_rows[2]["clip_id"],
+            lease_id=following_lease_id,
         )
 
-        _raw_control(
+        _release_download_converged(
             runtime,
-            "release_download",
-            {"clip_id": leased["clip_id"], "lease_id": lease_id},
+            clip_id=leased["clip_id"],
+            lease_id=lease_id,
         )
         final_status = _strict_json(
             _bounded_read(runtime / "status.json", 128 * 1024), "runtime status"

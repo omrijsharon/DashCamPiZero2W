@@ -2119,6 +2119,47 @@ def test_control_wrapper_is_not_a_reviewed_diagnostic_location() -> None:
     assert "raw_control" not in run._reviewed_function_lines()
 
 
+def test_download_release_retries_only_one_ambiguous_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def release(_runtime: Path, command: str, arguments: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        assert command == "release_download"
+        assert arguments == {"clip_id": "clip", "lease_id": "lease"}
+        if calls == 1:
+            raise run.HarnessError("private response")
+        return {"clip_id": "clip", "released": False}
+
+    monkeypatch.setattr(run, "_raw_control", release)
+
+    assert run._release_download_converged(
+        Path("runtime"),
+        clip_id="clip",
+        lease_id="lease",
+    ) == {"clip_id": "clip", "released": False}
+    assert calls == 2
+
+
+def test_download_release_requires_exact_convergence_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        run,
+        "_raw_control",
+        lambda *_args, **_kwargs: {"clip_id": "other", "released": True},
+    )
+
+    with pytest.raises(run.HarnessError, match="convergence response"):
+        run._release_download_converged(
+            Path("runtime"),
+            clip_id="clip",
+            lease_id="lease",
+        )
+
+
 def test_rollback_output_is_opened_inside_private_namespace() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 

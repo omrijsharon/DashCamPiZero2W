@@ -2395,13 +2395,22 @@ def _detach(loop: Path, image: Path) -> None:
 
 
 def _unmount(target: Path, loop: Path) -> None:
-    row = _findmnt(target)
-    if (
-        row.get("source") != loop.as_posix()
-        or Path(cast(str, row.get("target"))).resolve() != target.resolve()
-    ):
-        raise HarnessError("refusing to unmount a foreign target")
-    _command(("/usr/bin/umount", target))
+    for attempt in range(20):
+        row = _findmnt(target)
+        if (
+            row.get("source") != loop.as_posix()
+            or Path(cast(str, row.get("target"))).resolve() != target.resolve()
+        ):
+            raise HarnessError("refusing to unmount a foreign target")
+        result = _command(
+            ("/usr/bin/umount", target),
+            allowed=frozenset({0, 32}),
+        )
+        if result.returncode == 0:
+            return
+        if attempt < 19:
+            time.sleep(0.1)
+    raise HarnessError("owned private mount remained busy after its retry bound")
 
 
 def _mount_fixture(

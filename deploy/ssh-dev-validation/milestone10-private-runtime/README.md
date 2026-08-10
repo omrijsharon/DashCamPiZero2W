@@ -76,7 +76,9 @@ The fixed phase order is:
    clips, and clean shutdown. During the three live threshold crossings only,
    an upward free-space jump is accepted because the immediately following
    catalog gate requires a new completed DELETE; all offline filler phases
-   retain the exact target gate. Per-clip sidecar drop-counter unavailability
+   retain the exact target gate. Live crossings use paced 1 MiB extents rather
+   than the offline 8 MiB extent size so the test driver does not manufacture
+   burst I/O pressure. Per-clip sidecar drop-counter unavailability
    remains truthful as `null` evidence; the final runtime status must instead
    provide a real drop source and an exact aggregate zero, alongside strict
    packet PTS/DTS and boundary checks.

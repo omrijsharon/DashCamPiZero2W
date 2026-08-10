@@ -56,6 +56,8 @@ MAX_SOURCE_MEMBERS: Final = 768
 MAX_FIXTURE_ROWS: Final = 512
 MAX_FILLER_BYTES: Final = 320 * 1024**2
 FILLER_CHUNK_BYTES: Final = 8 * 1024**2
+LIVE_FILLER_CHUNK_BYTES: Final = 1 * 1024**2
+MAX_FILLER_STEPS: Final = MAX_FILLER_BYTES // LIVE_FILLER_CHUNK_BYTES + 1
 PHASE_TIMEOUT_S: Final = 420
 QUALIFICATION_TIMEOUT_S: Final = 900
 UNIT_START_TIMEOUT_S: Final = 48
@@ -3307,7 +3309,8 @@ def _allocate_filler(
     path = root / "M10-PRIVATE-UNKNOWN-FILLER.bin"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     allocated = 0
-    amount = 0
+    steps = 0
+    step_bytes = LIVE_FILLER_CHUNK_BYTES if allow_concurrent_reclaim else FILLER_CHUNK_BYTES
     try:
         while True:
             current = os.statvfs(root)  # type: ignore[attr-defined]
@@ -3317,14 +3320,17 @@ def _allocate_filler(
             if free <= target_free + 2 * current.f_frsize:
                 break
             required = free - target_free
-            amount = min(FILLER_CHUNK_BYTES, required)
+            amount = min(step_bytes, required)
             amount = ((amount + current.f_frsize - 1) // current.f_frsize) * current.f_frsize
             if allocated + amount > MAX_FILLER_BYTES:
                 raise HarnessError("filler exceeds its allocation bound")
             os.posix_fallocate(descriptor, allocated, amount)  # type: ignore[attr-defined]
             allocated += amount
-            if allocated // FILLER_CHUNK_BYTES > MAX_FILLER_BYTES // FILLER_CHUNK_BYTES + 1:
+            steps += 1
+            if steps > MAX_FILLER_STEPS:
                 raise HarnessError("filler allocation step bound exceeded")
+            if allow_concurrent_reclaim:
+                time.sleep(0.02)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

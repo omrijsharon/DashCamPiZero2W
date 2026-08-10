@@ -456,7 +456,8 @@ def _main() -> int:
     arguments = parser.parse_args()
     try:
         config = load_config(arguments.config)
-        preflight = run_live_storage_preflight(config, identity_path=arguments.identity)
+        identity_path = arguments.identity.as_posix()
+        preflight = run_live_storage_preflight(config, identity_path=identity_path)
         report = quiesce_for_rollback(
             config,
             preflight,
@@ -465,7 +466,7 @@ def _main() -> int:
             boot_id=read_boot_id(),
             preflight_refresh=lambda: run_live_storage_preflight(
                 config,
-                identity_path=arguments.identity,
+                identity_path=identity_path,
             ),
             max_passes=arguments.max_passes,
         )

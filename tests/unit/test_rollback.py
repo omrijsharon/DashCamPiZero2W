@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,75 @@ UUID_TEXT = "7EED-3EA7"
 
 def test_quiesce_uses_the_installed_storage_identity_by_default() -> None:
     assert Path("/etc/dashcam/storage-volume.env") == DEFAULT_IDENTITY_PATH
+
+
+def test_quiesce_cli_passes_identity_to_preflight_as_a_posix_string(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed: list[str] = []
+    config = DashcamConfig()
+    preflight = object()
+    guard = rollback_module.RollbackGuardReport(
+        volume_uuid=UUID_TEXT,
+        device_id="1:2",
+        capacity_bytes=CAPACITY,
+        free_bytes=FREE,
+        high_free_bytes=HIGH,
+        catalog_schema=5,
+        finalized_clips_examined=0,
+    )
+    report = rollback_module.RollbackQuiesceReport(
+        schema_before=5,
+        schema_after=5,
+        passes=1,
+        intents_examined=0,
+        actions_attempted=0,
+        expired_leases_cleared=0,
+        orphaned_writing_demoted=0,
+        latch_initialized=False,
+        guard=guard,
+    )
+
+    def live_preflight(_config: DashcamConfig, *, identity_path: str) -> object:
+        assert isinstance(identity_path, str)
+        observed.append(identity_path)
+        return preflight
+
+    def quiesce(_config: DashcamConfig, _preflight: object, **kwargs: object) -> object:
+        refresh = kwargs["preflight_refresh"]
+        assert callable(refresh)
+        assert refresh() is preflight
+        return report
+
+    monkeypatch.setattr(rollback_module, "load_config", lambda _path: config)
+    monkeypatch.setattr(rollback_module, "run_live_storage_preflight", live_preflight)
+    monkeypatch.setattr(rollback_module, "quiesce_for_rollback", quiesce)
+    monkeypatch.setattr(rollback_module, "read_boot_id", lambda: BOOT_ID)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dashcam.rollback",
+            "quiesce",
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--identity",
+            "/var/lib/dashcam/storage-volume.env",
+            "--catalog",
+            str(tmp_path / "catalog.sqlite3"),
+            "--control-socket",
+            str(tmp_path / "control.sock"),
+        ],
+    )
+
+    assert rollback_module._main() == 0
+    assert observed == [
+        "/var/lib/dashcam/storage-volume.env",
+        "/var/lib/dashcam/storage-volume.env",
+    ]
+    assert '"ready": true' in capsys.readouterr().out
 
 
 def _space() -> tuple[int, int]:

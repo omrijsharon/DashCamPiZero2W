@@ -2123,9 +2123,10 @@ def test_each_live_crossing_starts_in_a_fresh_writing_interval() -> None:
     phase = source[source.index("def _phase_a(") : source.index("def _rollback_phase(")]
 
     assert phase.count("_wait_fresh_writing(catalog, root)") == 3
-    assert 'initial_id = initial.get("clip_id")' in source
-    assert 'row["clip_id"] != initial_id' in source
-    assert "timeout: float = 70" in source
+    assert "metadata.st_size <= maximum_size_bytes" in source
+    assert "metadata.st_dev == root_device" in source
+    assert "maximum_size_bytes: int = 16 * 1024**2" in source
+    assert "timeout: float = 95" in source
 
 
 def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:

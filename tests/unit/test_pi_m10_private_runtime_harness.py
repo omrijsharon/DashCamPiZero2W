@@ -626,6 +626,9 @@ def test_candidate_transient_unit_matches_private_production_contract(tmp_path: 
     assert f"{runtime.as_posix()}:/run/dashcam" in text
     assert sum(prop.startswith("BindPaths=") for prop in properties) == 1
     assert not any(prop.startswith("ReadWritePaths=") for prop in properties)
+    adapter = next(prop for prop in properties if prop.startswith("BindReadOnlyPaths="))
+    assert "/usr/bin/findmnt:/usr/libexec/dashcam-m10-findmnt-real" in adapter
+    assert f"{recording.parent.as_posix()}/bundle/run.py:/usr/bin/findmnt" in adapter
     assert "StateDirectory=" not in text
     assert "RuntimeDirectory=" not in text
 
@@ -669,6 +672,108 @@ def test_bind_source_allowlist_refuses_production_or_foreign_paths() -> None:
             runtime_source=Path("/run/dashcam"),
             role="candidate",
         )
+
+
+def test_private_findmnt_adapter_selects_only_active_device_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = {"target", "source", "fstype", "label", "uuid", "options", "maj:min"}
+    hidden = {key: None for key in keys}
+    hidden.update(
+        {"target": "/srv/dashcam", "source": "/dev/mmcblk0p3", "maj:min": "179:3"}
+    )
+    active = {key: None for key in keys}
+    active.update({"target": "/srv/dashcam", "source": "/dev/loop7", "maj:min": "7:7"})
+    observed = SimpleNamespace(
+        returncode=0,
+        stderr=b"",
+        stdout=run.canonical_json({"filesystems": [hidden, active]}),
+    )
+    output = io.BytesIO()
+    monkeypatch.setattr(run.subprocess, "run", lambda *_args, **_kwargs: observed)
+    monkeypatch.setattr(run.os, "stat", lambda _path: SimpleNamespace(st_dev=77))
+    monkeypatch.setattr(run.os, "major", lambda _device: 7, raising=False)
+    monkeypatch.setattr(run.os, "minor", lambda _device: 7, raising=False)
+    monkeypatch.setattr(run.sys, "stdout", SimpleNamespace(buffer=output))
+
+    assert run._findmnt_adapter(
+        (
+            "--json",
+            "--mountpoint",
+            "/srv/dashcam",
+            "--output",
+            "TARGET,SOURCE,FSTYPE,LABEL,UUID,OPTIONS,MAJ:MIN",
+        )
+    ) == 0
+    assert output.getvalue() == run.canonical_json({"filesystems": [active]})
+    assert run._findmnt_adapter(("--json", "--target", "/srv/dashcam")) == 2
+
+
+@pytest.mark.parametrize(
+    "document",
+    (
+        {"filesystems": []},
+        {"filesystems": [{"target": "/srv/dashcam"}]},
+        {
+            "filesystems": [
+                {
+                    "target": "/srv/dashcam",
+                    "source": "/dev/loop6",
+                    "fstype": "exfat",
+                    "label": "M10PRIVATE",
+                    "uuid": "1111-2222",
+                    "options": "rw",
+                    "maj:min": "7:6",
+                }
+            ]
+        },
+        {
+            "filesystems": [
+                {
+                    "target": "/srv/dashcam",
+                    "source": "/dev/loop7",
+                    "fstype": "exfat",
+                    "label": "M10PRIVATE",
+                    "uuid": "1111-2222",
+                    "options": "rw",
+                    "maj:min": "7:7",
+                },
+                {
+                    "target": "/srv/dashcam",
+                    "source": "/dev/loop8",
+                    "fstype": "exfat",
+                    "label": "M10PRIVATE",
+                    "uuid": "3333-4444",
+                    "options": "rw",
+                    "maj:min": "7:7",
+                },
+            ]
+        },
+        {"filesystems": [], "unexpected": "private"},
+    ),
+)
+def test_private_findmnt_adapter_refuses_nonexact_or_ambiguous_rows(
+    monkeypatch: pytest.MonkeyPatch, document: dict[str, object]
+) -> None:
+    observed = SimpleNamespace(
+        returncode=0,
+        stderr=b"",
+        stdout=run.canonical_json(document),
+    )
+    monkeypatch.setattr(run.subprocess, "run", lambda *_args, **_kwargs: observed)
+    monkeypatch.setattr(run.os, "stat", lambda _path: SimpleNamespace(st_dev=77))
+    monkeypatch.setattr(run.os, "major", lambda _device: 7, raising=False)
+    monkeypatch.setattr(run.os, "minor", lambda _device: 7, raising=False)
+
+    assert run._findmnt_adapter(
+        (
+            "--json",
+            "--mountpoint",
+            "/srv/dashcam",
+            "--output",
+            "TARGET,SOURCE,FSTYPE,LABEL,UUID,OPTIONS,MAJ:MIN",
+        )
+    ) == 2
 
 
 def test_clean_storage_safety_stop_requires_zero_restart_and_success() -> None:
@@ -1706,6 +1811,7 @@ def test_result_claims_remain_explicit_and_false_for_unexercised_surfaces() -> N
         assert claim in source
     assert '"conditions_property": "[unprintable]"' in source
     assert '"conditions_property_parsed": False' in source
+    assert '"findmnt_active_row_adapter_used": True' in source
 
 
 def test_rollback_output_is_opened_inside_private_namespace() -> None:

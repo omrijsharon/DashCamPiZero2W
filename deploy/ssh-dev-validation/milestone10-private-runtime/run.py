@@ -201,6 +201,7 @@ IDENTITY_PATH: Final = Path("/var/lib/dashcam/storage-volume.env")
 LAUNCHER_PATH: Final = Path("/var/lib/dashcam/source-launcher.py")
 CANDIDATE_ARCHIVE_PATH: Final = Path("/var/lib/dashcam/candidate-source.zip")
 ROLLBACK_ARCHIVE_PATH: Final = Path("/var/lib/dashcam/rollback-source.zip")
+REAL_FINDMNT_PATH: Final = Path("/usr/libexec/dashcam-m10-findmnt-real")
 LIVE_LOCKS: Final = (
     Path("/run/lock/dashcam-live-qualification.lock"),
     Path("/run/dashcam-m10-retention-loop.lock"),
@@ -847,6 +848,11 @@ def render_transient_properties(
         f"BindPaths={sources[0]}:/srv/dashcam "
         f"{sources[1]}:/var/lib/dashcam {sources[2]}:/run/dashcam"
     )
+    adapter_source = recording_source.parent / "bundle" / "run.py"
+    findmnt_adapter = (
+        f"BindReadOnlyPaths=/usr/bin/findmnt:{REAL_FINDMNT_PATH.as_posix()} "
+        f"{adapter_source.as_posix()}:/usr/bin/findmnt"
+    )
     properties = [
         "User=dashcam",
         "Group=dashcam",
@@ -876,6 +882,7 @@ def render_transient_properties(
         "MemoryDenyWriteExecute=yes",
         "RestrictAddressFamilies=AF_UNIX",
         bind_paths,
+        findmnt_adapter,
         "WorkingDirectory=/var/lib/dashcam",
     ]
     if camera:
@@ -1392,6 +1399,71 @@ def _require_root_identity(*, minimum_free: int = ROOT_PRESERVED_FREE_BYTES) -> 
     if free < minimum_free:
         raise HarnessError("root reserve gate refused a mutation")
     return free
+
+
+def _findmnt_adapter(argv: Sequence[str]) -> int:
+    expected = (
+        "--json",
+        "--mountpoint",
+        "/srv/dashcam",
+        "--output",
+        "TARGET,SOURCE,FSTYPE,LABEL,UUID,OPTIONS,MAJ:MIN",
+    )
+    if tuple(argv) != expected:
+        return 2
+    try:
+        result = subprocess.run(
+            (REAL_FINDMNT_PATH, *expected),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=3,
+            env={"LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
+        if (
+            result.returncode != 0
+            or result.stderr
+            or len(result.stdout) > 16 * 1024
+        ):
+            return 2
+        duplicates = False
+
+        def pairs(pairs_value: list[tuple[str, object]]) -> dict[str, object]:
+            nonlocal duplicates
+            value: dict[str, object] = {}
+            for key, item in pairs_value:
+                if key in value:
+                    duplicates = True
+                value[key] = item
+            return value
+
+        document = json.loads(result.stdout.decode("utf-8"), object_pairs_hook=pairs)
+        rows = (
+            document.get("filesystems")
+            if isinstance(document, dict) and set(document) == {"filesystems"}
+            else None
+        )
+        if duplicates or not isinstance(rows, list) or not 1 <= len(rows) <= 2:
+            return 2
+        expected_keys = {"target", "source", "fstype", "label", "uuid", "options", "maj:min"}
+        if any(not isinstance(row, dict) or set(row) != expected_keys for row in rows):
+            return 2
+        metadata = os.stat("/srv/dashcam")
+        major = cast(Callable[[int], int], getattr(os, "major"))  # noqa: B009
+        minor = cast(Callable[[int], int], getattr(os, "minor"))  # noqa: B009
+        device_id = f"{major(metadata.st_dev)}:{minor(metadata.st_dev)}"
+        matches = [
+            row
+            for row in rows
+            if row.get("target") == "/srv/dashcam" and row.get("maj:min") == device_id
+        ]
+        if len(matches) != 1:
+            return 2
+        sys.stdout.buffer.write(canonical_json({"filesystems": matches}))
+        sys.stdout.buffer.flush()
+        return 0
+    except Exception:
+        return 2
 
 
 def _findmnt(path: Path) -> dict[str, object]:
@@ -2625,8 +2697,26 @@ def _install_private_state(
     }
 
 
-BIND_PROBE = b"""import json,os
-p={"srv_dev":os.stat("/srv/dashcam").st_dev,"state_dev":os.stat("/var/lib/dashcam").st_dev,"run_dev":os.stat("/run/dashcam").st_dev,"srv_w":os.access("/srv/dashcam",os.W_OK),"state_w":os.access("/var/lib/dashcam",os.W_OK),"run_w":os.access("/run/dashcam",os.W_OK)}
+BIND_PROBE = b"""import json,os,subprocess
+observed=os.stat("/srv/dashcam").st_dev
+device=f"{os.major(observed)}:{os.minor(observed)}"
+result=subprocess.run(("/usr/bin/findmnt","--json","--mountpoint","/srv/dashcam","--output","TARGET,SOURCE,FSTYPE,LABEL,UUID,OPTIONS,MAJ:MIN"),check=False,capture_output=True,timeout=3,env={"LC_ALL":"C","PATH":"/usr/sbin:/usr/bin:/sbin:/bin"})
+value=(
+ json.loads(result.stdout.decode("ascii"))
+ if result.returncode==0 and not result.stderr
+ else None
+)
+rows=value.get("filesystems") if isinstance(value,dict) else None
+p={
+ "srv_dev":observed,
+ "state_dev":os.stat("/var/lib/dashcam").st_dev,
+ "run_dev":os.stat("/run/dashcam").st_dev,
+ "srv_w":os.access("/srv/dashcam",os.W_OK),
+ "state_w":os.access("/var/lib/dashcam",os.W_OK),
+ "run_w":os.access("/run/dashcam",os.W_OK),
+ "findmnt_single":isinstance(rows,list) and len(rows)==1,
+ "findmnt_device":isinstance(rows,list) and len(rows)==1 and rows[0].get("maj:min")==device,
+}
 f=os.open("/run/dashcam/bind-proof.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 os.write(f,(json.dumps(p,sort_keys=True,separators=(",",":"))+"\\n").encode("ascii"));os.fsync(f);os.close(f)
 """
@@ -2745,10 +2835,30 @@ def _run_bind_probe(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
             raise HarnessError("private BindPaths qualification failed")
         proof = _strict_json(_bounded_read(runtime / "bind-proof.json", 4096), "bind proof")
         if (
-            proof.get("srv_dev") != paths["recording"].stat().st_dev
+            set(proof)
+            != {
+                "srv_dev",
+                "state_dev",
+                "run_dev",
+                "srv_w",
+                "state_w",
+                "run_w",
+                "findmnt_single",
+                "findmnt_device",
+            }
+            or proof.get("srv_dev") != paths["recording"].stat().st_dev
             or proof.get("state_dev") != state.stat().st_dev
             or proof.get("run_dev") != runtime.stat().st_dev
-            or any(proof.get(key) is not True for key in ("srv_w", "state_w", "run_w"))
+            or any(
+                proof.get(key) is not True
+                for key in (
+                    "srv_w",
+                    "state_w",
+                    "run_w",
+                    "findmnt_single",
+                    "findmnt_device",
+                )
+            )
         ):
             raise HarnessError("private bind device/writeability proof differs")
         return proof
@@ -5311,6 +5421,7 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
                 "root_free_before_bytes": root_free_before,
                 "root_free_after_bytes": root_free_after,
                 "private_bind_paths": True,
+                "findmnt_active_row_adapter_used": True,
                 "production_paths_read_only_and_unchanged": True,
             },
             "phases": phase_results,
@@ -5498,6 +5609,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global _qualification_deadline_ns
+    if Path(sys.argv[0]).name == "findmnt":
+        return _findmnt_adapter(sys.argv[1:] if argv is None else argv)
     arguments = _parser().parse_args(argv)
     try:
         if arguments.recover_work is not None:

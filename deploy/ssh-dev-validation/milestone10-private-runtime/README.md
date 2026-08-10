@@ -52,6 +52,14 @@ transient unit's private mount namespace. It does not use `StateDirectory=` or
 read-only for exact before/after hashes; transient candidate and rollback code
 see only the private bindings.
 
+Because the inherited production mount remains as a hidden lower mount row in
+that namespace, transient units bind the exact reviewed harness over
+`/usr/bin/findmnt`. This adapter accepts only the production preflight argv,
+calls the real binary at a read-only private bind, and returns only the single
+row whose `maj:min` equals `stat(/srv/dashcam)`. The pre-camera bind probe
+requires one normalized row and exact device equality; every other shape
+refuses before camera startup.
+
 On this exact systemd 257 stack, `systemctl show` serializes the structured
 `Conditions` property only as the exact sentinel `[unprintable]`. The harness
 requires that sentinel and records `conditions_property_parsed=false`; it does

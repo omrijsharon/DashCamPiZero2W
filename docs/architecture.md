@@ -425,6 +425,30 @@ interfaces:
   is not deployable while the Milestone 9 resource gate and production
   listener/web integration gates remain open. Evidence:
   `docs/test-reports/2026-08-10-milestone10-control-component-live.md`.
+
+  The final Milestone 10 qualification ran the hash-closed production candidate
+  in transient service-identity units with private loop-backed exFAT and ext4
+  bind mounts, the real camera, `v4l2h264enc`, and the production recorder-owned
+  control listener. Startup converged a pending `FINALIZE` before reclaim and
+  reached recording in 20.99 seconds. Deletion progressed while the active
+  `WRITING` identity and members remained untouched; protected, leased,
+  current, and event-NEXT targets remained excluded. The listener protected
+  exact previous two/current/next one, including idempotent retry and successor
+  convergence. Three independently hardware-decoded, IDR-first clips retained
+  strictly increasing PTS/DTS, zero adjacent normalized gaps, and zero runtime
+  drops or restarts. Separate fresh fixtures proved clean pre-camera/listener
+  `STORAGE_SAFETY_STOP` with eight byte-identical protected pairs and bounded a
+  65-intent startup backlog to exactly 64 completed plus one pending. A
+  separately hash-closed schema-5 rollback companion then quiesced and admitted
+  the phase-A private state before opening the real camera/encoder without the
+  candidate listener. Together with the prior durable `FINALIZING` exclusion,
+  unknown-file, process-`SIGKILL`, lease, and pair-intent authorities, this
+  closes Milestone 10. It does not claim physical power loss,
+  camera-generated `FINALIZING` overlap, installation against production
+  media/catalog, HTTP/UI, or an M11 download byte data plane. The accepted
+  installed release remains dormant `5f95`, and Milestone 9 remains open.
+  Evidence:
+  `docs/test-reports/2026-08-10-milestone10-private-runtime-live.md`.
 - Overlay formatting consumes one coherent telemetry snapshot and emits bounded
   text/layout data. The first pre-encoder `textoverlay` source slice bound
   initial state before PLAYING and used a queue-free optional worker, but its
@@ -441,10 +465,10 @@ A/V, and repeated logical microphone-loss/restoration evidence. Direct dynamic
 audio-pad mutation remains refused; immutable-generation/IDR handoff with
 bounded three-slot recycling is selected. Microphone-absent startup has passed;
 physical hot-unplug/replug is outside current acceptance. Remaining work
-includes exact-Pi overlay qualification, deployable production listener and
-web/download-data-plane integration, active-recording and safety-stop retention
-qualification, the physical power-loss matrix, actual service-UID socket
-ownership, HTTP serving, preview, and the privileged removal helper.
+includes the Milestone 9 resource exit gate, installation/deployment decisions
+for the qualified Milestone 10 candidate and rollback companion, physical
+power-loss qualification, the M11 web/download data plane, HTTP serving,
+preview, and the privileged removal helper.
 
 ## Structured logging convention
 

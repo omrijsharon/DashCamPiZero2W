@@ -211,6 +211,29 @@
   evidence. Root available space after cleanup was 2,765,840,384 bytes and the
   bounded host pre/post digest beginning `428a0f7e` matched. Evidence:
   `docs/test-reports/2026-08-10-milestone10-control-component-live.md`.
+- Milestone 10 is complete through combined component and private-runtime
+  authority. Hash-closed harness `c8a01e3173010480c42250200a7ddbc32fcd5ee7`
+  ran production candidate `3d027042c798c6dd7d92e3701689862f28ed2d9e`
+  and rollback companion `5268bd8e2f0dfe18d2a70ec142af45e8198b3f1a`
+  in private loop-backed exFAT/ext4 mounts on the verified Pi. The candidate
+  reached real camera/hardware-H.264 recording in 20.99 seconds, retained an
+  active `WRITING` clip while deletion progressed, protected exact previous
+  two/current/next one through the service-identity Unix listener, and produced
+  three decoded IDR-first clips with zero adjacent normalized gaps and zero
+  runtime drops/restarts. Eight protected pairs remained byte-identical below
+  emergency pressure while the candidate stopped before camera/listener with
+  status 0 and no restart. A 65-intent startup fixture completed exactly 64 and
+  left one durably pending before the same clean stop. The schema-5 rollback
+  quiesce/guard and real camera/encoder start also passed. Accepted result
+  `/var/tmp/m10-private-runtime-c8a01e317301.json` is 5,844 bytes, mode/owner
+  `0600 root:root`, and SHA-256
+  `3ed369ebd44d1370e094548613985b1c98da0a1911da5d98e5a062ff55046bad`.
+  Production paths and installed release were unchanged; `5f95` remains
+  enabled/inactive. This is not physical-power-loss, camera-generated
+  `FINALIZING` overlap, physical GPS/audio, HTTP/UI, or M11 download-data-plane
+  evidence, and it does not close the independent Milestone 9 resource gate.
+  Evidence:
+  `docs/test-reports/2026-08-10-milestone10-private-runtime-live.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

@@ -569,7 +569,26 @@ def test_candidate_and_rollback_configs_are_deliberately_distinct() -> None:
         assert value in rollback
     assert "download_lease_timeout_s = 300" in candidate
     assert "download_lease_timeout_s" not in rollback
-    assert "/run/dashcam/gps-deliberately-absent" in candidate
+    for config in (candidate, rollback):
+        assert 'device = "/dev/dashcam-gps-deliberately-absent"' in config
+        assert "/run/dashcam/gps-deliberately-absent" not in config
+
+
+def test_generated_configs_reach_exact_candidate_parser_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(ROOT / "src"))
+    from dashcam.config import ConfigError, parse_config_toml
+
+    candidate = parse_config_toml(run._config(rollback=False).decode("ascii"))
+
+    assert candidate.gps.device == "/dev/dashcam-gps-deliberately-absent"
+    assert candidate.storage.download_lease_timeout_s == 300
+    with pytest.raises(
+        ConfigError,
+        match=r"storage is missing required key: download_lease_timeout_s",
+    ):
+        parse_config_toml(run._config(rollback=True).decode("ascii"))
 
 
 def _paths(tmp_path: Path) -> tuple[Path, Path, Path]:

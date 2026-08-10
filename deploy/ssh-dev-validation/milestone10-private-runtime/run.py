@@ -530,7 +530,7 @@ codec = "aac"
 bitrate_bps = 128000
 
 [gps]
-device = "/run/dashcam/gps-deliberately-absent"
+device = "/dev/dashcam-gps-deliberately-absent"
 baud = 115200
 stale_after_s = 2.0
 max_sample_hz = 10

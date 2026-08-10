@@ -1764,6 +1764,69 @@ def test_refusal_line_skips_command_frame_for_exact_reviewed_caller(
         assert private not in payload
 
 
+def test_refusal_line_skips_command_and_systemd_wrappers_for_bind_probe_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = run.subprocess.CompletedProcess(
+        ["/usr/bin/systemd-run", "--property", "Environment=PSK=hunter2"],
+        7,
+        stdout=b"SSID MyHome coordinates 32.1,34.8",
+        stderr=b"token abcdef /private/systemd/path",
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "pwd",
+        SimpleNamespace(getpwnam=lambda _name: SimpleNamespace(pw_uid=42, pw_gid=43)),
+    )
+    monkeypatch.setattr(run, "_write_exclusive", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "render_transient_properties",
+        lambda **_kwargs: ("Environment=PRIVATE_TOKEN=abcdef",),
+    )
+    monkeypatch.setattr(run, "_remove_unit", lambda _unit: None)
+    monkeypatch.setattr(run.subprocess, "run", lambda *_args, **_kwargs: completed)
+    paths = {
+        "state": Path("/private/state"),
+        "runtime": Path("/private/runtime"),
+        "recording": Path("/private/recording"),
+    }
+
+    try:
+        run._run_bind_probe("123456789abc", paths)
+    except run.HarnessError as error:
+        traceback = error.__traceback__
+        frames: list[tuple[str, int]] = []
+        while traceback is not None:
+            frames.append((traceback.tb_frame.f_code.co_name, traceback.tb_lineno))
+            traceback = traceback.tb_next
+        caller_line = next(line for name, line in frames if name == "_run_bind_probe")
+        payload = run._refusal_line(error)
+    else:
+        pytest.fail("nonzero systemd-run unexpectedly succeeded")
+
+    frame_names = {name for name, _line in frames}
+    assert {"_run_bind_probe", "_systemd_run", "_command"} <= frame_names
+    reviewed = run._reviewed_function_lines()
+    assert "systemd_run" not in reviewed
+    assert "command" not in reviewed
+    assert payload == f"REFUSED: H_HARNESS_Frun_bind_probe_L{caller_line}\n".encode("ascii")
+    assert run._validated_refusal_location(payload) == payload
+    for private in (
+        b"MyHome",
+        b"hunter2",
+        b"32.1",
+        b"34.8",
+        b"abcdef",
+        b"/private",
+        b"Environment",
+        b"returncode",
+        b"stdout",
+        b"stderr",
+    ):
+        assert private not in payload
+
+
 def test_fixture_subprocess_relays_only_exact_self_validated_child_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

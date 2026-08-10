@@ -123,7 +123,6 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "cleanup_fixture",
     "discard_fixture",
     "install_private_state",
-    "systemd_run",
     "wait_unit_terminal",
     "wait_recording",
     "remove_unit",

@@ -1195,6 +1195,151 @@ def test_worker_emits_the_closed_crash_cell_diagnostic(
     assert b"private child detail" not in captured[0]
 
 
+def test_lease_client_refusal_exposes_only_closed_state_hashes_and_reviewed_child() -> None:
+    reviewed_line = min(harness._reviewed_function_lines()["lease_client"])
+    child = f"REFUSED: H_OS_Flease_client_L{reviewed_line}\n".encode("ascii")
+    error = harness.LeaseClientContractError(
+        state="CONFIRM_MISMATCH_EXITED",
+        returncode=2,
+        stdout=b"",
+        stderr=child,
+    )
+
+    line = harness._lease_client_refusal_line(error)
+
+    assert harness._safe_worker_refusal_detail(line) == line[:-1].decode("ascii")
+    assert b"state=CONFIRM_MISMATCH_EXITED" in line
+    assert b"returncode=2" in line
+    assert f"child=H_OS_Flease_client_L{reviewed_line}".encode("ascii") in line
+    assert child not in line
+    assert hashlib.sha256(child).hexdigest().encode("ascii") in line
+
+
+def test_lease_client_refusal_digests_arbitrary_child_output() -> None:
+    private = b"SSID=MyHome PSK=hunter2 token=secret\n/private/path\n"
+    error = harness.LeaseClientContractError(
+        state="CONFIRM_TIMEOUT_RUNNING",
+        returncode=-harness.SIGKILL_NUMBER,
+        stdout=b"",
+        stderr=private,
+    )
+
+    line = harness._lease_client_refusal_line(error)
+
+    assert harness._safe_worker_refusal_detail(line) == line[:-1].decode("ascii")
+    assert b"child=H_DIGEST_ONLY" in line
+    assert hashlib.sha256(private).hexdigest().encode("ascii") in line
+    for secret in (b"MyHome", b"hunter2", b"secret", b"/private"):
+        assert secret not in line
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (b"returncode=2", b"returncode=02"),
+        (b"stdout_bytes=0", b"stdout_bytes=00"),
+        (b"stderr_bytes=0", b"stderr_bytes=00"),
+        (b"returncode=2", b"returncode=-0"),
+        (b"state=CONFIRM_MISMATCH_EXITED", b"state=CONFIRM_TIMEOUT_RUNNING"),
+    ],
+)
+def test_parent_rejects_noncanonical_or_contradictory_lease_diagnostic(
+    original: bytes,
+    replacement: bytes,
+) -> None:
+    valid = harness._lease_client_refusal_line(
+        harness.LeaseClientContractError(
+            state="CONFIRM_MISMATCH_EXITED",
+            returncode=2,
+            stdout=b"",
+            stderr=b"",
+        )
+    )
+    mutated = valid.replace(original, replacement, 1)
+    assert mutated != valid
+
+    detail = harness._safe_worker_refusal_detail(mutated)
+
+    assert detail == (
+        "worker-stderr-sha256="
+        + hashlib.sha256(mutated).hexdigest()
+        + f",bytes={len(mutated)}"
+    )
+
+
+def test_parent_rejects_forged_lease_child_location_or_hash() -> None:
+    reviewed_line = min(harness._reviewed_function_lines()["lease_client"])
+    child = f"REFUSED: H_OS_Flease_client_L{reviewed_line}\n".encode("ascii")
+    valid = harness._lease_client_refusal_line(
+        harness.LeaseClientContractError(
+            state="CONFIRM_MISMATCH_EXITED",
+            returncode=2,
+            stdout=b"",
+            stderr=child,
+        )
+    )
+    for mutated in (
+        valid.replace(
+            f"_L{reviewed_line}".encode("ascii"),
+            f"_L{max(harness._reviewed_function_lines()['lease_client']) + 1}".encode(
+                "ascii"
+            ),
+            1,
+        ),
+        valid.replace(
+            hashlib.sha256(child).hexdigest().encode("ascii"),
+            b"0" * 64,
+            1,
+        ),
+    ):
+        detail = harness._safe_worker_refusal_detail(mutated)
+        assert detail.startswith("worker-stderr-sha256=")
+        assert "H_LEASE_CLIENT" not in detail
+
+
+def test_abandoned_lease_confirmation_timeout_kills_joins_and_reports_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[object] = []
+    sigkill = cast(int, harness.SIGKILL_NUMBER)
+
+    class Process:
+        stdout = io.BytesIO(b"")
+        stderr = io.BytesIO(b"private child output")
+        finished = False
+
+        def poll(self) -> int | None:
+            return -sigkill if self.finished else None
+
+        def kill(self) -> None:
+            calls.append("kill")
+            self.finished = True
+
+        def wait(self, *, timeout: int) -> int:
+            calls.append(("wait", timeout))
+            assert self.finished
+            return -sigkill
+
+    process = Process()
+    monkeypatch.setattr(harness.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(harness.select, "select", lambda *_args, **_kwargs: ([], [], []))
+
+    with pytest.raises(harness.LeaseClientContractError) as captured:
+        harness._run_abandoned_lease_client(
+            bundle=tmp_path,
+            work=tmp_path,
+            expected_manifest_sha256="a" * 64,
+            expected_commit="b" * 40,
+        )
+
+    assert captured.value.state == "CONFIRM_TIMEOUT_RUNNING"
+    assert captured.value.returncode == -sigkill
+    assert captured.value.stdout == b""
+    assert captured.value.stderr == b"private child output"
+    assert calls == ["kill", ("wait", 5)]
+
+
 @pytest.mark.parametrize(
     "value",
     [

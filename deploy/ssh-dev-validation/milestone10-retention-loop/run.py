@@ -69,6 +69,24 @@ CRASH_CELL_REFUSAL_RE: Final = re.compile(
     rb"stdout_sha256=([0-9a-f]{64}) stderr_bytes=([0-9]{1,3}) "
     rb"stderr_sha256=([0-9a-f]{64}) failed=([01]{4})\n"
 )
+LEASE_CLIENT_STATES: Final = frozenset(
+    {
+        "CONFIRM_TIMEOUT_RUNNING",
+        "CONFIRM_MISMATCH_RUNNING",
+        "CONFIRM_MISMATCH_EXITED",
+        "POST_CONFIRM_CONTRACT",
+    }
+)
+LEASE_CLIENT_REFUSAL_RE: Final = re.compile(
+    rb"REFUSED: H_LEASE_CLIENT "
+    rb"state=(CONFIRM_TIMEOUT_RUNNING|CONFIRM_MISMATCH_RUNNING|"
+    rb"CONFIRM_MISMATCH_EXITED|POST_CONFIRM_CONTRACT) "
+    rb"returncode=(-?[0-9]{1,3}) stdout_bytes=([0-9]{1,3}) "
+    rb"stdout_sha256=([0-9a-f]{64}) stderr_bytes=([0-9]{1,3}) "
+    rb"stderr_sha256=([0-9a-f]{64}) "
+    rb"child=(H_(?:HARNESS|OS|UNICODE|ZIP|VALUE|ASSERT|ATTRIBUTE|KEY|RUNTIME|TYPE|"
+    rb"EXCEPTION)_F[a-z][a-z0-9_]*_L[1-9][0-9]{0,3}|H_DIGEST_ONLY)\n"
+)
 MAX_REVIEWED_RUN_LINE: Final = 8192
 WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "worker",
@@ -88,6 +106,7 @@ WORKER_DIAGNOSTIC_FUNCTIONS: Final = (
     "validate_control_response",
     "cleanup_control_runtime_directory",
     "arm_parent_death_sigkill",
+    "lease_client",
     "matrix_g",
     "write_result",
     "load_commit_source",
@@ -257,6 +276,24 @@ class CrashCellContractError(HarnessError):
         self.stdout = stdout
         self.stderr = stderr
         self.failed_mask = failed_mask
+
+
+class LeaseClientContractError(HarnessError):
+    """The bounded lease child missed its confirmation or loss contract."""
+
+    def __init__(
+        self,
+        *,
+        state: str,
+        returncode: int,
+        stdout: bytes,
+        stderr: bytes,
+    ) -> None:
+        super().__init__("lease client missed its closed process contract")
+        self.state = state
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,12 +824,8 @@ def _run(
 def _safe_worker_refusal_detail(stderr: bytes) -> str:
     if not isinstance(stderr, bytes):
         return "worker-stderr-unavailable"
-    match = WORKER_REFUSAL_RE.fullmatch(stderr)
-    if match is not None:
-        function = match.group(2).decode("ascii")
-        line = int(match.group(3))
-        if line in _reviewed_function_lines().get(function, frozenset()):
-            return stderr[:-1].decode("ascii")
+    if _validated_worker_refusal_token(stderr) is not None:
+        return stderr[:-1].decode("ascii")
     crash_match = CRASH_CELL_REFUSAL_RE.fullmatch(stderr)
     if crash_match is not None:
         returncode_token = crash_match.group(3).decode("ascii")
@@ -825,7 +858,79 @@ def _safe_worker_refusal_detail(stderr: bytes) -> str:
             and failed_mask != b"0000"
         ):
             return stderr[:-1].decode("ascii")
+    lease_match = LEASE_CLIENT_REFUSAL_RE.fullmatch(stderr)
+    if lease_match is not None:
+        state = lease_match.group(1).decode("ascii")
+        returncode_token = lease_match.group(2).decode("ascii")
+        stdout_bytes_token = lease_match.group(3).decode("ascii")
+        stderr_bytes_token = lease_match.group(5).decode("ascii")
+        returncode = int(returncode_token)
+        stdout_bytes = int(stdout_bytes_token)
+        stdout_sha256 = lease_match.group(4).decode("ascii")
+        stderr_bytes = int(stderr_bytes_token)
+        stderr_sha256 = lease_match.group(6).decode("ascii")
+        child = lease_match.group(7)
+        empty_sha256 = _sha256(b"")
+        confirmation_sha256 = _sha256(CONTROL_CLIENT_CONFIRMATION)
+        canonical_numbers = (
+            returncode_token == str(returncode)
+            and stdout_bytes_token == str(stdout_bytes)
+            and stderr_bytes_token == str(stderr_bytes)
+        )
+        bounded = (
+            -255 <= returncode <= 255
+            and 0 <= stdout_bytes <= 513
+            and 0 <= stderr_bytes <= 513
+            and (stdout_bytes != 0 or stdout_sha256 == empty_sha256)
+            and (stderr_bytes != 0 or stderr_sha256 == empty_sha256)
+        )
+        confirmation_matches = (
+            stdout_bytes == len(CONTROL_CLIENT_CONFIRMATION)
+            and stdout_sha256 == confirmation_sha256
+        )
+        state_matches = (
+            (
+                state == "CONFIRM_TIMEOUT_RUNNING"
+                and returncode == -SIGKILL_NUMBER
+                and stdout_bytes == 0
+                and stdout_sha256 == empty_sha256
+            )
+            or (
+                state in {"CONFIRM_MISMATCH_RUNNING", "CONFIRM_MISMATCH_EXITED"}
+                and not confirmation_matches
+                and (
+                    state != "CONFIRM_MISMATCH_RUNNING"
+                    or returncode == -SIGKILL_NUMBER
+                )
+            )
+            or (
+                state == "POST_CONFIRM_CONTRACT"
+                and confirmation_matches
+                and (returncode != -SIGKILL_NUMBER or stderr_bytes != 0)
+            )
+        )
+        child_matches = child == b"H_DIGEST_ONLY"
+        if child != b"H_DIGEST_ONLY":
+            reconstructed = b"REFUSED: " + child + b"\n"
+            child_matches = (
+                _validated_worker_refusal_token(reconstructed) is not None
+                and stderr_bytes == len(reconstructed)
+                and stderr_sha256 == _sha256(reconstructed)
+            )
+        if canonical_numbers and bounded and state_matches and child_matches:
+            return stderr[:-1].decode("ascii")
     return f"worker-stderr-sha256={_sha256(stderr)},bytes={len(stderr)}"
+
+
+def _validated_worker_refusal_token(stderr: bytes) -> bytes | None:
+    match = WORKER_REFUSAL_RE.fullmatch(stderr)
+    if match is None:
+        return None
+    function = match.group(2).decode("ascii")
+    line = int(match.group(3))
+    if line not in _reviewed_function_lines().get(function, frozenset()):
+        return None
+    return stderr[len(b"REFUSED: ") : -1]
 
 
 def _crash_cell_refusal_line(error: CrashCellContractError) -> bytes:
@@ -849,6 +954,57 @@ def _crash_cell_refusal_line(error: CrashCellContractError) -> bytes:
         f"stderr_bytes={len(error.stderr)} stderr_sha256={_sha256(error.stderr)} "
         f"failed={error.failed_mask}\n"
     ).encode("ascii")
+
+
+def _lease_client_refusal_line(error: LeaseClientContractError) -> bytes:
+    confirmation_matches = (
+        len(error.stdout) == len(CONTROL_CLIENT_CONFIRMATION)
+        and _sha256(error.stdout) == _sha256(CONTROL_CLIENT_CONFIRMATION)
+    )
+    state_matches = (
+        (
+            error.state == "CONFIRM_TIMEOUT_RUNNING"
+            and error.returncode == -SIGKILL_NUMBER
+            and error.stdout == b""
+        )
+        or (
+            error.state in {"CONFIRM_MISMATCH_RUNNING", "CONFIRM_MISMATCH_EXITED"}
+            and not confirmation_matches
+            and (
+                error.state != "CONFIRM_MISMATCH_RUNNING"
+                or error.returncode == -SIGKILL_NUMBER
+            )
+        )
+        or (
+            error.state == "POST_CONFIRM_CONTRACT"
+            and confirmation_matches
+            and (error.returncode != -SIGKILL_NUMBER or bool(error.stderr))
+        )
+    )
+    if (
+        error.state not in LEASE_CLIENT_STATES
+        or isinstance(error.returncode, bool)
+        or not isinstance(error.returncode, int)
+        or not -255 <= error.returncode <= 255
+        or len(error.stdout) > 513
+        or len(error.stderr) > 513
+        or not state_matches
+    ):
+        raise HarnessError("lease-client diagnostic fields differ from their bounds")
+    child = _validated_worker_refusal_token(error.stderr) or b"H_DIGEST_ONLY"
+    return (
+        b"REFUSED: H_LEASE_CLIENT "
+        + f"state={error.state} returncode={error.returncode} ".encode("ascii")
+        + f"stdout_bytes={len(error.stdout)} stdout_sha256={_sha256(error.stdout)} ".encode(
+            "ascii"
+        )
+        + f"stderr_bytes={len(error.stderr)} stderr_sha256={_sha256(error.stderr)} ".encode(
+            "ascii"
+        )
+        + b"child="
+        + child
+        + b"\n"
+    )
 
 
 def _worker_exception_category(error: Exception) -> str:
@@ -2895,20 +3051,32 @@ def _run_abandoned_lease_client(
         if ready:
             stdout = os.read(process.stdout.fileno(), len(CONTROL_CLIENT_CONFIRMATION) + 1)
         if stdout != CONTROL_CLIENT_CONFIRMATION:
-            process.kill()
-            process.wait(timeout=5)
+            observed_returncode = process.poll()
+            if not ready and observed_returncode is None:
+                state = "CONFIRM_TIMEOUT_RUNNING"
+            elif observed_returncode is None:
+                state = "CONFIRM_MISMATCH_RUNNING"
+            else:
+                state = "CONFIRM_MISMATCH_EXITED"
+            if observed_returncode is None:
+                process.kill()
+            returncode = process.wait(timeout=5)
             stderr = process.stderr.read(513)
-            raise HarnessError(
-                "lease client did not confirm acquisition: "
-                f"stdout={len(stdout)}:{_sha256(stdout)} stderr={len(stderr)}:{_sha256(stderr)}"
+            raise LeaseClientContractError(
+                state=state,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
         process.kill()
         returncode = process.wait(timeout=5)
         stderr = process.stderr.read(513)
         if returncode != -SIGKILL_NUMBER or stderr:
-            raise HarnessError(
-                "lease client loss contract differed: "
-                f"rc={returncode} stderr={len(stderr)}:{_sha256(stderr)}"
+            raise LeaseClientContractError(
+                state="POST_CONFIRM_CONTRACT",
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
     finally:
         if process.poll() is None:
@@ -4120,11 +4288,12 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
 
 
 def _emit_worker_refusal(error: Exception) -> int:
-    line = (
-        _crash_cell_refusal_line(error)
-        if isinstance(error, CrashCellContractError)
-        else _worker_refusal_line(error)
-    )
+    if isinstance(error, CrashCellContractError):
+        line = _crash_cell_refusal_line(error)
+    elif isinstance(error, LeaseClientContractError):
+        line = _lease_client_refusal_line(error)
+    else:
+        line = _worker_refusal_line(error)
     _write_all(sys.stderr.fileno(), line)
     return 2
 

@@ -157,3 +157,11 @@ stdout/stderr byte counts and SHA-256 values, and a four-bit failure mask. The
 mask order is return code, stdout bound, empty stderr, canonical intent UUID;
 `1` identifies a failed predicate. Raw child output, paths, and intent IDs are
 never forwarded.
+
+An abandoned lease-client refusal is similarly bounded to a fixed lifecycle
+state, canonical numeric return code, stdout/stderr byte counts and SHA-256
+values. It includes a child category/function/line token only when the parent
+independently proves that the complete child stderr is one reviewed harness
+refusal line at that exact function line; every arbitrary, multiline, or
+unreviewed diagnostic is represented by `H_DIGEST_ONLY`. Responses, lease
+authorities, paths, and exception messages are never forwarded.

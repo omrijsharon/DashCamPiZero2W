@@ -1520,6 +1520,105 @@ def test_ambiguous_systemd_launch_reconciles_deterministic_unit(
     assert removed == [unit]
 
 
+@pytest.mark.parametrize(
+    "timeout",
+    (True, 0.0, -1.0, float("nan"), float("inf"), 50.001),
+)
+def test_systemd_run_refuses_invalid_or_unbounded_client_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: float,
+) -> None:
+    monkeypatch.setattr(
+        run,
+        "_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must refuse first")),
+    )
+
+    with pytest.raises(run.HarnessError, match="client timeout differs"):
+        run._systemd_run(
+            "dashcam-m10-private-123456789abc-bind.service",
+            (),
+            ("/bin/true",),
+            client_timeout_s=timeout,
+        )
+
+
+def test_notify_launch_admits_simulated_21_second_reply_while_bind_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[float] = []
+    removed: list[str] = []
+
+    def command(_arguments: object, *, timeout: float) -> None:
+        observed.append(timeout)
+        if timeout <= 21:
+            raise run.HarnessError("simulated notify reply arrived at 21 seconds")
+
+    monkeypatch.setattr(run, "_command", command)
+    monkeypatch.setattr(run, "_remove_unit", removed.append)
+    bind_unit = "dashcam-m10-private-123456789abc-bind.service"
+    notify_unit = "dashcam-m10-private-123456789abc-a.service"
+
+    with pytest.raises(run.HarnessError, match="arrived at 21 seconds"):
+        run._systemd_run(bind_unit, (), ("/bin/true",))
+    run._systemd_run(
+        notify_unit,
+        (),
+        ("/bin/true",),
+        client_timeout_s=run.SYSTEMD_RUN_NOTIFY_TIMEOUT_S,
+    )
+
+    assert observed == [20.0, 50.0]
+    assert removed == [bind_unit]
+
+
+def test_candidate_unit_maps_only_notify_roles_to_50_second_client_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, float]] = []
+
+    def systemd_run(
+        unit: str,
+        _properties: object,
+        _command: object,
+        *,
+        client_timeout_s: float,
+    ) -> None:
+        observed.append((unit, client_timeout_s))
+
+    monkeypatch.setattr(run, "_systemd_run", systemd_run)
+    paths = {
+        "recording": Path("/var/tmp/dashcam-m10-private.123456789abc/recording"),
+        "state": Path("/var/tmp/dashcam-m10-private.123456789abc/state"),
+        "runtime": Path("/run/dashcam-m10-private.123456789abc"),
+    }
+
+    run._candidate_unit("123456789abc", "a", paths, role="candidate")
+    run._candidate_unit(
+        "123456789abc",
+        "rollback3",
+        paths,
+        role="rollback-recorder",
+    )
+
+    assert observed == [
+        ("dashcam-m10-private-123456789abc-a.service", 50.0),
+        ("dashcam-m10-private-123456789abc-rollback3.service", 50.0),
+    ]
+
+
+def test_bind_and_rollback_recovery_keep_explicit_20_second_client_timeout() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+    bind = source[source.index("def _run_bind_probe(") : source.index("def _source_environment(")]
+    rollback = source[
+        source.index("def _rollback_phase(") : source.index("def _protected_emergency_phase(")
+    ]
+
+    expected = "client_timeout_s=SYSTEMD_RUN_CLIENT_TIMEOUT_S"
+    assert bind.count(expected) == 1
+    assert rollback.count(expected) == 1
+
+
 def test_source_has_owned_loop_cleanup_and_no_broad_destructive_actions() -> None:
     source = (HARNESS / "run.py").read_text(encoding="utf-8")
 

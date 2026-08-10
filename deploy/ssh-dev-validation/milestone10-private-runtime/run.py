@@ -61,6 +61,8 @@ QUALIFICATION_TIMEOUT_S: Final = 900
 UNIT_START_TIMEOUT_S: Final = 48
 UNIT_STOP_TIMEOUT_S: Final = 35
 ROLLBACK_TIMEOUT_S: Final = 60
+SYSTEMD_RUN_CLIENT_TIMEOUT_S: Final = 20.0
+SYSTEMD_RUN_NOTIFY_TIMEOUT_S: Final = 50.0
 OBSERVATION_INTERVAL_S: Final = 0.1
 CONTROL_RESPONSE_BYTES: Final = 16 * 1024
 CONTROL_TIMEOUT_S: Final = 9.0
@@ -2323,16 +2325,26 @@ def _systemd_run(
     unit: str,
     properties: Sequence[str],
     command: Sequence[str | Path],
+    *,
+    client_timeout_s: float = SYSTEMD_RUN_CLIENT_TIMEOUT_S,
 ) -> None:
     if UNIT_RE.fullmatch(unit) is None:
         raise HarnessError("transient unit name differs")
+    if (
+        isinstance(client_timeout_s, bool)
+        or not isinstance(client_timeout_s, (int, float))
+        or not math.isfinite(client_timeout_s)
+        or client_timeout_s <= 0
+        or client_timeout_s > SYSTEMD_RUN_NOTIFY_TIMEOUT_S
+    ):
+        raise HarnessError("systemd-run client timeout differs")
     arguments: list[str | Path] = ["/usr/bin/systemd-run", "--unit", unit.removesuffix(".service")]
     for prop in properties:
         arguments.extend(("--property", prop))
     arguments.append("--")
     arguments.extend(command)
     try:
-        _command(arguments, timeout=20)
+        _command(arguments, timeout=client_timeout_s)
     except BaseException:
         # systemd-run may lose its reply after PID 1 accepted the unit. Always
         # reconcile the deterministic name before allowing caller cleanup.
@@ -2404,7 +2416,12 @@ def _run_bind_probe(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
         runtime_source=runtime,
         role="bind",
     )
-    _systemd_run(unit, properties, ("/usr/bin/python3", "-I", "/var/lib/dashcam/bind-probe.py"))
+    _systemd_run(
+        unit,
+        properties,
+        ("/usr/bin/python3", "-I", "/var/lib/dashcam/bind-probe.py"),
+        client_timeout_s=SYSTEMD_RUN_CLIENT_TIMEOUT_S,
+    )
     values = _wait_unit_terminal(unit, 20)
     try:
         if values.get("Result") != "success" or values.get("ExecMainStatus") != "0":
@@ -2978,7 +2995,16 @@ def _candidate_unit(
     if before_launch is not None:
         before_launch()
     try:
-        _systemd_run(unit, properties, command)
+        _systemd_run(
+            unit,
+            properties,
+            command,
+            client_timeout_s=(
+                SYSTEMD_RUN_NOTIFY_TIMEOUT_S
+                if role in {"candidate", "rollback-recorder"}
+                else SYSTEMD_RUN_CLIENT_TIMEOUT_S
+            ),
+        )
     except BaseException:
         if launch_failure is not None:
             launch_failure()
@@ -3779,6 +3805,7 @@ def _rollback_phase(nonce: str, paths: Mapping[str, Path]) -> dict[str, object]:
                 "--control-socket",
                 CONTROL_SOCKET,
             ),
+            client_timeout_s=SYSTEMD_RUN_CLIENT_TIMEOUT_S,
         )
         terminal = _wait_unit_terminal(unit, ROLLBACK_TIMEOUT_S)
         try:

@@ -3993,15 +3993,14 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
         raise HarnessError("canonical sidecar drop counter differs")
     if not isinstance(warnings, list):
         raise HarnessError("canonical sidecar warnings shape differs")
-    if any(
+    counter_warning = any(
         text in str(item).casefold()
         for item in warnings
         for text in (
             "dropped-frame observation was unavailable",
             "frame and drop counters are unavailable",
         )
-    ):
-        raise HarnessError("canonical sidecar counter warning differs")
+    )
     directory = PurePosixPath(relative).parent
     video_relative = (directory / cast(str, value["video_file"])).as_posix()
     video = root / PurePosixPath(video_relative)
@@ -4028,6 +4027,7 @@ def _canonical_media_row(root: Path, row: Mapping[str, object]) -> dict[str, obj
         "end": row["end_monotonic_ns"],
         "sequence": value.get("sequence"),
         "frames_written": video_summary["frames_written"],
+        "sidecar_drop_counter_available": not counter_warning,
     }
 
 
@@ -4310,6 +4310,7 @@ def _media_evidence(rows: Sequence[Mapping[str, object]]) -> list[dict[str, obje
                 "video_packets": packets,
                 "sidecar_frames_written": row.get("frames_written"),
                 "observer_minus_packets": cast(int, row.get("frames_written")) - packets,
+                "sidecar_drop_counter_available": row.get("sidecar_drop_counter_available"),
                 "packet_fps": round(packets / duration, 6),
                 "minimum_pts_delta": minimum_pts_delta,
                 "minimum_dts_delta": minimum_dts_delta,
@@ -4317,7 +4318,9 @@ def _media_evidence(rows: Sequence[Mapping[str, object]]) -> list[dict[str, obje
                 "idr_first": True,
                 "hardware_h264_1080p": True,
                 "hardware_decoded": True,
-                "dropped_frames": 0,
+                "dropped_frames": (
+                    0 if row.get("sidecar_drop_counter_available") is True else None
+                ),
             }
         )
         previous_end = end

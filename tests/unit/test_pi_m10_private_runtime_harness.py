@@ -2020,7 +2020,6 @@ def test_canonical_media_refusals_use_the_reviewed_function_lines() -> None:
         "canonical sidecar frame counter differs",
         "canonical sidecar drop counter differs",
         "canonical sidecar warnings shape differs",
-        "canonical sidecar counter warning differs",
         "finalized media catalog path differs",
         "finalized media member type differs",
         "finalized media device differs",
@@ -2067,6 +2066,14 @@ def test_canonical_media_accepts_production_sidecar_without_result_newline(
     assert not sidecar.endswith(b"\n")
     assert observed["clip_id"] == row["clip_id"]
     assert observed["frames_written"] == 30
+    assert observed["sidecar_drop_counter_available"] is True
+
+
+def test_media_evidence_never_turns_unavailable_sidecar_drop_count_into_zero() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+
+    assert '"sidecar_drop_counter_available": not counter_warning' in source
+    assert '0 if row.get("sidecar_drop_counter_available") is True else None' in source
 
 
 def test_control_wrapper_is_not_a_reviewed_diagnostic_location() -> None:

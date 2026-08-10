@@ -73,7 +73,10 @@ The fixed phase order is:
 1. Candidate startup pending-FINALIZE convergence followed by reclaim, real
    camera/hardware encoder, recorder-owned listener, active-WRITING and
    protected/leased exclusion, event NEXT convergence, three decoded ordinary
-   clips, and clean shutdown.
+   clips, and clean shutdown. During the three live threshold crossings only,
+   an upward free-space jump is accepted because the immediately following
+   catalog gate requires a new completed DELETE; all offline filler phases
+   retain the exact target gate.
 2. Exact rollback quiesce twice, its read-only guard, and a short real rollback
    recorder start on the same private fixture.
 3. Fresh protected-only emergency, which must terminate with clean

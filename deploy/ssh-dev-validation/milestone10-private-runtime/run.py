@@ -3290,7 +3290,14 @@ def _managed_manifest(root: Path) -> dict[str, str]:
     return result
 
 
-def _allocate_filler(root: Path, target_free: int) -> tuple[Path, int]:
+def _allocate_filler(
+    root: Path,
+    target_free: int,
+    *,
+    allow_concurrent_reclaim: bool = False,
+) -> tuple[Path, int]:
+    if not isinstance(allow_concurrent_reclaim, bool):
+        raise TypeError("concurrent reclaim allowance must be boolean")
     facts = os.statvfs(root)  # type: ignore[attr-defined]
     free = facts.f_bavail * facts.f_frsize
     target_free = (target_free // facts.f_frsize) * facts.f_frsize
@@ -3322,7 +3329,10 @@ def _allocate_filler(root: Path, target_free: int) -> tuple[Path, int]:
         os.close(descriptor)
     observed = os.statvfs(root)  # type: ignore[attr-defined]
     final_free = observed.f_bavail * observed.f_frsize
-    if final_free > target_free + 2 * observed.f_frsize:
+    if (
+        not allow_concurrent_reclaim
+        and final_free > target_free + 2 * observed.f_frsize
+    ):
         raise HarnessError("filler ended above its bounded target")
     if final_free < target_free - FILLER_CHUNK_BYTES:
         raise HarnessError("filler ended below its bounded target")
@@ -4485,7 +4495,11 @@ def _phase_a(
         )
         writing_before = _wait_writing(catalog, root)
         before_live_count = _catalog_counts(catalog)["delete_complete"]
-        live_filler, live_filler_bytes = _allocate_filler(root, low - 2 * 1024**2)
+        live_filler, live_filler_bytes = _allocate_filler(
+            root,
+            low - 2 * 1024**2,
+            allow_concurrent_reclaim=True,
+        )
         live_snapshot, writing_after = _wait_delete_progress(
             catalog, root, before_live_count, writing_before
         )
@@ -4524,7 +4538,11 @@ def _phase_a(
 
         second_writing = _wait_writing(catalog, root)
         second_before = _catalog_counts(catalog)["delete_complete"]
-        second_filler, second_filler_bytes = _allocate_filler(root, low - 2 * 1024**2)
+        second_filler, second_filler_bytes = _allocate_filler(
+            root,
+            low - 2 * 1024**2,
+            allow_concurrent_reclaim=True,
+        )
         second_snapshot, _second_after = _wait_delete_progress(
             catalog, root, second_before, second_writing
         )
@@ -4563,7 +4581,11 @@ def _phase_a(
             raise HarnessError("media preservation lease identity differs")
         next_before = _catalog_counts(catalog)["delete_complete"]
         next_writing = _wait_writing(catalog, root)
-        next_filler, next_filler_bytes = _allocate_filler(root, low - 2 * 1024**2)
+        next_filler, next_filler_bytes = _allocate_filler(
+            root,
+            low - 2 * 1024**2,
+            allow_concurrent_reclaim=True,
+        )
         next_snapshot, _next_after = _wait_delete_progress(
             catalog,
             root,

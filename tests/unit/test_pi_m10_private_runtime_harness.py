@@ -986,6 +986,61 @@ def test_filler_target_direction_refusals_are_distinct_reviewed_lines() -> None:
     assert set(observed).issubset(run._reviewed_function_lines()["allocate_filler"])
 
 
+@pytest.mark.parametrize("allow_concurrent_reclaim", (False, True))
+def test_filler_upward_jump_requires_explicit_live_reclaim_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_concurrent_reclaim: bool,
+) -> None:
+    block = 4096
+    target = 64 * 1024**2
+    before = target + 20 * 1024**2
+    observations = iter(
+        (
+            before,
+            before,
+            target + 3 * block,
+            target + 2 * block,
+            target + 8 * 1024**2,
+        )
+    )
+
+    def statvfs(_path: Path) -> SimpleNamespace:
+        free = next(observations)
+        return SimpleNamespace(
+            f_bavail=free // block,
+            f_frsize=block,
+            f_blocks=(before + 64 * 1024**2) // block,
+        )
+
+    monkeypatch.setattr(run.os, "statvfs", statvfs, raising=False)
+    monkeypatch.setattr(
+        run.os,
+        "posix_fallocate",
+        lambda _descriptor, _offset, _amount: None,
+        raising=False,
+    )
+
+    if allow_concurrent_reclaim:
+        _path, allocated = run._allocate_filler(
+            tmp_path,
+            target,
+            allow_concurrent_reclaim=True,
+        )
+        assert allocated > 0
+    else:
+        with pytest.raises(run.HarnessError, match="above its bounded target"):
+            run._allocate_filler(tmp_path, target)
+
+
+def test_only_live_fillers_allow_catalog_proven_reclaim_increase() -> None:
+    source = (HARNESS / "run.py").read_text(encoding="utf-8")
+
+    assert source.count("allow_concurrent_reclaim=True") == 3
+    assert "filler, filler_bytes = _allocate_filler(root, emergency" in source
+    assert "startup_filler, startup_filler_bytes = _allocate_filler(" in source
+
+
 def test_strict_idr_parser_rejects_keyframe_without_idr() -> None:
     assert run._contains_idr(b"\x00\x00\x00\x01\x65\x88")
     assert run._contains_idr((2).to_bytes(4, "big") + b"\x65\x88")

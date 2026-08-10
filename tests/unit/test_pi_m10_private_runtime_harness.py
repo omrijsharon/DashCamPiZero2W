@@ -2127,6 +2127,38 @@ def test_each_live_crossing_starts_in_a_fresh_writing_interval() -> None:
     assert "metadata.st_dev == root_device" in source
     assert "maximum_size_bytes: int = 16 * 1024**2" in source
     assert "timeout: float = 95" in source
+    assert 'if len(writing) > 2:' in source
+    assert 'if len(early) > 1:' in source
+
+
+def test_fresh_writing_selection_accepts_one_small_successor_during_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "recording"
+    clips = root / "clips"
+    clips.mkdir(parents=True)
+    old_video = clips / "old.mp4"
+    new_video = clips / "new.mp4"
+    old_video.touch()
+    with old_video.open("r+b") as stream:
+        stream.truncate(17 * 1024**2)
+    new_video.write_bytes(b"new")
+    old = {
+        "clip_id": "00000000-0000-4000-8000-000000000001",
+        "lifecycle": "WRITING",
+        "video_path": "clips/old.mp4",
+        "video_present": True,
+    }
+    new = {
+        "clip_id": "00000000-0000-4000-8000-000000000002",
+        "lifecycle": "WRITING",
+        "video_path": "clips/new.mp4",
+        "video_present": True,
+    }
+    monkeypatch.setattr(run, "_query_catalog", lambda _catalog, _root: {"clips": [old, new]})
+
+    assert run._wait_fresh_writing(tmp_path / "catalog.sqlite3", root) == new
 
 
 def test_runtime_health_refusals_are_distinct_reviewed_lines() -> None:

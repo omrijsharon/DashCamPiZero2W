@@ -3946,22 +3946,37 @@ def _wait_fresh_writing(
     deadline = time.monotonic() + timeout
     root_device = root.stat().st_dev
     while time.monotonic() < deadline:
-        row = _writing_clip(_query_catalog(catalog, root))
-        relative = None if row is None else row.get("video_path")
-        video = root / PurePosixPath(relative) if isinstance(relative, str) else None
-        try:
-            metadata = None if video is None else video.stat(follow_symlinks=False)
-        except OSError:
-            metadata = None
-        if (
-            row is not None
-            and row.get("video_present") is True
-            and metadata is not None
-            and stat.S_ISREG(metadata.st_mode)
-            and metadata.st_dev == root_device
-            and metadata.st_size <= maximum_size_bytes
-        ):
-            return row
+        snapshot = _query_catalog(catalog, root)
+        clips = snapshot.get("clips")
+        if not isinstance(clips, list):
+            raise HarnessError("fresh catalog snapshot clip shape differs")
+        writing = [
+            cast(dict[str, object], row)
+            for row in clips
+            if isinstance(row, dict) and row.get("lifecycle") == "WRITING"
+        ]
+        if len(writing) > 2:
+            raise HarnessError("production runtime exposed too many overlapping WRITING clips")
+        early: list[dict[str, object]] = []
+        for row in writing:
+            relative = row.get("video_path")
+            video = root / PurePosixPath(relative) if isinstance(relative, str) else None
+            try:
+                metadata = None if video is None else video.stat(follow_symlinks=False)
+            except OSError:
+                metadata = None
+            if (
+                row.get("video_present") is True
+                and metadata is not None
+                and stat.S_ISREG(metadata.st_mode)
+                and metadata.st_dev == root_device
+                and metadata.st_size <= maximum_size_bytes
+            ):
+                early.append(row)
+        if len(early) > 1:
+            raise HarnessError("early WRITING interval identity is ambiguous")
+        if early:
+            return early[0]
         time.sleep(0.05)
     raise HarnessError("early durable WRITING interval was not observed")
 

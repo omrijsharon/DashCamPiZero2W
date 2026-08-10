@@ -1039,9 +1039,9 @@ def test_only_live_fillers_allow_catalog_proven_reclaim_increase() -> None:
     assert source.count("allow_concurrent_reclaim=True") == 3
     assert "filler, filler_bytes = _allocate_filler(root, emergency" in source
     assert "startup_filler, startup_filler_bytes = _allocate_filler(" in source
-    assert "LIVE_FILLER_CHUNK_BYTES: Final = 1 * 1024**2" in source
+    assert "LIVE_FILLER_CHUNK_BYTES: Final = 256 * 1024" in source
     assert "if allow_concurrent_reclaim else FILLER_CHUNK_BYTES" in source
-    assert "if allow_concurrent_reclaim:\n                time.sleep(0.02)" in source
+    assert "if allow_concurrent_reclaim:\n                time.sleep(0.05)" in source
 
 
 def test_candidate_selection_waits_for_reclaimer_quiescence(

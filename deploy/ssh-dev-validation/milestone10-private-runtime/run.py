@@ -56,7 +56,7 @@ MAX_SOURCE_MEMBERS: Final = 768
 MAX_FIXTURE_ROWS: Final = 512
 MAX_FILLER_BYTES: Final = 320 * 1024**2
 FILLER_CHUNK_BYTES: Final = 8 * 1024**2
-LIVE_FILLER_CHUNK_BYTES: Final = 1 * 1024**2
+LIVE_FILLER_CHUNK_BYTES: Final = 256 * 1024
 MAX_FILLER_STEPS: Final = MAX_FILLER_BYTES // LIVE_FILLER_CHUNK_BYTES + 1
 PHASE_TIMEOUT_S: Final = 420
 QUALIFICATION_TIMEOUT_S: Final = 900
@@ -3330,7 +3330,7 @@ def _allocate_filler(
             if steps > MAX_FILLER_STEPS:
                 raise HarnessError("filler allocation step bound exceeded")
             if allow_concurrent_reclaim:
-                time.sleep(0.02)
+                time.sleep(0.05)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

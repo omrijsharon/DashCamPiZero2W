@@ -188,6 +188,29 @@
   exit-gate evidence. Earlier diagnostic harness refusals produced no accepted
   result and cleaned their disposable resources. Evidence:
   `docs/test-reports/2026-08-10-milestone10-sigkill-live.md`.
+- Source commit `0992bf7385de2aa6ae0026e0a4a7e6427fa5d721` then extended the
+  exact-Pi private-loop harness with commit-source control components. Matrix H
+  created a root-owned harness-only Unix socket under fresh `/run`, required
+  mode `0660` and the actual `dashcam-api` group, and exercised the real bounded
+  server, handler, dispatcher, ext4 catalog, and exFAT pair operations. It
+  proved path-free opaque leases, actual abandoned-client `SIGKILL`, exact
+  same-boot expiry, previous-boot cleanup, restart-preserved authority, bounded
+  admission/global caps, wrong-authority refusal, idempotent release, retention
+  exclusion then eligibility, socket-driven protect/unprotect convergence, and
+  lease-deferred event protection for exact previous two/current/next one with
+  stable-ID retry. All matrices A--H passed. The bundle manifest SHA-256 is
+  `dec914900377e337b5fa2c6ff854606bc97785d88e16979ff71778d50ccfcc72`;
+  accepted result `/var/tmp/m10-retention-result-0992bf7.json` has SHA-256
+  `266931a84eb862bf5878750a2be42c9fcb642915dfc080c22c46a74a16e388ad`,
+  size 11,554 bytes, and mode/owner `0600 root:root`. Earlier diagnostic runs
+  safely refused because of harness/source API and response-encoding mismatches;
+  each published no accepted result and passed exact disposable cleanup before
+  the reviewed parser-compatible run. This is commit-source component evidence,
+  not installed-release, production listener/service UID, HTTP/download data
+  plane, production runtime/camera, physical-power-loss, or Milestone 10 exit
+  evidence. Root available space after cleanup was 2,765,840,384 bytes and the
+  bounded host pre/post digest beginning `428a0f7e` matched. Evidence:
+  `docs/test-reports/2026-08-10-milestone10-control-component-live.md`.
 - The Milestone 9 functional overlay gates passed on the verified `.112` Pi
   with the accepted installed `5f95` release. Hash-closed harness manifest
   `e38b54ea71268f1cd82a50b1a2ef85891ac68c9a5124599e2d37ef2bd88f4ff5`

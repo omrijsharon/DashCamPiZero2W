@@ -1512,3 +1512,148 @@ def test_failure_cleanup_stays_inside_exclusion_scope() -> None:
     assert qualify.index("_cleanup_fixture(paths)") < qualify.index(
         'exclusion_state["restore_authorized"] = True'
     )
+
+
+def test_refusal_location_accepts_only_reviewed_function_and_executable_line() -> None:
+    lines = run._reviewed_function_lines()
+    valid_line = min(lines["host_snapshot"])
+    accepted = f"REFUSED: H_OS_Fhost_snapshot_L{valid_line}\n".encode("ascii")
+
+    assert run._validated_refusal_location(accepted) == accepted
+
+    for refused in (
+        accepted.removesuffix(b"\n"),
+        accepted + b"private second line\n",
+        f"REFUSED: H_OS_Fhost_snapshot_L{max(lines['host_snapshot']) + 1}\n".encode(
+            "ascii"
+        ),
+        f"REFUSED: H_OS_Fnot_reviewed_L{valid_line}\n".encode("ascii"),
+        f"REFUSED: H_PRIVATE_Fhost_snapshot_L{valid_line}\n".encode("ascii"),
+        f"REFUSED: H_OS_Fhost_snapshot_L0{valid_line}\n".encode("ascii"),
+        b"REFUSED: SSID MyHome PSK hunter2 /private/path\n",
+    ):
+        assert run._validated_refusal_location(refused) is None
+
+
+def test_refusal_line_uses_deepest_exact_reviewed_frame_without_private_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_command(*_args: object, **_kwargs: object) -> object:
+        raise OSError("SSID MyHome PSK hunter2 coordinates 32.1,34.8 /private/path")
+
+    monkeypatch.setattr(run, "_command", fail_command)
+    try:
+        run._findmnt(Path("/"))
+    except OSError as error:
+        payload = run._refusal_line(error)
+    else:
+        pytest.fail("injected command failure was not raised")
+
+    assert payload.startswith(b"REFUSED: H_OS_Ffindmnt_L")
+    assert run._validated_refusal_location(payload) == payload
+    for private in (b"MyHome", b"hunter2", b"32.1", b"34.8", b"/private"):
+        assert private not in payload
+
+
+@pytest.mark.parametrize(
+    ("error", "plain"),
+    [
+        (run.HarnessError("token abcdef"), b"REFUSED: HarnessError\n"),
+        (OSError("SSID MyHome"), b"REFUSED: OSError\n"),
+        (ValueError("coordinates 32.1,34.8"), b"REFUSED: ValueError\n"),
+        (RuntimeError("/private/catalog.sqlite3"), b"REFUSED: RuntimeError\n"),
+        (Exception("secret bearer value"), b"REFUSED: Exception\n"),
+    ],
+)
+def test_unlocated_refusal_uses_only_fixed_plain_type(
+    error: Exception, plain: bytes
+) -> None:
+    payload = run._refusal_line(error)
+
+    assert payload == plain
+    assert run.REFUSAL_LOCATION_RE.fullmatch(payload) is None
+    for private in (b"abcdef", b"MyHome", b"32.1", b"34.8", b"/private", b"bearer"):
+        assert private not in payload
+
+
+def test_external_only_exception_frame_is_not_reported() -> None:
+    try:
+        raise OSError("external /private/path token abcdef")
+    except OSError as error:
+        payload = run._refusal_line(error)
+
+    assert payload == b"REFUSED: OSError\n"
+    assert b"private" not in payload
+    assert b"abcdef" not in payload
+
+
+def test_reviewed_path_resolution_failure_falls_back_without_private_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RefusingPath:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def resolve(self, *, strict: bool) -> Path:
+            assert strict is True
+            raise OSError("private reviewed path token abcdef")
+
+    monkeypatch.setattr(run, "Path", RefusingPath)
+    payload = run._refusal_line(run.HarnessError("SSID MyHome PSK hunter2"))
+
+    assert payload == b"REFUSED: HarnessError\n"
+    assert b"abcdef" not in payload
+    assert b"MyHome" not in payload
+
+
+def test_forged_reviewed_name_with_external_code_filename_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_lines = run._reviewed_function_lines()["host_snapshot"]
+
+    def external_host_snapshot() -> dict[str, object]:
+        return {}
+
+    monkeypatch.setattr(run, "_host_snapshot", external_host_snapshot)
+    assert "host_snapshot" not in run._reviewed_function_lines()
+    forged = (
+        f"REFUSED: H_HARNESS_Fhost_snapshot_L{min(original_lines)}\n".encode("ascii")
+    )
+    assert run._validated_refusal_location(forged) is None
+
+
+def test_main_refusal_is_one_safe_validated_line_without_exception_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments = run.argparse.Namespace(
+        recover_work=None,
+        fixture=None,
+        bundle="bundle",
+        expected_manifest_sha256="0" * 64,
+        expected_harness_commit="1" * 40,
+        expected_candidate_commit=run.EXPECTED_CANDIDATE,
+        rollback_commit=run.EXPECTED_ROLLBACK,
+        expected_board_serial="00000000db28ffe4",
+        output="/var/tmp/result.json",
+        fixture_root=None,
+        fixture_catalog=None,
+        fixture_boot_id=None,
+        fixture_source=None,
+    )
+    parser = SimpleNamespace(parse_args=lambda _argv: arguments)
+    monkeypatch.setattr(run, "_parser", lambda: parser)
+
+    def refuse(_arguments: object) -> dict[str, object]:
+        raise run.HarnessError("SSID MyHome PSK hunter2 /private/path token abcdef")
+
+    monkeypatch.setattr(run, "qualify", refuse)
+
+    assert run.main([]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = captured.err.encode("ascii")
+    assert payload.startswith(b"REFUSED: H_HARNESS_Fmain_L")
+    assert run._validated_refusal_location(payload) == payload
+    for private in ("MyHome", "hunter2", "/private", "abcdef"):
+        assert private not in captured.err

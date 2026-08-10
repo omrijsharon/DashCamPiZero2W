@@ -91,6 +91,67 @@ LIVE_LOCKS: Final = (
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
 SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 LOOP_RE: Final = re.compile(r"/dev/loop[0-9]{1,4}")
+REFUSAL_LOCATION_RE: Final = re.compile(
+    rb"REFUSED: H_(HARNESS|SQLITE|OS|UNICODE|ZIP|VALUE|ASSERT|ATTRIBUTE|KEY|"
+    rb"RUNTIME|TYPE|EXCEPTION)_F([a-z][a-z0-9_]*)_L([1-9][0-9]{0,3})\n"
+)
+MAX_REVIEWED_RUN_LINE: Final = 8192
+DIAGNOSTIC_FUNCTIONS: Final = (
+    "main",
+    "qualify",
+    "validate_pi",
+    "host_snapshot",
+    "qualification_locks",
+    "runtime_exclusion",
+    "require_excluded",
+    "freeze_bundle",
+    "require_root_identity",
+    "findmnt",
+    "service_properties",
+    "command",
+    "create_runtime_exclusion",
+    "remove_owned_runtime_exclusion",
+    "write_recovery_journal",
+    "transition_recovery_journal",
+    "mount_fixture",
+    "cleanup_fixture",
+    "discard_fixture",
+    "install_private_state",
+    "systemd_run",
+    "wait_unit_terminal",
+    "wait_recording",
+    "remove_unit",
+    "run_bind_probe",
+    "fixture_subprocess",
+    "query_catalog",
+    "managed_manifest",
+    "allocate_filler",
+    "remove_filler",
+    "raw_control",
+    "listener_identity",
+    "candidate_unit",
+    "stop_clean",
+    "wait_writing",
+    "wait_delete_progress",
+    "wait_event_media",
+    "media_evidence",
+    "runtime_health",
+    "phase_a",
+    "rollback_phase",
+    "protected_emergency_phase",
+    "startup_bound_phase",
+    "fresh_phase",
+    "remove_frozen",
+    "same_production",
+    "publish_result",
+    "require_dense_image",
+    "require_owned_loop",
+    "require_mount",
+    "attach",
+    "detach",
+    "unmount",
+    "blkid",
+)
 UNIT_RE: Final = re.compile(
     r"dashcam-m10-private-[a-z0-9]{12}-(?:bind|a|rollback[0123]|b|c)\.service"
 )
@@ -4377,6 +4438,111 @@ def qualify(arguments: argparse.Namespace) -> dict[str, object]:
         return result
 
 
+def _exception_category(error: Exception) -> str:
+    for expected, category in (
+        (HarnessError, "HARNESS"),
+        (sqlite3.Error, "SQLITE"),
+        (UnicodeError, "UNICODE"),
+        (zipfile.BadZipFile, "ZIP"),
+        (OSError, "OS"),
+        (AssertionError, "ASSERT"),
+        (AttributeError, "ATTRIBUTE"),
+        (KeyError, "KEY"),
+        (RuntimeError, "RUNTIME"),
+        (TypeError, "TYPE"),
+        (ValueError, "VALUE"),
+    ):
+        if isinstance(error, expected):
+            return category
+    return "EXCEPTION"
+
+
+def _reviewed_function_lines() -> dict[str, frozenset[int]]:
+    result: dict[str, frozenset[int]] = {}
+    try:
+        reviewed_path = Path(__file__).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return result
+    for function_code in DIAGNOSTIC_FUNCTIONS:
+        function = globals().get("_" + function_code, globals().get(function_code))
+        code = getattr(function, "__code__", None)
+        if code is None:
+            continue
+        try:
+            code_path = Path(code.co_filename).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if code_path != reviewed_path:
+            continue
+        lines = frozenset(
+            line
+            for _start, _end, line in code.co_lines()
+            if line is not None and 1 <= line <= MAX_REVIEWED_RUN_LINE
+        )
+        if lines:
+            result[function_code] = lines
+    return result
+
+
+def _reviewed_exception_location(error: Exception) -> tuple[str, int] | None:
+    try:
+        reviewed_path = Path(__file__).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    line_map = _reviewed_function_lines()
+    selected: tuple[str, int] | None = None
+    traceback = error.__traceback__
+    while traceback is not None:
+        try:
+            frame_path = Path(traceback.tb_frame.f_code.co_filename).resolve(strict=True)
+        except (OSError, RuntimeError):
+            frame_path = Path()
+        function_name = traceback.tb_frame.f_code.co_name.removeprefix("_")
+        if frame_path == reviewed_path and traceback.tb_lineno in line_map.get(
+            function_name, frozenset()
+        ):
+            selected = (function_name, traceback.tb_lineno)
+        traceback = traceback.tb_next
+    return selected
+
+
+def _validated_refusal_location(payload: bytes) -> bytes | None:
+    match = REFUSAL_LOCATION_RE.fullmatch(payload)
+    if match is None:
+        return None
+    function = match.group(2).decode("ascii")
+    line = int(match.group(3))
+    if line not in _reviewed_function_lines().get(function, frozenset()):
+        return None
+    return payload
+
+
+def _refusal_line(error: Exception) -> bytes:
+    category = _exception_category(error)
+    location = _reviewed_exception_location(error)
+    if location is not None:
+        function, line = location
+        payload = f"REFUSED: H_{category}_F{function}_L{line}\n".encode("ascii")
+        validated = _validated_refusal_location(payload)
+        if validated is not None:
+            return validated
+    plain = {
+        "HARNESS": "HarnessError",
+        "SQLITE": "SQLiteError",
+        "UNICODE": "UnicodeError",
+        "ZIP": "BadZipFile",
+        "OS": "OSError",
+        "ASSERT": "AssertionError",
+        "ATTRIBUTE": "AttributeError",
+        "KEY": "KeyError",
+        "RUNTIME": "RuntimeError",
+        "TYPE": "TypeError",
+        "VALUE": "ValueError",
+        "EXCEPTION": "Exception",
+    }[category]
+    return f"REFUSED: {plain}\n".encode("ascii")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle")
@@ -4441,8 +4607,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = qualify(arguments)
             finally:
                 _qualification_deadline_ns = None
-    except (HarnessError, OSError, ValueError, sqlite3.Error, zipfile.BadZipFile) as error:
-        print(f"REFUSED: {type(error).__name__}", file=sys.stderr)
+    except Exception as error:
+        sys.stderr.write(_refusal_line(error).decode("ascii"))
+        sys.stderr.flush()
         return 2
     print(canonical_json(result).decode("ascii"), end="")
     return 0

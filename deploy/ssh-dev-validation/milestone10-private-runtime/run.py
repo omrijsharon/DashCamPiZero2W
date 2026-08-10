@@ -3041,12 +3041,20 @@ def _listener_identity(runtime: Path, dashcam_uid: int) -> dict[str, object]:
     return {"uid": metadata.st_uid, "gid": metadata.st_gid, "mode": "0660"}
 
 
-def _storage_fault_classification(runtime: object) -> tuple[str, str | None]:
+def _storage_fault_classification(
+    runtime: object,
+    lifecycle_detail: object,
+) -> tuple[str, str | None]:
     if not isinstance(runtime, dict):
         return "RUNTIME_MALFORMED", None
     if "storage_preflight" not in runtime:
         return "PREFLIGHT_MISSING", None
     preflight = runtime["storage_preflight"]
+    if preflight is None:
+        if lifecycle_detail == "storage preflight failed":
+            return "PREFLIGHT_FAILED", None
+        if lifecycle_detail == "storage preflight exceeded deadline":
+            return "PREFLIGHT_TIMEOUT", None
     if not isinstance(preflight, dict):
         return "PREFLIGHT_NOT_MAPPING", None
     if set(preflight) != PREFLIGHT_STATUS_KEYS:
@@ -3215,11 +3223,18 @@ def _phase_a_launch_failure_status(runtime: Path) -> None:
     if reason == "FINALIZATION_FAILED":
         raise HarnessError("phase A launch status matched classified branch")
     if reason == "STORAGE_FAULT":
-        classification, storage_reason = _storage_fault_classification(document["runtime"])
+        classification, storage_reason = _storage_fault_classification(
+            document["runtime"],
+            lifecycle["detail"],
+        )
         if classification == "RUNTIME_MALFORMED":
             raise HarnessError("phase A storage status runtime is malformed")
         if classification == "PREFLIGHT_MISSING":
             raise HarnessError("phase A storage preflight status is missing")
+        if classification == "PREFLIGHT_FAILED":
+            raise HarnessError("phase A storage preflight execution failed")
+        if classification == "PREFLIGHT_TIMEOUT":
+            raise HarnessError("phase A storage preflight execution timed out")
         if classification == "PREFLIGHT_NOT_MAPPING":
             raise HarnessError("phase A storage preflight status type differs")
         if classification == "PREFLIGHT_KEYS":

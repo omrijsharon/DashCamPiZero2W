@@ -2150,10 +2150,11 @@ def _storage_retention_status(
 
 def _storage_fault_status_payload(
     *,
-    preflight: object = None,
-    retention: object = None,
+    preflight: object = ...,
+    retention: object = ...,
     include_preflight: bool = True,
     include_retention: bool = True,
+    detail: str = "SSID MyHome PSK hunter2 /private/path token abcdef",
 ) -> bytes:
     runtime: dict[str, object] = {
         "private_path": "/private/runtime",
@@ -2164,11 +2165,11 @@ def _storage_fault_status_payload(
     }
     if include_preflight:
         runtime["storage_preflight"] = (
-            _storage_preflight_status() if preflight is None else preflight
+            _storage_preflight_status() if preflight is ... else preflight
         )
     if include_retention:
         runtime["storage_retention"] = (
-            _storage_retention_status() if retention is None else retention
+            _storage_retention_status() if retention is ... else retention
         )
     return run.canonical_json(
         {
@@ -2176,7 +2177,7 @@ def _storage_fault_status_payload(
             "lifecycle": {
                 "state": "FAULTED",
                 "reason": "STORAGE_FAULT",
-                "detail": "SSID MyHome PSK hunter2 /private/path token abcdef",
+                "detail": detail,
                 "sequence": 7,
                 "config_schema_version": 1,
                 "notification_failures": 0,
@@ -2349,6 +2350,37 @@ def test_storage_fault_diagnostic_missing_and_malformed_shapes_are_fixed_and_uni
             b"32134800",
             b"987654321",
         ):
+            assert private not in refusal
+
+
+def test_storage_fault_diagnostic_splits_exact_preflight_execution_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = (
+        _storage_fault_status_payload(
+            preflight=None,
+            detail="storage preflight failed",
+        ),
+        _storage_fault_status_payload(
+            preflight=None,
+            detail="storage preflight exceeded deadline",
+        ),
+        _storage_fault_status_payload(
+            preflight=None,
+            detail="PRIVATE preflight hunter2 /private/path",
+        ),
+        _storage_fault_status_payload(
+            preflight=["PRIVATE", "hunter2", "/private/path"],
+            detail="storage preflight failed",
+        ),
+    )
+    refusals = [_launch_status_refusal(monkeypatch, payload) for payload in cases]
+
+    assert len(set(refusals[:3])) == 3
+    assert refusals[2] == refusals[3]
+    for refusal in set(refusals):
+        assert run._validated_refusal_location(refusal) == refusal
+        for private in (b"PRIVATE", b"hunter2", b"/private", b"failed", b"deadline"):
             assert private not in refusal
 
 

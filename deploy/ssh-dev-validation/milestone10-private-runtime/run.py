@@ -222,6 +222,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "raw_control",
     "listener_identity",
     "phase_a_launch_failure_status",
+    "run_preflight_diagnostic",
     "candidate_unit",
     "stop_clean",
     "wait_writing",
@@ -673,6 +674,46 @@ sys.argv=[a.module,*arguments]
 runpy.run_module(a.module,run_name="__main__",alter_sys=True)
 """
 
+PREFLIGHT_DIAGNOSTIC = b"""#!/usr/bin/env python3
+import json,os,sys
+out="/run/dashcam/preflight-diagnostic.json"
+def emit(stage):
+ payload=(json.dumps({"schema_version":1,"stage":stage},sort_keys=True,separators=(",",":"))+"\\n").encode("ascii")
+ fd=os.open(out,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+ try:
+  view=memoryview(payload)
+  while view:
+   count=os.write(fd,view)
+   if count<=0: raise RuntimeError("diagnostic write made no progress")
+   view=view[count:]
+  os.fsync(fd)
+ finally: os.close(fd)
+ directory=os.open("/run/dashcam",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+ try: os.fsync(directory)
+ finally: os.close(directory)
+def attempt(stage,operation):
+ try: return operation()
+ except Exception:
+  emit(stage);raise SystemExit(0)
+sys.path.insert(0,"/var/lib/dashcam/candidate-source.zip")
+def imports():
+ from dashcam.config import load_config
+ from dashcam.storage import preflight
+ return load_config,preflight
+load_config,p=attempt("IMPORT",imports)
+config=attempt("CONFIG",lambda:load_config("/var/lib/dashcam/config.toml"))
+identity=attempt("IDENTITY",lambda:p.load_storage_identity("/var/lib/dashcam/storage-volume.env"))
+policy=attempt("POLICY",lambda:p.policy_from_identity(config,identity))
+raw=attempt("COLLECT",lambda:p.PosixFactsCollector().collect(policy.recording_root))
+parsed=attempt("PARSE",lambda:p.recording_root_facts_from_mapping(raw))
+filesystem=attempt("FILESYSTEM",lambda:p.PosixPreflightFilesystem(
+ recording_root=policy.recording_root,
+ expected_device_id=parsed.mount.device_id or "0:0",
+))
+attempt("RUN",lambda:p.run_storage_preflight(raw,policy=policy,filesystem=filesystem))
+emit("RESULT")
+"""
+
 
 def render_transient_properties(
     *,
@@ -681,7 +722,13 @@ def render_transient_properties(
     runtime_source: Path,
     role: str,
 ) -> tuple[str, ...]:
-    if role not in {"candidate", "rollback-recovery", "rollback-recorder", "bind"}:
+    if role not in {
+        "candidate",
+        "rollback-recovery",
+        "rollback-recorder",
+        "bind",
+        "preflight-diagnostic",
+    }:
         raise HarnessError("transient service role differs")
     sources = tuple(path.as_posix() for path in (recording_source, state_source, runtime_source))
     if any(
@@ -690,13 +737,14 @@ def render_transient_properties(
         for value in sources
     ):
         raise HarnessError("transient bind source is outside the nonce roots")
-    if role in {"rollback-recovery", "bind"}:
+    if role in {"rollback-recovery", "bind", "preflight-diagnostic"}:
         groups = "dashcam-storage"
     elif role == "rollback-recorder":
         groups = "video render dialout dashcam-storage"
     else:
         groups = "audio video render dialout dashcam-storage dashcam-api"
     camera = role in {"candidate", "rollback-recorder"}
+    needs_devices = camera or role == "preflight-diagnostic"
     bind_paths = (
         f"BindPaths={sources[0]}:/srv/dashcam "
         f"{sources[1]}:/var/lib/dashcam {sources[2]}:/run/dashcam"
@@ -715,8 +763,8 @@ def render_transient_properties(
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
         "PrivateTmp=yes",
-        "PrivateDevices=no" if camera else "PrivateDevices=yes",
-        "DevicePolicy=auto" if camera else "DevicePolicy=closed",
+        "PrivateDevices=no" if needs_devices else "PrivateDevices=yes",
+        "DevicePolicy=auto" if needs_devices else "DevicePolicy=closed",
         "ProtectSystem=strict",
         "ProtectHome=yes",
         "ProtectKernelTunables=yes",
@@ -2384,6 +2432,12 @@ def _install_private_state(
     _write_exclusive(state / "rollback-config.toml", _config(rollback=True), 0o640, gid=dashcam_gid)
     _write_exclusive(state / "storage-volume.env", identity, 0o640, gid=dashcam_gid)
     _write_exclusive(state / "source-launcher.py", LAUNCHER, 0o750, gid=dashcam_gid)
+    _write_exclusive(
+        state / "preflight-diagnostic.py",
+        PREFLIGHT_DIAGNOSTIC,
+        0o750,
+        gid=dashcam_gid,
+    )
     for name in ("candidate-source.zip", "rollback-source.zip"):
         _write_exclusive(
             state / name,
@@ -3141,7 +3195,11 @@ def _storage_fault_classification(
     return "RETENTION_MODE", mode
 
 
-def _phase_a_launch_failure_status(runtime: Path) -> None:
+def _phase_a_launch_failure_status(
+    runtime: Path,
+    *,
+    preflight_failure: Callable[[], None] | None = None,
+) -> None:
     if runtime.parent != Path("/run") or NONCE_RE.fullmatch(runtime.name) is None:
         raise HarnessError("phase A launch status runtime identity differs")
     status = runtime / "status.json"
@@ -3232,6 +3290,8 @@ def _phase_a_launch_failure_status(runtime: Path) -> None:
         if classification == "PREFLIGHT_MISSING":
             raise HarnessError("phase A storage preflight status is missing")
         if classification == "PREFLIGHT_FAILED":
+            if preflight_failure is not None:
+                preflight_failure()
             raise HarnessError("phase A storage preflight execution failed")
         if classification == "PREFLIGHT_TIMEOUT":
             raise HarnessError("phase A storage preflight execution timed out")
@@ -3349,6 +3409,53 @@ def _phase_a_launch_failure_status(runtime: Path) -> None:
     if state == "FAULTED":
         raise HarnessError("phase A launch status lacks a required reason")
     raise HarnessError("phase A launch status classification is unreachable")
+
+
+def _run_preflight_diagnostic(nonce: str, paths: Mapping[str, Path]) -> None:
+    output = paths["runtime"] / "preflight-diagnostic.json"
+    if output.exists() or output.is_symlink():
+        raise HarnessError("preflight diagnostic output already exists")
+    unit = f"dashcam-m10-private-{nonce}-preflight.service"
+    properties = render_transient_properties(
+        recording_source=paths["recording"],
+        state_source=paths["state"],
+        runtime_source=paths["runtime"],
+        role="preflight-diagnostic",
+    )
+    try:
+        _systemd_run(
+            unit,
+            properties,
+            (EXPECTED_INTERPRETER, "-I", "/var/lib/dashcam/preflight-diagnostic.py"),
+        )
+        values = _wait_unit_terminal(unit, 20)
+        if values.get("Result") != "success" or values.get("ExecMainStatus") != "0":
+            raise HarnessError("preflight diagnostic unit failed")
+        result = _strict_json(_bounded_read(output, 4096), "preflight diagnostic")
+    finally:
+        _remove_unit(unit)
+    if set(result) != {"schema_version", "stage"} or result.get("schema_version") != 1:
+        raise HarnessError("preflight diagnostic result differs")
+    stage = result.get("stage")
+    if stage == "IMPORT":
+        raise HarnessError("preflight diagnostic classified import")
+    if stage == "CONFIG":
+        raise HarnessError("preflight diagnostic classified config")
+    if stage == "IDENTITY":
+        raise HarnessError("preflight diagnostic classified identity")
+    if stage == "POLICY":
+        raise HarnessError("preflight diagnostic classified policy")
+    if stage == "COLLECT":
+        raise HarnessError("preflight diagnostic classified fact collection")
+    if stage == "PARSE":
+        raise HarnessError("preflight diagnostic classified fact parsing")
+    if stage == "FILESYSTEM":
+        raise HarnessError("preflight diagnostic classified filesystem construction")
+    if stage == "RUN":
+        raise HarnessError("preflight diagnostic classified decision or write probe")
+    if stage == "RESULT":
+        raise HarnessError("preflight diagnostic unexpectedly returned a result")
+    raise HarnessError("preflight diagnostic stage differs")
 
 
 def _candidate_unit(
@@ -3937,7 +4044,10 @@ def _phase_a(
         nonce,
         "a",
         paths,
-        launch_failure=lambda: _phase_a_launch_failure_status(runtime),
+        launch_failure=lambda: _phase_a_launch_failure_status(
+            runtime,
+            preflight_failure=lambda: _run_preflight_diagnostic(nonce, paths),
+        ),
     )
     started_ns = time.monotonic_ns()
     stopped = False

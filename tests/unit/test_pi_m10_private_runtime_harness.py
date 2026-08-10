@@ -5,6 +5,7 @@ import importlib.util
 import io
 import sys
 import zipfile
+from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path, PurePosixPath
 from types import ModuleType, SimpleNamespace
@@ -2382,6 +2383,61 @@ def test_storage_fault_diagnostic_splits_exact_preflight_execution_failures(
         assert run._validated_refusal_location(refusal) == refusal
         for private in (b"PRIVATE", b"hunter2", b"/private", b"failed", b"deadline"):
             assert private not in refusal
+
+
+def test_preflight_execution_diagnostic_has_closed_unique_stage_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    paths = {
+        "recording": tmp_path / "recording",
+        "state": tmp_path / "state",
+        "runtime": runtime,
+    }
+    monkeypatch.setattr(run, "render_transient_properties", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        run,
+        "_wait_unit_terminal",
+        lambda _unit, _timeout: {"Result": "success", "ExecMainStatus": "0"},
+    )
+    monkeypatch.setattr(run, "_remove_unit", lambda _unit: None)
+    stages = (
+        "IMPORT",
+        "CONFIG",
+        "IDENTITY",
+        "POLICY",
+        "COLLECT",
+        "PARSE",
+        "FILESYSTEM",
+        "RUN",
+        "RESULT",
+    )
+    refusals: set[bytes] = set()
+
+    def installer(output: Path, stage: str) -> Callable[..., None]:
+        def systemd_run(*_args: object, **_kwargs: object) -> None:
+            output.write_bytes(run.canonical_json({"schema_version": 1, "stage": stage}))
+
+        return systemd_run
+
+    for stage in stages:
+        output = runtime / "preflight-diagnostic.json"
+        monkeypatch.setattr(run, "_systemd_run", installer(output, stage))
+        try:
+            run._run_preflight_diagnostic("123456789abc", paths)
+        except run.HarnessError as error:
+            refusal = run._refusal_line(error)
+        else:
+            pytest.fail("preflight diagnostic unexpectedly returned")
+        output.unlink()
+        assert refusal.startswith(b"REFUSED: H_HARNESS_Frun_preflight_diagnostic_L")
+        assert run._validated_refusal_location(refusal) == refusal
+        assert stage.encode("ascii") not in refusal
+        refusals.add(refusal)
+
+    assert len(refusals) == len(stages)
 
 
 def test_storage_fault_diagnostic_splits_every_preflight_malformed_predicate(

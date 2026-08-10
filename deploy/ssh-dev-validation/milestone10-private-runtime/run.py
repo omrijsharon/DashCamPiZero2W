@@ -66,6 +66,23 @@ SYSTEMD_RUN_NOTIFY_TIMEOUT_S: Final = 50.0
 OBSERVATION_INTERVAL_S: Final = 0.1
 CONTROL_RESPONSE_BYTES: Final = 16 * 1024
 CONTROL_TIMEOUT_S: Final = 9.0
+RUNTIME_STATUS_BYTES: Final = 32 * 1024
+RECORDER_STATES: Final = ("STARTING", "RECORDING", "DEGRADED", "STOPPING", "FAULTED")
+RECORDER_REASONS: Final = (
+    "CONFIG_ERROR",
+    "STARTUP_FAILED",
+    "STARTUP_TIMEOUT",
+    "RUNTIME_EXITED",
+    "RUNTIME_FAILED",
+    "PIPELINE_RECOVERING",
+    "PIPELINE_RECOVERY_EXHAUSTED",
+    "PIPELINE_NO_PROGRESS",
+    "FINALIZATION_FAILED",
+    "STORAGE_FAULT",
+    "OPTIONAL_SUBSYSTEM",
+    "SHUTDOWN_FAILED",
+    "SHUTDOWN_TIMEOUT",
+)
 FIXTURE_FINALIZING_SIDECAR: Final = PurePosixPath(
     "pending/boot-m10private-000022.partial.json"
 )
@@ -138,6 +155,7 @@ DIAGNOSTIC_FUNCTIONS: Final = (
     "remove_filler",
     "raw_control",
     "listener_identity",
+    "phase_a_launch_failure_status",
     "candidate_unit",
     "stop_clean",
     "wait_writing",
@@ -2956,6 +2974,108 @@ def _listener_identity(runtime: Path, dashcam_uid: int) -> dict[str, object]:
     return {"uid": metadata.st_uid, "gid": metadata.st_gid, "mode": "0660"}
 
 
+def _phase_a_launch_failure_status(runtime: Path) -> None:
+    if runtime.parent != Path("/run") or NONCE_RE.fullmatch(runtime.name) is None:
+        raise HarnessError("phase A launch status runtime identity differs")
+    status = runtime / "status.json"
+    try:
+        present = status.is_file() and not status.is_symlink()
+    except OSError:
+        present = False
+    if not present:
+        raise HarnessError("phase A launch status is missing")
+    document: dict[str, object] | None = None
+    with contextlib.suppress(Exception):
+        document = _strict_json(_bounded_read(status, RUNTIME_STATUS_BYTES), "runtime status")
+    lifecycle = document.get("lifecycle") if document is not None else None
+    if (
+        document is None
+        or set(document) != {"schema_version", "lifecycle", "runtime"}
+        or document.get("schema_version") != 3
+        or not isinstance(lifecycle, dict)
+        or set(lifecycle)
+        != {
+            "state",
+            "reason",
+            "detail",
+            "sequence",
+            "config_schema_version",
+            "notification_failures",
+        }
+        or type(lifecycle.get("sequence")) is not int
+        or cast(int, lifecycle.get("sequence")) < 0
+        or (
+            lifecycle.get("config_schema_version") is not None
+            and (
+                type(lifecycle.get("config_schema_version")) is not int
+                or cast(int, lifecycle.get("config_schema_version")) < 1
+            )
+        )
+        or type(lifecycle.get("notification_failures")) is not int
+        or cast(int, lifecycle.get("notification_failures")) < 0
+        or (
+            lifecycle.get("detail") is not None
+            and (
+                not isinstance(lifecycle.get("detail"), str)
+                or not cast(str, lifecycle.get("detail"))
+                or len(cast(str, lifecycle.get("detail"))) > 512
+                or not cast(str, lifecycle.get("detail")).isprintable()
+            )
+        )
+        or not isinstance(lifecycle.get("state"), str)
+        or (
+            lifecycle.get("reason") is not None
+            and not isinstance(lifecycle.get("reason"), str)
+        )
+    ):
+        raise HarnessError("phase A launch status is malformed")
+    state = cast(str, lifecycle["state"])
+    reason = cast(str | None, lifecycle["reason"])
+    if state not in RECORDER_STATES:
+        raise HarnessError("phase A launch status state is unknown")
+    if reason is not None and reason not in RECORDER_REASONS:
+        raise HarnessError("phase A launch status reason is unknown")
+    if state == "RECORDING" and reason is not None:
+        raise HarnessError("phase A launch status state/reason pair is malformed")
+    if reason == "CONFIG_ERROR":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "STARTUP_FAILED":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "STARTUP_TIMEOUT":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "RUNTIME_EXITED":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "RUNTIME_FAILED":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "PIPELINE_RECOVERING":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "PIPELINE_RECOVERY_EXHAUSTED":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "PIPELINE_NO_PROGRESS":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "FINALIZATION_FAILED":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "STORAGE_FAULT":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "OPTIONAL_SUBSYSTEM":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "SHUTDOWN_FAILED":
+        raise HarnessError("phase A launch status matched classified branch")
+    if reason == "SHUTDOWN_TIMEOUT":
+        raise HarnessError("phase A launch status matched classified branch")
+    if state == "STARTING":
+        raise HarnessError("phase A launch status matched classified branch")
+    if state == "RECORDING":
+        raise HarnessError("phase A launch status matched classified branch")
+    if state == "STOPPING":
+        raise HarnessError("phase A launch status matched classified branch")
+    if state == "DEGRADED":
+        raise HarnessError("phase A launch status lacks a required reason")
+    if state == "FAULTED":
+        raise HarnessError("phase A launch status lacks a required reason")
+    raise HarnessError("phase A launch status classification is unreachable")
+
+
 def _candidate_unit(
     nonce: str,
     suffix: str,
@@ -3538,7 +3658,12 @@ def _phase_a(
     low, high, _emergency = resolved_thresholds(cast(int, identity["capacity_bytes"]))
     reserve = math.ceil(MINIMUM_FREE_GIB * 1024**3)
     startup_filler, startup_filler_bytes = _allocate_filler(root, (low + reserve) // 2)
-    unit = _candidate_unit(nonce, "a", paths)
+    unit = _candidate_unit(
+        nonce,
+        "a",
+        paths,
+        launch_failure=lambda: _phase_a_launch_failure_status(runtime),
+    )
     started_ns = time.monotonic_ns()
     stopped = False
     try:

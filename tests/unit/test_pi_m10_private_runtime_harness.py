@@ -1926,6 +1926,222 @@ def test_refusal_line_skips_command_and_systemd_wrappers_for_bind_probe_caller(
         assert private not in payload
 
 
+def _launch_status_payload(state: str, reason: str | None) -> bytes:
+    return run.canonical_json(
+        {
+            "schema_version": 3,
+            "lifecycle": {
+                "state": state,
+                "reason": reason,
+                "detail": "SSID MyHome PSK hunter2 /private/path token abcdef",
+                "sequence": 7,
+                "config_schema_version": 1,
+                "notification_failures": 0,
+            },
+            "runtime": {
+                "secret": "coordinates 32.1,34.8",
+                "path": "/srv/dashcam/private.mp4",
+            },
+        }
+    )
+
+
+def _launch_status_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> bytes:
+    runtime = Path("/run/dashcam-m10-private.123456789abc")
+    status = runtime / "status.json"
+    observations: list[tuple[Path, int]] = []
+    monkeypatch.setattr(run.Path, "is_file", lambda self: self == status)
+    monkeypatch.setattr(run.Path, "is_symlink", lambda _self: False)
+
+    def bounded(path: Path, maximum: int) -> bytes:
+        observations.append((path, maximum))
+        return payload
+
+    monkeypatch.setattr(run, "_bounded_read", bounded)
+    try:
+        run._phase_a_launch_failure_status(runtime)
+    except run.HarnessError as error:
+        refusal = run._refusal_line(error)
+    else:
+        pytest.fail("launch-failure status callback unexpectedly returned")
+    assert observations == [(status, run.RUNTIME_STATUS_BYTES)]
+    assert refusal.startswith(b"REFUSED: H_HARNESS_Fphase_a_launch_failure_status_L")
+    assert run._validated_refusal_location(refusal) == refusal
+    for private in (
+        b"MyHome",
+        b"hunter2",
+        b"/private",
+        b"abcdef",
+        b"32.1",
+        b"34.8",
+        b"/srv",
+        b"detail",
+        b"runtime",
+        b"reason",
+    ):
+        assert private not in refusal
+    return refusal
+
+
+def test_phase_a_launch_failure_has_unique_safe_line_for_every_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert run.RECORDER_REASONS == (
+        "CONFIG_ERROR",
+        "STARTUP_FAILED",
+        "STARTUP_TIMEOUT",
+        "RUNTIME_EXITED",
+        "RUNTIME_FAILED",
+        "PIPELINE_RECOVERING",
+        "PIPELINE_RECOVERY_EXHAUSTED",
+        "PIPELINE_NO_PROGRESS",
+        "FINALIZATION_FAILED",
+        "STORAGE_FAULT",
+        "OPTIONAL_SUBSYSTEM",
+        "SHUTDOWN_FAILED",
+        "SHUTDOWN_TIMEOUT",
+    )
+    refusals = {
+        _launch_status_refusal(monkeypatch, _launch_status_payload("FAULTED", reason))
+        for reason in run.RECORDER_REASONS
+    }
+    assert len(refusals) == len(run.RECORDER_REASONS)
+
+
+def test_phase_a_launch_failure_has_unique_safe_line_for_every_reasonless_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refusals = {
+        _launch_status_refusal(monkeypatch, _launch_status_payload(state, None))
+        for state in run.RECORDER_STATES
+    }
+    assert len(refusals) == len(run.RECORDER_STATES)
+
+
+def test_phase_a_launch_failure_missing_status_is_fixed_and_path_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Path("/run/dashcam-m10-private.123456789abc")
+    monkeypatch.setattr(run.Path, "is_file", lambda _self: False)
+    monkeypatch.setattr(run.Path, "is_symlink", lambda _self: False)
+
+    try:
+        run._phase_a_launch_failure_status(runtime)
+    except run.HarnessError as error:
+        refusal = run._refusal_line(error)
+    else:
+        pytest.fail("missing launch status unexpectedly returned")
+
+    assert refusal.startswith(b"REFUSED: H_HARNESS_Fphase_a_launch_failure_status_L")
+    assert run._validated_refusal_location(refusal) == refusal
+    assert b"/run" not in refusal
+    assert b"status.json" not in refusal
+
+
+def test_phase_a_launch_failure_malformed_and_unknown_values_have_closed_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = (
+        run.canonical_json(
+            {
+                "schema_version": 2,
+                "lifecycle": {"detail": "PSK hunter2 /private/path"},
+                "runtime": {"secret": "abcdef"},
+            }
+        ),
+        _launch_status_payload("PRIVATE_UNKNOWN_STATE", None),
+        _launch_status_payload("FAULTED", "PRIVATE_UNKNOWN_REASON"),
+    )
+    refusals = {_launch_status_refusal(monkeypatch, payload) for payload in cases}
+    assert len(refusals) == len(cases)
+    for refusal in refusals:
+        for private in (b"PRIVATE", b"hunter2", b"/private", b"abcdef"):
+            assert private not in refusal
+
+
+def test_phase_a_wires_launch_failure_status_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Path("/run/dashcam-m10-private.123456789abc")
+    status = runtime / "status.json"
+    payload = _launch_status_payload("FAULTED", "STORAGE_FAULT")
+    monkeypatch.setattr(run.Path, "is_file", lambda self: self == status)
+    monkeypatch.setattr(run.Path, "is_symlink", lambda _self: False)
+    monkeypatch.setattr(run, "_bounded_read", lambda _path, _maximum: payload)
+    monkeypatch.setattr(run, "_source_environment", lambda _archive: None)
+    monkeypatch.setattr(run, "_read_boot_id", lambda: "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setattr(run, "_fixture_subprocess", lambda *_args: {})
+    monkeypatch.setattr(run, "resolved_thresholds", lambda _capacity: (100, 200, 50))
+    monkeypatch.setattr(run, "_allocate_filler", lambda _root, _target: (Path("filler"), 1))
+
+    def candidate(
+        _nonce: str,
+        _suffix: str,
+        _paths: object,
+        **options: object,
+    ) -> str:
+        callback = options.get("launch_failure")
+        assert callable(callback)
+        callback()
+        pytest.fail("launch failure callback unexpectedly returned")
+
+    monkeypatch.setattr(run, "_candidate_unit", candidate)
+    paths = {
+        "recording": Path("/fixture/recording"),
+        "state": Path("/fixture/state"),
+        "runtime": runtime,
+    }
+    try:
+        run._phase_a("123456789abc", paths, {"capacity_bytes": 4096}, dashcam_uid=42)
+    except run.HarnessError as error:
+        refusal = run._refusal_line(error)
+    else:
+        pytest.fail("phase A launch failure unexpectedly returned")
+
+    assert refusal.startswith(b"REFUSED: H_HARNESS_Fphase_a_launch_failure_status_L")
+    assert run._validated_refusal_location(refusal) == refusal
+
+
+def test_candidate_unit_runs_launch_failure_only_after_reconciliation_and_not_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    paths = {
+        "recording": Path("/private/recording"),
+        "state": Path("/private/state"),
+        "runtime": Path("/private/runtime"),
+    }
+    monkeypatch.setattr(run, "render_transient_properties", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        run,
+        "_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(run.HarnessError("private")),
+    )
+    monkeypatch.setattr(run, "_remove_unit", lambda _unit: events.append("reconciled"))
+
+    with pytest.raises(run.HarnessError):
+        run._candidate_unit(
+            "123456789abc",
+            "a",
+            paths,
+            launch_failure=lambda: events.append("callback"),
+        )
+    assert events == ["reconciled", "callback"]
+
+    events.clear()
+    monkeypatch.setattr(run, "_systemd_run", lambda *_args, **_kwargs: None)
+    run._candidate_unit(
+        "123456789abc",
+        "a",
+        paths,
+        launch_failure=lambda: events.append("callback"),
+    )
+    assert events == []
+
+
 def test_fixture_subprocess_relays_only_exact_self_validated_child_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
